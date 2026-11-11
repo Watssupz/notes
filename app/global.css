@@ -10,3 +10,32 @@ html > body[data-scroll-locked] {
   margin-right: 0px !important;
   --removed-body-scroll-bar-size: 0px !important;
 }
+
+:root,
+body,
+#nd-home-layout,
+#nd-docs-layout {
+  --fd-layout-width: 90% !important;
+}
+
+/* Header và đường line ngăn cách (border-b) tràn viền full 100% toàn màn hình */
+#nd-nav,
+#nd-nav > div {
+  width: 100% !important;
+  max-width: 100% !important;
+}
+
+/* Nội dung bên trong Header (Logo, Menu, Icons) hiển thị 90% và căn giữa thẳng hàng với Body */
+#nd-nav > div > div:first-child {
+  width: 90% !important;
+  max-width: 90% !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+  padding-left: 0 !important;
+  padding-right: 0 !important;
+}
+
+/* Tăng width hiển thị cho trang tài liệu đọc docs */
+#nd-page[data-layout-content] {
+  max-width: min(90%, 1200px) !important;
+}
