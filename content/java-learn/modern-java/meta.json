@@ -1,0 +1,11 @@
+{
+  "title": "Java 8+ & Hiện đại",
+  "pages": [
+    "stream-api",
+    "optional",
+    "records-sealed",
+    "virtual-threads",
+    "pattern-matching",
+    "reflection-dynamic-proxy-deep-dive"
+  ]
+}

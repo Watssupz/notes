@@ -1,0 +1,337 @@
+---
+title: "Optimistic vs Pessimistic Lock"
+description: "Mổ xẻ khóa lạc quan vs bi quan: CAS (compare-and-swap) & lệnh CPU cmpxchg, vòng lặp retry của AtomicInteger, ABA problem & AtomicStampedReference, StampedLock optimistic read, versioning trong DB (@Version JPA), so với synchronized/ReentrantLock. Kèm sơ đồ và benchmark contention."
+---
+
+Optimistic locking và pessimistic locking là hai chiến lược kiểm soát truy cập đồng thời. Một bên giả định xung đột hiếm và kiểm tra khi cập nhật; bên còn lại ngăn xung đột trước bằng cách giữ quyền truy cập độc quyền.
+
+## Mục lục
+
+- [Tổng quan](#1-tổng-quan)
+- [Hai triết lý: bi quan vs lạc quan](#2-hai-triết-lý-bi-quan-vs-lạc-quan)
+- [Pessimistic lock — synchronized & ReentrantLock](#3-pessimistic-lock--synchronized--reentrantlock)
+- [CAS — trái tim của optimistic lock](#4-cas--trái-tim-của-optimistic-lock)
+- [AtomicInteger — vòng lặp CAS trong thực tế](#5-atomicinteger--vòng-lặp-cas-trong-thực-tế)
+- [ABA problem & AtomicStampedReference](#6-aba-problem--atomicstampedreference)
+- [StampedLock — optimistic read trong JDK](#7-stampedlock--optimistic-read-trong-jdk)
+- [Optimistic lock ở tầng DB — @Version](#8-optimistic-lock-ở-tầng-db--version)
+- [Chọn loại nào theo mức contention](#9-chọn-loại-nào-theo-mức-contention)
+- [Anti-patterns cần tránh](#10-anti-patterns-cần-tránh)
+- [Tóm tắt — Cheat sheet & nguyên tắc](#11-tóm-tắt--cheat-sheet--nguyên-tắc)
+
+---
+
+## 1. Tổng quan
+
+Pessimistic locking phù hợp khi xung đột thường xuyên hoặc chi phí retry cao, nhưng có thể làm tăng thời gian chờ và nguy cơ deadlock. Optimistic locking giảm blocking, đổi lại caller phải xử lý thất bại CAS, version conflict hoặc retry.
+
+Không có chiến lược luôn tốt hơn. Quyết định phụ thuộc vào tỷ lệ tranh chấp, độ dài critical section, yêu cầu latency và khả năng thực hiện lại thao tác một cách an toàn.
+
+## 2. Hai triết lý: bi quan vs lạc quan
+
+| | **Pessimistic (bi quan)** | **Optimistic (lạc quan)** |
+|---|---------------------------|----------------------------|
+| Giả định | "Chắc chắn sẽ có xung đột" | "Hiếm khi xung đột" |
+| Hành động | **Khóa trước**, ai khác phải đợi | Cứ làm, **kiểm tra lúc ghi** |
+| Khi xung đột | Thread khác **block/chờ** | Phát hiện → **retry** (làm lại) |
+| Chi phí | Context switch, park/unpark thread | CPU quay vòng retry |
+| Tốt khi | Contention **cao**, critical section dài | Contention **thấp**, thao tác ngắn |
+| Ví dụ Java | `synchronized`, `ReentrantLock` | `AtomicInteger`, `StampedLock`, `@Version` |
+
+```d2 title="2. Hai triết lý: bi quan vs lạc quan"
+direction: down
+n_Pessimistic: "Pessimistic" {
+  n_P1: "acquire lock"
+  n_P2: "làm việc (người khác CHỜ)"
+  n_P3: "release lock"
+}
+n_Optimistic: "Optimistic" {
+  n_O1: "đọc giá trị + version"
+  n_O2: "tính toán (không khóa)"
+  n_O3: "version còn nguyên?" { shape: diamond }
+  n_O4: "commit (CAS thành công)"
+}
+n_Pessimistic.n_P1 -> n_Pessimistic.n_P2
+n_Pessimistic.n_P2 -> n_Pessimistic.n_P3
+n_Optimistic.n_O1 -> n_Optimistic.n_O2
+n_Optimistic.n_O2 -> n_Optimistic.n_O3
+n_Optimistic.n_O3 -> n_Optimistic.n_O4: "có"
+n_Optimistic.n_O3 -> n_Optimistic.n_O1: "không"
+```
+
+> [!NOTE]
+> Lạc quan **không phải "không có lock"** theo nghĩa tuyệt đối — nó là "không chặn ai cả; nếu phát hiện người khác đã thay đổi thì làm lại". Đánh đổi: tiết kiệm chi phí khóa khi rảnh, nhưng tốn retry khi đông. Đó là lý do nó **chỉ thắng khi contention thấp**.
+
+---
+
+## 3. Pessimistic lock — synchronized & ReentrantLock
+
+Bi quan = giành quyền **độc quyền** trước khi vào vùng tới hạn. Thread khác bị **chặn** (block) cho tới khi lock được nhả:
+
+```java
+private final ReentrantLock lock = new ReentrantLock();
+void transfer() {
+    lock.lock();              // chờ tới khi giành được
+    try {
+        // critical section — chỉ một thread tại một thời điểm
+    } finally {
+        lock.unlock();        // LUÔN nhả trong finally
+    }
+}
+```
+
+Khi một thread không giành được lock, nó bị **park** (OS đưa ra khỏi CPU) và **unpark** khi lock rảnh — qua cơ chế **AQS** (xem [AQS Deep Dive](/concurrency/aqs-deep-dive/)). Chi phí park/unpark là **context switch** (~µs), đắt nếu xung đột nhiều lần ngắn.
+
+> [!TIP]
+> Bi quan **thắng khi critical section dài hoặc contention cao**: nếu cứ retry lạc quan sẽ tốn CPU vô ích (livelock kiểu spin), thì chặn thread lại và để nó ngủ rẻ hơn. `synchronized` còn được JIT tối ưu (biased/thin lock, lock elision) cho trường hợp ít/không tranh chấp — xem [synchronized internals](/concurrency/synchronized-internals-deep-dive/).
+
+---
+
+## 4. CAS — trái tim của optimistic lock
+
+**CAS (Compare-And-Swap)** là một lệnh **nguyên tử của CPU** (x86: `cmpxchg`, ARM: `LDREX/STREX`). Ngữ nghĩa:
+
+```
+CAS(địa_chỉ, expected, newValue):
+    nếu *địa_chỉ == expected:
+        *địa_chỉ = newValue;  return true     ← thành công
+    ngược lại:
+        return false                          ← ai đó đã đổi, không ghi
+```
+
+Toàn bộ "so sánh rồi ghi" thực hiện **trong một lệnh nguyên tử** — không thread nào chen ngang được giữa chừng. Đây là **primitive không khóa (lock-free)** mà mọi optimistic lock xây trên đó.
+
+```d2 title="4. CAS — trái tim của optimistic lock"
+direction: right
+read: "Thread đọc expected = 5\ntính newValue = 6"
+cas: "CAS(address, expected=5, new=6)"
+match: "Memory vẫn bằng 5?" { shape: diamond }
+write: "true: ghi value = 6"
+retry: "false: không ghi\nđọc lại, tính lại, thử CAS lại"
+read -> cas -> match
+match -> write: Có
+match -> retry: "Không, ví dụ value = 7"
+retry -> read
+```
+
+> [!IMPORTANT]
+> CAS là lý do optimistic lock tồn tại được: nó cho phép "kiểm tra giá trị chưa đổi **và** ghi giá trị mới" thành một thao tác bất khả phân. Không có CAS, optimistic lock có khe hở race ngay tại bước commit. Trong Java, CAS lộ ra qua `java.lang.invoke.VarHandle` (và `Unsafe` cũ).
+
+---
+
+## 5. AtomicInteger — vòng lặp CAS trong thực tế
+
+`incrementAndGet()` không hề có khóa — nó là **vòng lặp CAS** (gọi là "CAS loop" / spin):
+
+```java
+public final int incrementAndGet() {
+    int prev, next;
+    do {
+        prev = get();              // đọc giá trị hiện tại
+        next = prev + 1;           // tính giá trị mới
+    } while (!compareAndSet(prev, next));  // CAS; thất bại → lặp lại với prev mới
+    return next;
+}
+```
+
+```d2 title="CAS thất bại phải đọc lại trước khi retry"
+direction: down
+n0: "Thread A: prev=5, next=6\nCAS(5→6) thành công"
+n1: "Thread B: prev=5, next=6\nCAS(5→6) thất bại vì A đã đổi thành 6"
+n2: "Thread B lặp: prev=6, next=7\nCAS(6→7) thành công"
+n0 -> n1
+n1 -> n2
+```
+
+- Không thread nào bị **block/park** — chỉ "quay vòng" đọc lại và thử lại.
+- Khi contention **thấp**: gần như luôn CAS thành công ngay lần đầu → rất nhanh.
+- Khi contention **cao**: nhiều thread retry liên tục → lãng phí CPU (spin). Lúc này `synchronized` hoặc `LongAdder` tốt hơn.
+
+> [!TIP]
+> `LongAdder`/`LongAccumulator` (Java 8+) giải bài toán contention cao của `AtomicLong`: thay vì một biến chung mà mọi thread tranh CAS, nó **chia thành nhiều ô (cell)**, mỗi thread cập nhật ô riêng, `sum()` cộng lại khi cần. Dưới tải ghi cực cao (counter, metrics), `LongAdder` nhanh hơn `AtomicLong` nhiều lần (xem benchmark mục 1).
+
+---
+
+## 6. ABA problem & AtomicStampedReference
+
+CAS chỉ kiểm tra "giá trị có **bằng** expected không", **không** biết "giá trị có **từng bị đổi** không". Sinh ra **ABA problem**:
+
+```d2 title="6. ABA problem & AtomicStampedReference"
+shape: sequence_diagram
+t1: "Thread 1"
+memory: Memory
+t2: "Thread 2"
+t1 -> memory: "đọc A, chuẩn bị CAS(A → C)"
+t2 -> memory: "đổi A → B"
+t2 -> memory: "đổi B → A"
+t1 -> memory: "CAS(A → C)"
+memory -> t1: "THÀNH CÔNG: hiện tại vẫn là A"
+t1.note: "CAS không thấy hai lần đổi ở giữa: ABA"
+```
+
+Với số đếm thuần túy, ABA thường vô hại. Nhưng với **cấu trúc dữ liệu lock-free** (stack/queue dùng con trỏ), ABA có thể nối lại một node đã bị giải phóng → hỏng cấu trúc.
+
+Cách chống: gắn thêm **version/stamp** vào giá trị, CAS cả (giá trị, stamp):
+
+```java
+AtomicStampedReference<Node> top = new AtomicStampedReference<>(node, 0);
+
+int[] stampHolder = new int[1];
+Node cur = top.get(stampHolder);          // đọc cả giá trị + stamp
+int stamp = stampHolder[0];
+// ... tính toán ...
+top.compareAndSet(cur, next, stamp, stamp + 1);  // CAS thất bại nếu stamp đã đổi
+```
+
+> [!WARNING]
+> ABA là cái bẫy tinh vi nhất của lập trình lock-free. Mỗi lần dùng CAS trên **reference** mà object có thể được tái sử dụng/giải phóng, hãy hỏi: "Nếu giá trị quay về đúng như cũ thì sao?". Dùng `AtomicStampedReference` (stamp) hoặc `AtomicMarkableReference` (cờ boolean) để phân biệt "chưa đổi" với "đổi đi rồi đổi lại".
+
+---
+
+## 7. StampedLock — optimistic read trong JDK
+
+`StampedLock` (Java 8) cung cấp **optimistic read** ngay trong thư viện chuẩn — đọc **không khóa**, chỉ kiểm tra lại xem có bị ghi đè giữa chừng không:
+
+```java
+private final StampedLock sl = new StampedLock();
+private double x, y;
+
+double distanceFromOrigin() {
+    long stamp = sl.tryOptimisticRead();    // KHÔNG khóa — chỉ lấy "tem" thời điểm
+    double curX = x, curY = y;              // đọc field (có thể bị ghi xen giữa)
+    if (!sl.validate(stamp)) {              // có ai ghi sau khi lấy stamp?
+        stamp = sl.readLock();              // → fallback sang read lock thật (bi quan)
+        try { curX = x; curY = y; }
+        finally { sl.unlockRead(stamp); }
+    }
+    return Math.sqrt(curX * curX + curY * curY);
+}
+```
+
+```d2 title="7. StampedLock — optimistic read trong JDK"
+direction: down
+n_A: "tryOptimisticRead() → stamp"
+n_B: "đọc field (không khóa)"
+n_C: "validate(stamp)?" { shape: diamond }
+n_D: "dùng giá trị đã đọc — nhanh, 0\ncontention"
+n_E: "readLock() bi quan rồi đọc lại"
+n_A -> n_B
+n_B -> n_C
+n_C -> n_D: "true (không ai ghi)"
+n_C -> n_E: "false (có ghi xen)"
+```
+
+- Khi **đọc nhiều, ghi hiếm**: optimistic read gần như luôn `validate` thành công → đọc **không tốn đồng bộ nào**, nhanh hơn cả `ReadWriteLock`.
+- `StampedLock` **không reentrant** và không hỗ trợ Condition — khác `ReentrantLock`. Dùng sai dễ deadlock.
+
+> [!CAUTION]
+> `StampedLock` mạnh nhưng **dễ dùng sai**: phải copy field ra biến cục bộ **trước** khi `validate`, không reentrant, và phải cẩn thận khi nâng cấp (`tryConvertToWriteLock`). Chỉ dùng khi đã đo được `ReadWriteLock` là nút thắt và pattern là read-mostly.
+
+---
+
+## 8. Optimistic lock ở tầng DB — @Version
+
+Cùng triết lý lạc quan áp lên database. Thay vì `SELECT ... FOR UPDATE` (pessimistic, khóa hàng), dùng **cột version**:
+
+```java
+@Entity
+class Account {
+    @Id Long id;
+    long balance;
+    @Version int version;     // Hibernate tự quản lý
+}
+```
+
+Khi update, Hibernate sinh:
+
+```sql
+UPDATE account SET balance = ?, version = version + 1
+WHERE id = ? AND version = ?    -- version PHẢI khớp giá trị lúc đọc
+```
+
+- Nếu `WHERE` khớp (version chưa đổi) → update thành công, version +1.
+- Nếu **0 dòng bị ảnh hưởng** (ai đó đã update trước, version đã tăng) → Hibernate ném `OptimisticLockException` → ứng dụng **retry** giao dịch.
+
+| | Pessimistic (`SELECT FOR UPDATE`) | Optimistic (`@Version`) |
+|---|-----------------------------------|--------------------------|
+| Khóa hàng | Có (người khác chờ) | Không |
+| Tốt khi | Tranh chấp cao, transaction ngắn | Tranh chấp thấp, đọc nhiều |
+| Rủi ro | Lock contention, deadlock | Phải xử lý retry khi xung đột |
+
+> [!IMPORTANT]
+> Optimistic DB lock dịch chuyển trách nhiệm xử lý xung đột sang **tầng ứng dụng**: bạn phải bắt `OptimisticLockException` và **retry** (đọc lại, áp lại thay đổi). Nó tránh giữ khóa DB lâu (tốt cho scale) nhưng yêu cầu logic retry idempotent.
+
+---
+
+## 9. Chọn loại nào theo mức contention
+
+```d2 title="9. Chọn loại nào theo mức contention"
+direction: down
+n_A: "Mức tranh chấp (contention)?" { shape: diamond }
+n_O: "Optimistic: Atomic*, StampedLock\noptimistic, @Version"
+n_P: "Pessimistic: synchronized /\nReentrantLock"
+n_L: "LongAdder (striped)"
+n_R: "StampedLock / ReadWriteLock"
+n_A -> n_O: "thấp, thao tác ngắn"
+n_A -> n_P: "cao, hoặc critical section dài"
+n_A -> n_L: "ghi cực nhiều vào counter"
+n_A -> n_R: "đọc nhiều ghi hiếm"
+```
+
+| Tình huống | Lựa chọn |
+|-----------|----------|
+| Counter đơn giản, contention vừa | `AtomicInteger`/`AtomicLong` |
+| Counter, contention cực cao | `LongAdder` |
+| Đọc nhiều, ghi rất hiếm | `StampedLock` (optimistic read) |
+| Critical section phức tạp/dài | `synchronized` / `ReentrantLock` |
+| Cập nhật DB, xung đột hiếm | `@Version` (optimistic) |
+| Cập nhật DB, xung đột cao | `SELECT FOR UPDATE` (pessimistic) |
+
+> [!TIP]
+> Quy tắc ngón tay cái: **đo trước**. Optimistic thắng khi xung đột hiếm (retry gần như không xảy ra); pessimistic thắng khi xung đột thường xuyên (retry sẽ phí CPU). Đừng mặc định "lock-free luôn nhanh hơn" — dưới contention cao, CAS loop có thể tệ hơn một lock biết park thread.
+
+---
+
+## 10. Anti-patterns cần tránh
+
+| Anti-pattern | Vì sao sai | Thay bằng |
+|--------------|-----------|-----------|
+| `views++` chia sẻ giữa thread | Không atomic → lost update | `AtomicInteger` / `synchronized` |
+| Optimistic CAS loop dưới contention cao | Spin lãng phí CPU | `synchronized` / `LongAdder` |
+| CAS reference mà bỏ qua ABA | Cấu trúc lock-free hỏng | `AtomicStampedReference` |
+| `@Version` nhưng không retry khi `OptimisticLockException` | Mất update, lỗi lan ra user | Bắt exception + retry idempotent |
+| `lock()` mà không `unlock()` trong `finally` | Lock rò khi exception → deadlock | Luôn `try/finally` |
+| `StampedLock` dùng như reentrant | Deadlock (không reentrant) | `ReentrantLock` nếu cần reentrant |
+| Pessimistic lock giữ qua I/O dài | Chặn mọi thread khác lâu | Giảm phạm vi khóa, optimistic |
+
+---
+
+## 11. Tóm tắt — Cheat sheet & nguyên tắc
+
+**Cỗ máy trong 6 dòng:**
+
+```
+1. Pessimistic = khóa trước, người khác CHỜ (synchronized, ReentrantLock)
+2. Optimistic  = cứ làm, kiểm tra lúc commit, xung đột → RETRY
+3. CAS = lệnh CPU nguyên tử (cmpxchg): so expected, khớp thì ghi, không thì fail
+4. AtomicInteger = vòng lặp CAS (spin), không park thread
+5. ABA: giá trị quay về cũ qua mặt CAS → dùng AtomicStampedReference
+6. DB: @Version (optimistic, retry) vs SELECT FOR UPDATE (pessimistic, khóa hàng)
+```
+
+| | Pessimistic | Optimistic |
+|---|-------------|------------|
+| Cơ chế | block/park | CAS + retry |
+| Tốt khi | contention cao | contention thấp |
+| Chi phí | context switch | CPU spin |
+
+**5 nguyên tắc khắc cốt:**
+
+1. **Optimistic thắng khi xung đột hiếm**; pessimistic thắng khi xung đột nhiều.
+2. **CAS là nền tảng lock-free** — nguyên tử "so rồi ghi" trong một lệnh CPU.
+3. **Coi chừng ABA** khi CAS trên reference — dùng stamp/version.
+4. **Contention ghi cực cao → `LongAdder`**, không phải `AtomicLong`.
+5. **Optimistic DB lock buộc phải có retry** — `@Version` + bắt `OptimisticLockException`.
+
+> [!TIP]
+> Một câu để nhớ: *Bi quan giả định "sẽ đụng nhau nên khóa lại"; lạc quan giả định "hiếm khi đụng nên cứ làm, sai thì làm lại".* Chọn sai triết lý so với mức contention thực tế là nguyên nhân số một khiến code đồng bộ vừa chậm vừa khó đoán.

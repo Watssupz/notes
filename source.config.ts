@@ -58,7 +58,7 @@ export default defineConfig({
   mdxOptions: {
     remarkPlugins: [
       remarkGithubCallouts,
-      remarkD2,
+      [remarkD2, { concurrency: 4 }],
       remarkCodeWalkthrough,
       remarkTerminalSession,
       remarkCodeDiff,

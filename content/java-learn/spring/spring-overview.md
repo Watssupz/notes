@@ -1,0 +1,315 @@
+---
+title: "Tổng quan Spring"
+description: "Bản đồ hệ sinh thái Spring: IoC container & Dependency Injection (BeanFactory vs ApplicationContext, bean lifecycle, scope), AOP qua proxy (cách @Transactional/@Cacheable hoạt động), Spring Boot auto-configuration & starter, và các module chính (MVC, Data, Security). Giải thích cơ chế bên dưới — không chỉ cách dùng annotation. Kèm sơ đồ container và lifecycle."
+---
+
+# Spring — Hiểu cơ chế bên dưới, không chỉ annotation
+
+Spring là hệ sinh thái xây dựng ứng dụng Java dựa trên container quản lý object và các abstraction cho những mối quan tâm hạ tầng. Hai cơ chế nền tảng là IoC/Dependency Injection và AOP.
+
+## Mục lục
+
+- [Tổng quan](#1-tổng-quan)
+- [IoC & Dependency Injection — trái tim của Spring](#2-ioc--dependency-injection--trái-tim-của-spring)
+- [Container: BeanFactory vs ApplicationContext](#3-container-beanfactory-vs-applicationcontext)
+- [Bean lifecycle & scope](#4-bean-lifecycle--scope)
+- [AOP — @Transactional hoạt động thế nào](#5-aop--transactional-hoạt-động-thế-nào)
+- [Spring Boot: auto-configuration & starter](#6-spring-boot-auto-configuration--starter)
+- [Các module chính](#7-các-module-chính)
+- [Kiểu inject & best practice](#8-kiểu-inject--best-practice)
+- [Anti-patterns cần tránh](#9-anti-patterns-cần-tránh)
+- [Tóm tắt — Cheat sheet](#10-tóm-tắt--cheat-sheet)
+
+---
+
+## 1. Tổng quan
+
+IoC Container tạo và liên kết bean, giúp code nghiệp vụ không phải tự quản lý dependency. AOP chèn các hành vi xuyên suốt như transaction, security, cache và logging quanh lời gọi method. Spring Boot bổ sung auto-configuration và conventions để giảm cấu hình lặp lại.
+
+Nắm ba lớp này—container, infrastructure abstraction và Boot—giúp hiểu Spring như một hệ thống nhất quán thay vì tập hợp annotation rời rạc.
+
+## 2. IoC & Dependency Injection — trái tim của Spring
+
+**Inversion of Control (IoC)**: thay vì object tự tạo dependency, *quyền điều khiển* việc tạo/lắp ráp được **đảo ngược** cho container. **Dependency Injection (DI)** là cách hiện thực: container "tiêm" dependency vào.
+
+```java
+@Service
+class OrderService {
+    private final OrderRepository repo;
+    private final EmailSender email;
+    OrderService(OrderRepository repo, EmailSender email) {  // container TIÊM vào
+        this.repo = repo; this.email = email;
+    }
+}
+```
+
+Đây chính là hiện thực của **Dependency Inversion Principle** (xem doc SOLID): `OrderService` phụ thuộc *interface* `OrderRepository`, không biết lớp cụ thể. Container quyết định cắm `JdbcOrderRepository` hay (trong test) một mock.
+
+```d2 title="2. IoC & Dependency Injection — trái tim của Spring"
+direction: down
+n_C: "Spring IoC Container"
+n_OS: "OrderService"
+n_Repo: "OrderRepository (JdbcOrderRepository)"
+n_Email: "EmailSender"
+n_C -> n_OS: "tạo + tiêm"
+n_C -> n_Repo: "tạo"
+n_C -> n_Email: "tạo"
+n_Repo -> n_OS: "tiêm vào" { style.stroke-dash: 3 }
+n_Email -> n_OS: "tiêm vào" { style.stroke-dash: 3 }
+```
+
+> [!TIP]
+> Lợi ích thực tế: (1) **test dễ** — inject mock thay vì real DB; (2) **đổi implementation** không sửa code dùng; (3) **không lo vòng đời** — container tạo/huỷ. "Bean" chỉ là object do Spring quản lý. Bạn khai báo bean bằng `@Component`/`@Service`/`@Repository`/`@Bean`, và Spring tự lắp ráp đồ thị phụ thuộc.
+
+---
+
+## 3. Container: BeanFactory vs ApplicationContext
+
+Container Spring có hai tầng:
+
+| | `BeanFactory` | `ApplicationContext` |
+|---|---------------|----------------------|
+| Vai trò | container cơ bản (DI, lazy) | mở rộng BeanFactory (dùng thực tế) |
+| Khởi tạo bean | lazy (khi cần) | **eager** (singleton tạo sẵn lúc start) |
+| Thêm | — | i18n, event, AOP, resource, environment |
+
+`ApplicationContext` là thứ bạn dùng 99% thời gian. Quá trình khởi động:
+
+```d2 title="Container đọc definition trước khi instantiate"
+direction: down
+n0: "Đọc annotation/@Configuration/XML\ntạo BeanDefinition"
+n1: "BeanFactoryPostProcessor sửa definition\nví dụ thay \${placeholder}"
+n2: "Tạo instance theo thứ tự dependency"
+n3: "Tiêm dependency (DI)"
+n4: "BeanPostProcessor: proxy (AOP), @PostConstruct"
+n5: "Container sẵn sàng"
+n0 -> n1
+n1 -> n2
+n2 -> n3
+n3 -> n4
+n4 -> n5
+```
+
+> [!NOTE]
+> `BeanPostProcessor` (bước 5) là điểm "ma thuật" của Spring: đây là nơi bean *thật* của bạn bị **bọc trong proxy** để thêm AOP (transaction, cache, security). Khi bạn `@Autowired` một service, thứ bạn nhận có thể là **proxy** chứ không phải instance gốc — chi tiết quan trọng để hiểu mục 5.
+
+---
+
+## 4. Bean lifecycle & scope
+
+### 4.1. Vòng đời một bean
+
+```d2 title="4.1. Vòng đời một bean"
+direction: right
+n_A: "Instantiate"
+n_B: "Populate (DI)"
+n_C: "@PostConstruct / InitializingBean"
+n_D: "BeanPostProcessor (bọc proxy)"
+n_E: "Bean sẵn sàng dùng"
+n_F: "@PreDestroy (khi shutdown)"
+n_A -> n_B
+n_B -> n_C
+n_C -> n_D
+n_D -> n_E
+n_E -> n_F
+```
+
+```java
+@Component
+class CacheWarmer {
+    @PostConstruct void init() { /* chạy SAU khi DI xong — nạp cache */ }
+    @PreDestroy   void cleanup() { /* chạy trước khi huỷ — đóng tài nguyên */ }
+}
+```
+
+### 4.2. Scope — vòng đời bean kéo dài bao lâu
+
+| Scope | Ý nghĩa |
+|-------|---------|
+| `singleton` (mặc định) | **một** instance cho cả container |
+| `prototype` | tạo mới mỗi lần inject/lấy |
+| `request` | một instance mỗi HTTP request (web) |
+| `session` | một instance mỗi HTTP session |
+
+> [!WARNING]
+> Bean Spring **mặc định là singleton** → **phải stateless** (không giữ state mutable theo từng request). Giữ field mutable trong singleton service = bug đa luồng (mọi request chia sẻ nó). Đây là lý do service Spring thường chỉ chứa dependency (final, immutable) chứ không chứa dữ liệu xử lý. Cần state theo request → dùng scope `request` hoặc truyền tham số.
+
+> [!WARNING]
+> Bẫy kinh điển: inject bean `prototype` vào bean `singleton`. Singleton chỉ được tiêm **một lần** lúc tạo → prototype "đông cứng" thành một instance, mất ý nghĩa prototype. Giải pháp: `ObjectProvider`, `@Lookup`, hoặc scoped proxy.
+
+---
+
+## 5. AOP — @Transactional hoạt động thế nào
+
+**Aspect-Oriented Programming**: tách "mối quan tâm cắt ngang" (cross-cutting: transaction, log, security, cache) ra khỏi logic nghiệp vụ. Spring hiện thực AOP bằng **proxy** (xem doc Structural Patterns — Proxy).
+
+```java
+@Service
+class OrderService {
+    @Transactional                       // không có code transaction trong method!
+    public void place(Order o) {
+        repo.save(o);                    // chỉ logic nghiệp vụ thuần
+        inventory.reduce(o);
+    }
+}
+```
+
+Điều thực sự xảy ra: Spring tạo một **proxy** bọc `OrderService`. Khi bạn gọi `place()`, bạn gọi proxy trước:
+
+```d2 title="5. AOP — @Transactional hoạt động thế nào"
+direction: right
+n_Caller: "Caller"
+n_Proxy: "Proxy (Spring tạo)"
+n_Real: "OrderService thật.place()"
+n_Caller -> n_Proxy
+n_Proxy -> n_Real: "mở transaction"
+n_Real -> n_Proxy
+n_Proxy -> n_Caller: "commit / rollback nếu lỗi"
+```
+
+```
+proxy.place():
+    txManager.begin()            ← before
+    try { realService.place() }  ← logic thật của bạn
+    catch { txManager.rollback(); throw }
+    txManager.commit()           ← after
+```
+
+> [!WARNING]
+> Hệ quả cực kỳ quan trọng của cơ chế proxy: **self-invocation không qua proxy**. Nếu method A (không `@Transactional`) gọi method B (`@Transactional`) **trong cùng class**, lời gọi `this.B()` **không** đi qua proxy → `@Transactional` của B **bị bỏ qua hoàn toàn**. Tương tự cho `@Cacheable`, `@Async`. Giải pháp: tách B sang bean khác, hoặc inject chính mình (self-injection). Đây là bug "tại sao transaction của tôi không chạy" số một.
+
+> [!NOTE]
+> Spring chọn proxy động: **JDK dynamic proxy** nếu bean có interface, **CGLIB** (subclass) nếu là class cụ thể. Vì CGLIB tạo subclass nên method/class `final` không proxy được → `@Transactional` trên method `final` âm thầm vô hiệu.
+
+---
+
+## 6. Spring Boot: auto-configuration & starter
+
+Spring "thuần" cấu hình rườm rà. **Spring Boot** thêm hai thứ:
+
+### 6.1. Starter — gom dependency theo nhóm
+
+```xml
+<!-- Một dòng kéo về Tomcat + Spring MVC + Jackson + validation... -->
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-web</artifactId>
+</dependency>
+```
+
+### 6.2. Auto-configuration — cấu hình theo "có gì trên classpath"
+
+```d2 title="Auto-configuration chọn default theo điều kiện"
+direction: down
+n0: "@SpringBootApplication"
+n1: "@EnableAutoConfiguration"
+n2: "Quét AutoConfiguration classes"
+n3: "@ConditionalOnClass / @ConditionalOnMissingBean…"
+n4: "H2 trên classpath, chưa có DataSource\n→ tạo DataSource H2"
+n0 -> n1
+n1 -> n2
+n2 -> n3
+n3 -> n4
+```
+
+> [!TIP]
+> Cơ chế cốt lõi của auto-config là **`@Conditional`**: "chỉ cấu hình X *nếu* điều kiện Y" (có class này, thiếu bean kia, property nọ bật). Đó là vì sao Spring Boot "chạy được ngay" nhưng vẫn cho bạn ghi đè — bạn khai báo bean của mình, `@ConditionalOnMissingBean` thấy có rồi nên auto-config nhường. Xem `--debug` để in "condition evaluation report" biết cái gì được/không được cấu hình và vì sao.
+
+---
+
+## 7. Các module chính
+
+```d2 title="7. Các module chính"
+direction: down
+n_Core: "Spring Core (IoC + AOP)"
+n_MVC: "Spring MVC / WebFlux"
+n_Data: "Spring Data (JPA/JDBC/Mongo)"
+n_Sec: "Spring Security"
+n_Boot: "Spring Boot (auto-config)"
+n_Core -> n_MVC
+n_Core -> n_Data
+n_Core -> n_Sec
+n_Core -> n_Boot
+n_Boot -> n_MVC
+n_Boot -> n_Data
+n_Boot -> n_Sec
+```
+
+| Module | Vai trò |
+|--------|---------|
+| Spring Core | IoC container + DI + AOP (nền của tất cả) |
+| Spring MVC | web MVC servlet (`@Controller`, `@RestController`) |
+| Spring WebFlux | web reactive (non-blocking, `Flux`/`Mono`) |
+| Spring Data | trừu tượng truy cập dữ liệu (repository tự sinh query) |
+| Spring Security | xác thực + phân quyền (filter chain) |
+| Spring Boot | auto-config + starter + embedded server + actuator |
+
+---
+
+## 8. Kiểu inject & best practice
+
+Ba cách tiêm dependency:
+
+```java
+// 1. Constructor injection — KHUYÊN DÙNG
+@Service
+class A {
+    private final B b;
+    A(B b) { this.b = b; }     // final, bắt buộc, dễ test, phát hiện circular sớm
+}
+
+// 2. Setter injection — cho dependency tuỳ chọn
+@Autowired void setB(B b) { this.b = b; }
+
+// 3. Field injection — TRÁNH
+@Autowired private B b;        // không final, khó test (phải reflection), giấu phụ thuộc
+```
+
+> [!TIP]
+> **Constructor injection là chuẩn vàng**: (1) field `final` → immutable, thread-safe; (2) dependency bắt buộc lộ rõ trong constructor; (3) test không cần Spring (chỉ `new A(mockB)`); (4) circular dependency bị phát hiện lúc khởi động thay vì ẩn. Field injection tiện nhưng giấu phụ thuộc và buộc dùng reflection để test — tránh. Với một dependency, Spring tự `@Autowired` constructor (khỏi ghi annotation).
+
+---
+
+## 9. Anti-patterns cần tránh
+
+| Anti-pattern | Vì sao sai | Thay bằng |
+|--------------|-----------|-----------|
+| Field injection (`@Autowired` field) | khó test, không final, giấu phụ thuộc | constructor injection |
+| State mutable trong singleton bean | bug đa luồng (chia sẻ giữa request) | stateless / scope request |
+| Gọi `@Transactional` cùng class (self-invocation) | không qua proxy → bị bỏ qua | tách bean / self-inject |
+| `@Transactional`/`@Async` trên method `final` | CGLIB không proxy được | bỏ `final` |
+| Inject prototype vào singleton trực tiếp | prototype đông cứng | `ObjectProvider`/scoped proxy |
+| Tự `new` bean trong code | mất DI/AOP/lifecycle | để container tạo |
+| Logic nặng trong constructor bean | chậm khởi động, khó test | `@PostConstruct` |
+
+---
+
+## 10. Tóm tắt — Cheat sheet
+
+**Hai nền tảng:**
+
+```
+IoC/DI → container TẠO + TIÊM dependency (bạn khai báo, không new)
+         bean mặc định SINGLETON → phải stateless
+AOP    → proxy bọc bean để thêm transaction/cache/security
+         self-invocation KHÔNG qua proxy → annotation bị bỏ
+```
+
+| Khái niệm | Nắm gì |
+|-----------|--------|
+| Bean | object do Spring quản lý vòng đời |
+| ApplicationContext | container dùng thực tế (eager singleton) |
+| `@Transactional` | proxy mở/commit/rollback quanh method |
+| Auto-configuration | `@Conditional` — cấu hình theo classpath |
+| Inject | constructor (chuẩn), setter (tuỳ chọn), field (tránh) |
+
+**5 nguyên tắc khắc cốt:**
+
+1. **IoC + AOP là nền của mọi thứ** — hiểu hai cái này là hiểu Spring.
+2. **Bean mặc định singleton → phải stateless.**
+3. **`@Transactional` chạy nhờ proxy** → self-invocation và method `final` làm nó vô hiệu.
+4. **Constructor injection là chuẩn vàng** — final, dễ test, lộ phụ thuộc.
+5. **Auto-config dựa trên `@Conditional`** — chạy ngay nhưng vẫn ghi đè được.
+
+> [!TIP]
+> Một câu để nhớ: *Spring lấy đi hai việc nhàm chán — lắp ráp object (IoC) và rải code cắt-ngang như transaction (AOP) — bằng cách tạo bean và bọc chúng trong proxy. Mọi "ma thuật" annotation chỉ là hai cơ chế đó hoạt động sau lưng bạn.*

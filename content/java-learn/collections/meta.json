@@ -1,0 +1,12 @@
+{
+  "title": "Collections Framework",
+  "pages": [
+    "collection-framework-overview",
+    "list-vs-map-vs-set",
+    "arraylist-vs-linkedlist",
+    "set-implementations",
+    "hashmap-deep-dive",
+    "concurrenthashmap-deep-dive",
+    "concurrent-collections"
+  ]
+}
