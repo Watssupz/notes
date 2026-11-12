@@ -1,6 +1,5 @@
-import { llms, loader } from 'fumadocs-core/source';
+import { loader } from 'fumadocs-core/source';
 import { lucideIconsPlugin } from 'fumadocs-core/source/lucide-icons';
-import { docsContentRoute, docsImageRoute, docsRoute } from './shared';
 import { defineDocs } from 'fumadocs-mdx/macro';
 import { metaSchema, pageSchema } from 'fumadocs-core/source/schema';
 
@@ -8,24 +7,36 @@ const docs = defineDocs({
   dir: 'content/docs',
   docs: {
     schema: pageSchema,
-    postprocess: {
-      includeProcessedMarkdown: true,
-    },
+    postprocess: { includeProcessedMarkdown: true },
   },
-  meta: {
-    schema: metaSchema,
+  meta: { schema: metaSchema },
+});
+
+const javaLearn = defineDocs({
+  dir: 'content/java-learn',
+  docs: {
+    schema: pageSchema,
+    postprocess: { includeProcessedMarkdown: true },
   },
+  meta: { schema: metaSchema },
 });
 
-// See https://fumadocs.dev/docs/headless/source-api for more info
-export const source = loader({
-  baseUrl: docsRoute,
-  source: docs.toFumadocsSource(),
-  plugins: [lucideIconsPlugin()],
-});
+export const sources = {
+  docs: loader({
+    baseUrl: '/docs',
+    source: docs.toFumadocsSource(),
+    plugins: [lucideIconsPlugin()],
+  }),
+  'java-learn': loader({
+    baseUrl: '/java-learn',
+    source: javaLearn.toFumadocsSource(),
+    plugins: [lucideIconsPlugin()],
+  }),
+};
 
-export const docsLlms = llms(source, {
-  renderPage: async (page) => `# ${page.data.title} (${page.url})
+export function getSource(id: string) {
+  return (sources as Record<string, (typeof sources)['docs']>)[id];
+}
 
-${await page.data.getText('processed')}`,
-});
+// Tạm giữ để các file cũ còn import `source` không bị lỗi
+export const source = sources.docs;

@@ -11,21 +11,29 @@ html > body[data-scroll-locked] {
   --removed-body-scroll-bar-size: 0px !important;
 }
 
-:root,
-body,
-#nd-home-layout,
-#nd-docs-layout {
-  --fd-layout-width: 90% !important;
+/* Trang chính (Home page): Container full 100% để Header và Footer tràn viền toàn màn hình */
+#nd-home-layout {
+  width: 100% !important;
+  max-width: 100% !important;
+  --fd-layout-width: 90vw !important;
 }
 
-/* Header và đường line ngăn cách (border-b) tràn viền full 100% toàn màn hình */
+/* Thân trang chính (Home page body): hiển thị rộng đúng 90% toàn màn hình và căn giữa */
+#nd-home-layout > div.flex-1 {
+  width: 90% !important;
+  max-width: 90% !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+}
+
+/* Header trang chính: thanh bar tràn viền 100%, nội dung bên trong căn đúng 90% */
 #nd-nav,
 #nd-nav > div {
   width: 100% !important;
   max-width: 100% !important;
 }
 
-/* Nội dung bên trong Header (Logo, Menu, Icons) hiển thị 90% và căn giữa thẳng hàng với Body */
+/* Nội dung bên trong Header (Logo, Menu, Icons) hiển thị đúng 90% và căn giữa thẳng hàng với Body */
 #nd-nav > div > div:first-child {
   width: 90% !important;
   max-width: 90% !important;
@@ -35,7 +43,15 @@ body,
   padding-right: 0 !important;
 }
 
-/* Tăng width hiển thị cho trang tài liệu đọc docs */
+/* Các trang còn lại (Docs): hiển thị full 100% toàn màn hình */
+#nd-docs-layout {
+  --fd-layout-width: 100% !important;
+  max-width: 100% !important;
+  width: 100% !important;
+}
+
+/* Nội dung bài viết đọc docs: full width, không bị giới hạn max-width */
 #nd-page[data-layout-content] {
-  max-width: min(90%, 1200px) !important;
+  max-width: none !important;
+  width: 100% !important;
 }

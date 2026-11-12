@@ -2,86 +2,27 @@
 
 import { useState, useMemo } from "react";
 import Link from "next/link";
-import {
-  BookOpen,
-  Search,
-  ArrowUpRight,
-  X,
-  Filter,
-  ScanFace,
-} from "lucide-react";
+import { Search, ArrowUpRight, X, Filter } from "lucide-react";
+import { groups, sections } from "@/lib/section";
 
-interface GroupItem {
-  title: string;
-  meta: string;
-  href: string;
-  icon: React.ComponentType<{ className?: string }>;
-}
-
-interface ColumnGroup {
-  id: string;
-  tabKey: string;
-  tabLabel: string;
-  title: string;
-  items: GroupItem[];
-}
-
-/**
- * Lộ trình kỹ thuật được phân nhóm theo 3 cột chuẩn như giao diện mẫu:
- * 01 / INFRASTRUCTURE
- * 02 / BACKEND SYSTEMS
- * 03 / WEB & PRACTICE
- */
-const GROUPS: ColumnGroup[] = [
-  {
-    id: "01",
-    tabKey: "infra",
-    tabLabel: "Hạ tầng",
-    title: "INFRASTRUCTURE",
-    items: [
-      {
-        title: "Tài Liệu Chung",
-        meta: "Setup • Hướng dẫn cơ bản",
-        href: "/docs",
-        icon: BookOpen,
-      },
-    ],
-  },
-  {
-    id: "02",
-    tabKey: "backend",
-    tabLabel: "Backend",
-    title: "BACKEND SYSTEMS",
-    items: [
-      {
-        title: "",
-        meta: "",
-        href: "",
-        icon: ScanFace,
-      },
-    ],
-  },
-  {
-    id: "03",
-    tabKey: "web",
-    tabLabel: "Web",
-    title: "WEB & PRACTICE",
-    items: [
-      {
-        title: "",
-        meta: "",
-        href: "",
-        icon: ScanFace,
-      },
-    ],
-  },
-];
+// Dựng 3 cột từ section.ts, cùng cấu trúc với bản cũ nên JSX bên dưới không phải sửa
+const GROUPS = groups.map((g) => ({
+  id: g.id,
+  tabKey: g.key,
+  title: g.title,
+  items: sections
+    .filter((s) => s.group === g.key)
+    .map((s) => ({
+      title: s.title,
+      meta: s.meta,
+      href: `/${s.id}`,
+      icon: s.icon,
+    })),
+}));
 
 const FILTER_TABS = [
   { key: "all", label: "Tất cả" },
-  { key: "infra", label: "Hạ tầng" },
-  { key: "backend", label: "Backend" },
-  { key: "web", label: "Web" },
+  ...groups.map((g) => ({ key: g.key as string, label: g.label as string })),
 ];
 
 export default function HomePage() {

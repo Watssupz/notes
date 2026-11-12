@@ -1,6 +1,6 @@
-import type { BaseLayoutProps } from 'fumadocs-ui/layouts/shared';
-import { appName, gitConfig } from './shared';
-import { BookOpen } from 'lucide-react';
+import type { BaseLayoutProps } from "fumadocs-ui/layouts/shared";
+import { appName } from "./shared";
+import { BookOpen } from "lucide-react";
 
 export function baseOptions(): BaseLayoutProps {
   return {
@@ -14,8 +14,5 @@ export function baseOptions(): BaseLayoutProps {
         </div>
       ),
     },
-    githubUrl: gitConfig.repo
-      ? `https://github.com/${gitConfig.user}/${gitConfig.repo}`
-      : `https://github.com/${gitConfig.user}`,
   };
 }
