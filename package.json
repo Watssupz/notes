@@ -4,6 +4,12 @@
   "private": true,
   "scripts": {
     "build": "next build",
+    "prebuild": "npm run java:sources:build && npm run java:docs:check",
+    "java:sources:build": "node script/java/build-source-examples.mjs",
+    "java:docs:check": "node script/java/check-docs.mjs",
+    "java:docs:audit": "node script/java/audit-diagrams.mjs",
+    "java:docs:check-export": "node script/java/check-diagram-export.mjs out",
+    "java:docs:compare-layouts": "node script/java/compare-d2-layouts.mjs",
     "dev": "next dev",
     "start": "next start",
     "types:check": "next typegen && tsc --noEmit"
