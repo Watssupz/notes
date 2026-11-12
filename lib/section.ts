@@ -25,11 +25,4 @@ export const sections: Section[] = [
     group: 'infra',
     icon: BookOpen,
   },
-  {
-    id: 'java-learn',
-    title: 'Học Java',
-    meta: 'Core Java • Collections',
-    group: 'backend',
-    icon: Coffee,
-  },
 ];
