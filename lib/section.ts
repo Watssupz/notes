@@ -1,4 +1,4 @@
-import { BookOpen, Coffee, type LucideIcon } from "lucide-react";
+import { BookOpen, Coffee, KeyRound, type LucideIcon } from "lucide-react";
 
 // 3 cột + tab lọc của trang chủ
 export const groups = [
@@ -31,5 +31,12 @@ export const sections: Section[] = [
     meta: "Live • Core",
     group: "backend",
     icon: Coffee,
+  },
+  {
+    id: "jwt-learn",
+    title: "JWT & Auth",
+    meta: "Live • Core",
+    group: "backend",
+    icon: KeyRound,
   },
 ];

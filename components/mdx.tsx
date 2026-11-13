@@ -1,4 +1,5 @@
 import defaultMdxComponents from "fumadocs-ui/mdx";
+import { MermaidDiagram } from "@/components/mermaid";
 import type { MDXComponents } from "mdx/types";
 import { D2Diagram } from "@vanhiep99w/docs-kit/components/d2";
 import { D2InteractiveDiagram } from "@vanhiep99w/docs-kit/components/d2-interactive";
@@ -25,6 +26,7 @@ export function getMDXComponents(components?: MDXComponents) {
     TerminalSession,
     ProtocolExchange,
     SpanWaterfall,
+    MermaidDiagram,
     SourceRef,
     Callout,
     Card,

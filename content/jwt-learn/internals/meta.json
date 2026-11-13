@@ -1,0 +1,11 @@
+{
+  "title": "Internals",
+  "pages": [
+    "token-creation-flow",
+    "token-validation-flow",
+    "header-payload-signature",
+    "signature-deep-dive",
+    "time-based-claims",
+    "audience-issuer-subject"
+  ]
+}

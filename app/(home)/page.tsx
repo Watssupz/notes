@@ -60,6 +60,11 @@ export default function HomePage() {
     return filteredGroups.reduce((acc, g) => acc + g.items.length, 0);
   }, [filteredGroups]);
 
+  // Số lượng mục nhiều nhất trong các cột đang hiển thị
+  const maxItems = useMemo(() => {
+    return Math.max(...filteredGroups.map((g) => g.items.length), 0);
+  }, [filteredGroups]);
+
   // Tự động đếm tổng số lượng lộ trình từ tất cả các groups
   const totalRoutes = useMemo(() => {
     return GROUPS.reduce((acc, g) => acc + g.items.length, 0);
@@ -155,12 +160,12 @@ export default function HomePage() {
       {filteredGroups.length > 0 ? (
         <div className="w-full border border-fd-border rounded-xl bg-fd-card overflow-hidden shadow-xs">
           <div
-            className={`grid divide-y lg:divide-y-0 lg:divide-x divide-fd-border ${
+            className={`grid divide-fd-border ${
               filteredGroups.length === 1
                 ? "grid-cols-1"
                 : filteredGroups.length === 2
-                  ? "grid-cols-1 md:grid-cols-2"
-                  : "grid-cols-1 lg:grid-cols-3"
+                  ? "grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x"
+                  : "grid-cols-1 lg:grid-cols-3 divide-y lg:divide-y-0 lg:divide-x"
             }`}
           >
             {filteredGroups.map((group) => (
@@ -184,14 +189,25 @@ export default function HomePage() {
                 </div>
 
                 {/* Danh sách các mục trong nhóm */}
-                <div className="divide-y divide-fd-border flex-1">
-                  {group.items.map((item) => {
+                <div className="flex-1">
+                  {group.items.map((item, index) => {
                     const Icon = item.icon;
+                    const isLastInGroup = index === group.items.length - 1;
+                    const isLastRow = index === maxItems - 1;
+
+                    let borderBottomClass = "border-b border-fd-border";
+                    if (isLastRow) {
+                      borderBottomClass = "border-b-0";
+                    } else if (isLastInGroup) {
+                      borderBottomClass =
+                        "border-b-0 md:border-b md:border-fd-border";
+                    }
+
                     return (
                       <Link
                         key={item.href}
                         href={item.href}
-                        className="group flex items-center justify-between px-6 py-4 transition-colors hover:bg-fd-muted/50"
+                        className={`group flex items-center justify-between px-6 py-4 transition-colors hover:bg-fd-muted/50 ${borderBottomClass}`}
                       >
                         <div className="flex items-center gap-3.5 min-w-0">
                           {/* Icon */}
