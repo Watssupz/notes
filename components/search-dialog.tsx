@@ -7,11 +7,6 @@ import { usePathname } from "next/navigation";
 import { useMemo } from "react";
 import { sections } from "@/lib/section";
 
-const SEARCH_TAGS = sections.map((s) => ({
-  name: s.title,
-  value: s.id,
-}));
-
 export default function CustomSearchDialog(props: DefaultSearchDialogProps) {
   const pathname = usePathname();
 
@@ -24,10 +19,7 @@ export default function CustomSearchDialog(props: DefaultSearchDialogProps) {
   return (
     <DefaultSearchDialog
       {...props}
-      tags={SEARCH_TAGS}
       defaultTag={currentSection?.id}
-      allowClear
     />
   );
 }
-
