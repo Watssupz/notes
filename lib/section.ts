@@ -1,4 +1,10 @@
-import { BookOpen, Coffee, KeyRound, type LucideIcon } from "lucide-react";
+import {
+  BookOpen,
+  Coffee,
+  InfinityIcon,
+  KeyRound,
+  type LucideIcon,
+} from "lucide-react";
 
 // 3 cột + tab lọc của trang chủ
 export const groups = [
@@ -24,6 +30,13 @@ export const sections: Section[] = [
     meta: "Setup • Hướng dẫn cơ bản",
     group: "infra",
     icon: BookOpen,
+  },
+  {
+    id: "90daysofdevops",
+    title: "90 Days of DevOps",
+    meta: "90 ngày học DevOps - Michael Cade.",
+    group: "infra",
+    icon: InfinityIcon,
   },
   {
     id: "java-learn",

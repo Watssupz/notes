@@ -30,6 +30,15 @@ const jwtLearn = defineDocs({
   meta: { schema: metaSchema },
 });
 
+const _90daysofdevops = defineDocs({
+  dir: "content/90daysofdevops",
+  docs: {
+    schema: pageSchema,
+    postprocess: { includeProcessedMarkdown: true },
+  },
+  meta: { schema: metaSchema },
+});
+
 export const sources = {
   docs: loader({
     baseUrl: "/docs",
@@ -44,6 +53,11 @@ export const sources = {
   "jwt-learn": loader({
     baseUrl: "/jwt-learn",
     source: jwtLearn.toFumadocsSource(),
+    plugins: [lucideIconsPlugin()],
+  }),
+  "90daysofdevops": loader({
+    baseUrl: "/90daysofdevops",
+    source: _90daysofdevops.toFumadocsSource(),
     plugins: [lucideIconsPlugin()],
   }),
 };
