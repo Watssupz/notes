@@ -1,0 +1,9 @@
+{
+  "title": "Fundamentals",
+  "pages": [
+    "redis-overview",
+    "redis-architecture",
+    "keys-and-ttl"
+  ]
+}
+

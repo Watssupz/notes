@@ -175,13 +175,13 @@ export default defineConfig({
       // Callouts kiểu GitHub (> [!NOTE]) -> Dùng chung cho cả 3 thư mục docs, java-learn, jwt-learn
       remarkGithubCallouts,
 
-      // Bộ công cụ docs-kit -> Phục vụ cho `content/java-learn`
-      [remarkD2, { concurrency: 4 }], // Sơ đồ kiến trúc D2 (chạy song song 4 worker)
-      remarkCodeWalkthrough,          // Giải thích code từng bước
-      remarkTerminalSession,          // Giả lập terminal console
-      remarkCodeDiff,                 // So sánh code diff
-      remarkProtocolExchange,         // Minh họa giao thức HTTP/TCP
-      remarkSpanWaterfall,            // Thác đo độ trễ luồng concurrency
+      // Bộ công cụ docs-kit -> Sơ đồ kiến trúc D2 (chạy 1 worker nhẹ nhàng, an toàn)
+      [remarkD2, { concurrency: 1 }],
+      remarkCodeWalkthrough, // Giải thích code từng bước
+      remarkTerminalSession, // Giả lập terminal console
+      remarkCodeDiff, // So sánh code diff
+      remarkProtocolExchange, // Minh họa giao thức HTTP/TCP
+      remarkSpanWaterfall, // Thác đo độ trễ luồng concurrency
 
       // Callout dự phòng
       remarkCallouts,

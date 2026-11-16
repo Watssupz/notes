@@ -1,0 +1,10 @@
+{
+  "title": "Advanced",
+  "pages": [
+    "transactions",
+    "lua-scripting",
+    "keyspace-notifications",
+    "client-side-caching",
+    "redis-modules"
+  ]
+}

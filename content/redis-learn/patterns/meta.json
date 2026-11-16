@@ -1,0 +1,12 @@
+{
+  "title": "Patterns & Use Cases",
+  "pages": [
+    "caching-patterns",
+    "request-coalescing",
+    "session-store",
+    "rate-limiting",
+    "leaderboard-counting",
+    "distributed-lock",
+    "pub-sub"
+  ]
+}

@@ -1,6 +1,7 @@
 import {
   BookOpen,
   Coffee,
+  Cpu,
   Database,
   InfinityIcon,
   KeyRound,
@@ -59,5 +60,12 @@ export const sections: Section[] = [
     meta: "Database • Indexing • Tối ưu",
     group: "backend",
     icon: Database,
+  },
+  {
+    id: "redis-learn",
+    title: "Redis",
+    meta: "Live • Cache",
+    group: "backend",
+    icon: Cpu,
   },
 ];

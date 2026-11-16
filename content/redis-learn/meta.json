@@ -1,0 +1,14 @@
+{
+  "title": "Redis",
+  "pages": [
+    "index",
+    "fundamentals",
+    "data-structures",
+    "persistence",
+    "replication",
+    "performance",
+    "patterns",
+    "advanced",
+    "operations"
+  ]
+}

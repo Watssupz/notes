@@ -1,0 +1,13 @@
+{
+  "title": "Data Structures",
+  "pages": [
+    "strings",
+    "hashes",
+    "lists",
+    "sets",
+    "sorted-sets",
+    "bitmaps-hyperloglog",
+    "geospatial",
+    "streams"
+  ]
+}

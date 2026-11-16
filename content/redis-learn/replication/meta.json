@@ -1,0 +1,8 @@
+{
+  "title": "Replication & High Availability",
+  "pages": [
+    "replication",
+    "sentinel",
+    "cluster"
+  ]
+}

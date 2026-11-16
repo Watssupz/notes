@@ -46,6 +46,14 @@ const sqlLearn = defineDocs({
   },
   meta: { schema: metaSchema },
 });
+const redisLearn = defineDocs({
+  dir: "content/redis-learn",
+  docs: {
+    schema: pageSchema,
+    postprocess: { includeProcessedMarkdown: true },
+  },
+  meta: { schema: metaSchema },
+});
 
 export const sources = {
   docs: loader({
@@ -71,6 +79,11 @@ export const sources = {
   "sql-learn": loader({
     baseUrl: "/sql-learn",
     source: sqlLearn.toFumadocsSource(),
+    plugins: [lucideIconsPlugin()],
+  }),
+  "redis-learn": loader({
+    baseUrl: "/redis-learn",
+    source: redisLearn.toFumadocsSource(),
     plugins: [lucideIconsPlugin()],
   }),
 };
