@@ -23,4 +23,4 @@ for (const document of documents) {
   });
   if (hasD2) await unified().use(remarkD2, d2Options).run(document.tree, { path: resolve(projectRoot, 'content/java-learn', document.path), value: document.value });
 }
-console.log(`[docs] ${documents.length} pages; ${d2} D2 diagrams validated; ${mermaid} Mermaid diagrams; ${inventory.reviewedText} reviewed non-diagram fences; ${projects.size} source projects, ${references.length} references validated`);
+console.log(`[java:docs] ${documents.length} pages; ${d2} D2 diagrams validated; ${mermaid} Mermaid diagrams; ${inventory.reviewedText} reviewed non-diagram fences; ${projects.size} source projects, ${references.length} references validated`);

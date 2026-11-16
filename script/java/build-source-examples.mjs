@@ -1,4 +1,4 @@
-import { readdir, readFile, mkdir, writeFile, rm, rename } from 'node:fs/promises';
+import { readdir, readFile, mkdir, writeFile, rm, rename, copyFile } from 'node:fs/promises';
 import { resolve, relative, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createProcessor } from '@mdx-js/mdx';
@@ -131,6 +131,18 @@ export async function buildSourceExamples({
       ] });
       count += files.length;
     }
+    try {
+      const existingRaw = await readFile(resolve(outputDir, 'manifest.json'), 'utf8');
+      const existingManifest = JSON.parse(existingRaw);
+      const otherProjects = existingManifest.filter((m) => !projects.has(m.id));
+      manifest.push(...otherProjects);
+      const currentFiles = await readdir(outputDir);
+      for (const file of currentFiles) {
+        if (file !== 'manifest.json' && !file.endsWith('-main.json')) {
+          await copyFile(resolve(outputDir, file), resolve(staging, file));
+        }
+      }
+    } catch {}
     await writeFile(resolve(staging, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
     await mkdir(dirname(outputDir), { recursive: true });
     await rm(outputDir, { recursive: true, force: true });
@@ -139,7 +151,7 @@ export async function buildSourceExamples({
     highlighter.dispose();
     await rm(staging, { recursive: true, force: true });
   }
-  console.log(`[source-examples] ${projects.size} projects, ${count} files, ${references.length} validated references → ${relative(projectRoot, outputDir)}`);
+  console.log(`[java:source-examples] ${projects.size} projects, ${count} files, ${references.length} validated references → ${relative(projectRoot, outputDir)}`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

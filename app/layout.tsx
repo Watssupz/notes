@@ -16,6 +16,9 @@ export const metadata: Metadata = {
     template: `%s | ${appName}`,
   },
   description: "Tài liệu & Ghi chú kỹ thuật",
+  icons: {
+    icon: "/icon.svg",
+  },
 };
 const gtmId = process.env.NEXT_PUBLIC_GTM_ID;
 

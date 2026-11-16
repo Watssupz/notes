@@ -1,0 +1,13 @@
+{
+  "title": "SQL",
+  "pages": [
+    "index",
+    "fundamentals",
+    "optimization",
+    "mysql",
+    "postgresql",
+    "oracle",
+    "comparison",
+    "interview"
+  ]
+}

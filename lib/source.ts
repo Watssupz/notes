@@ -38,6 +38,14 @@ const _90daysofdevops = defineDocs({
   },
   meta: { schema: metaSchema },
 });
+const sqlLearn = defineDocs({
+  dir: "content/sql-learn",
+  docs: {
+    schema: pageSchema,
+    postprocess: { includeProcessedMarkdown: true },
+  },
+  meta: { schema: metaSchema },
+});
 
 export const sources = {
   docs: loader({
@@ -58,6 +66,11 @@ export const sources = {
   "90daysofdevops": loader({
     baseUrl: "/90daysofdevops",
     source: _90daysofdevops.toFumadocsSource(),
+    plugins: [lucideIconsPlugin()],
+  }),
+  "sql-learn": loader({
+    baseUrl: "/sql-learn",
+    source: sqlLearn.toFumadocsSource(),
     plugins: [lucideIconsPlugin()],
   }),
 };

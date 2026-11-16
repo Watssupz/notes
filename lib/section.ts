@@ -1,6 +1,7 @@
 import {
   BookOpen,
   Coffee,
+  Database,
   InfinityIcon,
   KeyRound,
   type LucideIcon,
@@ -48,8 +49,15 @@ export const sections: Section[] = [
   {
     id: "jwt-learn",
     title: "JWT & Auth",
-    meta: "Live • Core",
+    meta: "Bảo mật • Xác thực • Token",
     group: "backend",
     icon: KeyRound,
+  },
+  {
+    id: "sql-learn",
+    title: "SQL",
+    meta: "Database • Indexing • Tối ưu",
+    group: "backend",
+    icon: Database,
   },
 ];
