@@ -1,0 +1,1409 @@
+---
+title: "Frontend build tooling: pipeline và từng công cụ"
+description: "Tài liệu phân biệt compiler, type checker, bundler, minifier, build tool, package manager và task orchestrator; đi sâu vào từng công cụ và cách kết hợp."
+---
+
+
+Tài liệu này giúp bạn hiểu **mỗi công cụ đứng ở đâu, thực sự làm gì, không làm gì và khi nào nên dùng**. Ví dụ sử dụng JavaScript, TypeScript và React; các nguyên tắc về module, bundling và caching vẫn áp dụng cho những frontend framework khác.
+
+Có thể đọc theo ba lượt, tùy vào phần pipeline bạn đang cần hiểu:
+
+1. **Nắm nền tảng:** phần 1–3 giải thích các tầng và toàn bộ pipeline.
+2. **Hiểu từng công cụ:** phần 4–9 đi sâu vào package manager, compiler, bundler, build tool, CSS tooling và monorepo tooling.
+3. **Áp dụng:** phần 10–13 có bảng chọn tool, bài thực hành, cách đo hiệu năng và checklist debug.
+
+<Callout type="info" title="Phạm vi phiên bản">
+
+Các thay đổi quan trọng được đối chiếu với tài liệu chính thức ngày **14/10/2026**, đặc biệt là **Vite 8** và **Next.js 16**. Không áp dụng mặc định mới cho dự án đang dùng major version cũ. Các cấu hình bên dưới là ví dụ độc lập, không yêu cầu cài toàn bộ công cụ vào cùng một project.
+
+</Callout>
+
+## Mục lục
+
+- [1. Vì sao frontend cần build tooling](#1-vì-sao-frontend-cần-build-tooling)
+- [2. Bản đồ các loại công cụ](#2-bản-đồ-các-loại-công-cụ)
+  - [2.1. Phân loại theo nhiệm vụ, không theo tên sản phẩm](#21-phân-loại-theo-nhiệm-vụ-không-theo-tên-sản-phẩm)
+  - [2.2. Compiler và transpiler không phải hai phe đối lập](#22-compiler-và-transpiler-không-phải-hai-phe-đối-lập)
+  - [2.3. Build tool không đồng nghĩa với bundler](#23-build-tool-không-đồng-nghĩa-với-bundler)
+  - [2.4. `npm run build` không nói lên bundler nào đang chạy](#24-npm-run-build-không-nói-lên-bundler-nào-đang-chạy)
+- [3. Đi qua một build pipeline cụ thể](#3-đi-qua-một-build-pipeline-cụ-thể)
+  - [3.1. Các file của ví dụ và nơi ứng dụng bắt đầu](#31-các-file-của-ví-dụ-và-nơi-ứng-dụng-bắt-đầu)
+  - [3.2. Entry: file được chọn làm điểm bắt đầu](#32-entry-file-được-chọn-làm-điểm-bắt-đầu)
+  - [3.3. Parsing và transformation](#33-parsing-và-transformation)
+  - [3.4. Type checking là một nhiệm vụ riêng](#34-type-checking-là-một-nhiệm-vụ-riêng)
+  - [3.5. Xây dependency graph và bundling](#35-xây-dependency-graph-và-bundling)
+  - [3.6. Code splitting](#36-code-splitting)
+  - [3.7. Tree shaking, dead-code elimination và minification](#37-tree-shaking-dead-code-elimination-và-minification)
+  - [3.8. Browser target không đồng nghĩa với polyfill](#38-browser-target-không-đồng-nghĩa-với-polyfill)
+  - [3.9. CSS, assets và output](#39-css-assets-và-output)
+  - [3.10. Source maps, dev server và HMR](#310-source-maps-dev-server-và-hmr)
+- [4. Package managers và runtime](#4-package-managers-và-runtime)
+  - [4.1. npm](#41-npm)
+  - [4.2. pnpm](#42-pnpm)
+  - [4.3. Yarn](#43-yarn)
+  - [4.4. Node.js và sự chồng lấn chức năng](#44-nodejs-và-sự-chồng-lấn-chức-năng)
+- [5. Compilers, transformers và type checker](#5-compilers-transformers-và-type-checker)
+  - [5.1. Babel](#51-babel)
+  - [5.2. SWC](#52-swc)
+  - [5.3. TypeScript compiler — `tsc`](#53-typescript-compiler--tsc)
+  - [5.4. Oxc](#54-oxc)
+- [6. Bundlers: đi sâu vào từng công cụ](#6-bundlers-đi-sâu-vào-từng-công-cụ)
+  - [6.1. Webpack](#61-webpack)
+  - [6.2. Rollup](#62-rollup)
+  - [6.3. esbuild](#63-esbuild)
+  - [6.4. Rspack](#64-rspack)
+  - [6.5. Rolldown](#65-rolldown)
+  - [6.6. Turbopack](#66-turbopack)
+  - [6.7. So sánh nhanh tầng bundler](#67-so-sánh-nhanh-tầng-bundler)
+- [7. Build tools: pipeline và developer experience](#7-build-tools-pipeline-và-developer-experience)
+  - [7.1. Vite](#71-vite)
+  - [7.2. Parcel](#72-parcel)
+  - [7.3. Rsbuild](#73-rsbuild)
+  - [7.4. So sánh Vite, Parcel và Rsbuild](#74-so-sánh-vite-parcel-và-rsbuild)
+- [8. Minifiers và CSS tooling](#8-minifiers-và-css-tooling)
+  - [8.1. Terser](#81-terser)
+  - [8.2. Sass](#82-sass)
+  - [8.3. PostCSS](#83-postcss)
+  - [8.4. Lightning CSS](#84-lightning-css)
+- [9. Task orchestration cho nhiều package](#9-task-orchestration-cho-nhiều-package)
+  - [9.1. Vì sao cần một tầng khác bundler](#91-vì-sao-cần-một-tầng-khác-bundler)
+  - [9.2. Turborepo](#92-turborepo)
+  - [9.3. Nx](#93-nx)
+- [10. Cách chọn và kết hợp công cụ](#10-cách-chọn-và-kết-hợp-công-cụ)
+  - [10.1. Những so sánh đúng tầng](#101-những-so-sánh-đúng-tầng)
+  - [10.2. Những tổ hợp điển hình](#102-những-tổ-hợp-điển-hình)
+  - [10.3. Chọn theo nhu cầu](#103-chọn-theo-nhu-cầu)
+- [11. Bài thực hành: quan sát pipeline bằng Vite](#11-bài-thực-hành-quan-sát-pipeline-bằng-vite)
+  - [11.1. Chạy project mẫu có sẵn](#111-chạy-project-mẫu-có-sẵn)
+  - [11.2. Đối chiếu source trước khi build](#112-đối-chiếu-source-trước-khi-build)
+  - [11.3. Quan sát development](#113-quan-sát-development)
+  - [11.4. Quan sát production output](#114-quan-sát-production-output)
+  - [11.5. Quan sát sự khác nhau giữa type checking và build](#115-quan-sát-sự-khác-nhau-giữa-type-checking-và-build)
+- [12. Đo hiệu năng và debug đúng tầng](#12-đo-hiệu-năng-và-debug-đúng-tầng)
+  - [12.1. Không gộp mọi thứ thành một con số “build nhanh”](#121-không-gộp-mọi-thứ-thành-một-con-số-build-nhanh)
+  - [12.2. Xác định toolchain thực tế](#122-xác-định-toolchain-thực-tế)
+  - [12.3. Tìm bottleneck thay vì đổi tool ngay](#123-tìm-bottleneck-thay-vì-đổi-tool-ngay)
+- [13. Checklist các lỗi dễ nhầm](#13-checklist-các-lỗi-dễ-nhầm)
+- [14. Tóm tắt để ghi nhớ](#14-tóm-tắt-để-ghi-nhớ)
+
+## 1. Vì sao frontend cần build tooling
+
+Browser chạy JavaScript và đọc HTML/CSS, nhưng source code trong dự án thường có thêm:
+
+- TypeScript với type annotation, interface và type-only import.
+- JSX/TSX của React hoặc file component riêng của framework.
+- Import package bằng tên như `react`, thay vì URL mà browser tải được trực tiếp.
+- Sass, CSS Modules, ảnh, font và những asset cần xử lý.
+- Code cần tương thích với nhiều browser khác nhau.
+- Những tính năng chỉ nên được tải khi người dùng cần đến.
+
+Build tooling biến source code thành output phù hợp với môi trường chạy, đồng thời hỗ trợ trải nghiệm phát triển: cập nhật nhanh, báo lỗi, source map và cấu hình nhất quán.
+
+**Không phải website nào cũng bắt buộc có bundler.** Browser hiện đại hỗ trợ ES modules; một website đơn giản có thể dùng HTML, CSS và JavaScript trực tiếp. Bundling là lựa chọn để tổ chức và tối ưu cách phân phối code, không phải điều kiện để JavaScript chạy được.
+
+Cũng cần tách hai môi trường:
+
+| Môi trường | Công việc | Ví dụ |
+|---|---|---|
+| **Build/development** | Chạy CLI, đọc file, transform, bundle, phục vụ dev server | Node.js chạy Vite hoặc Webpack |
+| **Browser runtime** | Thực thi JavaScript đã được phục vụ cho người dùng | React render giao diện trong Chrome |
+
+Một package dùng được trong Node.js chưa chắc dùng được trong browser. Bundler không tự biến `node:fs` thành khả năng đọc ổ đĩa của người dùng.
+
+## 2. Bản đồ các loại công cụ
+
+### 2.1. Phân loại theo nhiệm vụ, không theo tên sản phẩm
+
+| Loại | Vấn đề giải quyết | Input → output điển hình | Công cụ |
+|---|---|---|---|
+| **Runtime** | Chạy code và CLI | JavaScript → thực thi | Node.js; Bun/Deno cũng có runtime |
+| **Package manager** | Cài, resolve và quản lý dependency | Manifest + lockfile → dependency đã cài | npm, pnpm, Yarn |
+| **Compiler/transpiler** | Chuyển đổi ngôn ngữ hoặc cú pháp | TS/JSX/modern JS → JavaScript | Babel, SWC, TypeScript compiler, Oxc transformer |
+| **Type checker** | Kiểm tra tính đúng đắn của kiểu | Source + type declarations → diagnostics | TypeScript compiler |
+| **Bundler** | Lần theo các import và tổ chức code thành các file đầu ra | File khởi đầu + các module được import → bundles/chunks | Webpack, Rollup, esbuild, Rspack, Rolldown, Turbopack |
+| **Minifier** | Giảm kích thước code, giữ nguyên hành vi theo các giả định cấu hình | JavaScript → JavaScript nhỏ hơn | Terser, esbuild, SWC, Oxc minifier |
+| **CSS processor/compiler** | Chuyển đổi và tối ưu stylesheet | SCSS/CSS → CSS | Sass, PostCSS, Lightning CSS |
+| **Build tool** | Tích hợp pipeline và developer experience | Project + config → dev server hoặc production output | Vite, Parcel, Rsbuild |
+| **Task orchestrator** | Điều phối nhiều task/package và cache kết quả | Task graph → chạy hoặc khôi phục output | Nx, Turborepo |
+| **Framework tooling** | Build theo quy tắc rendering/routing của framework | App → client/server/static output | Next.js CLI, Angular CLI, tooling của Nuxt/SvelteKit |
+
+Các nhóm này **không loại trừ nhau**. esbuild có thể transform, bundle và minify. Parcel vừa là bundler vừa cung cấp trải nghiệm build hoàn chỉnh. Nx có thể tích hợp build tool qua plugin, nhưng công việc compile/bundle vẫn do công cụ bên dưới thực hiện.
+
+### 2.2. Compiler và transpiler không phải hai phe đối lập
+
+**Compiler** là thuật ngữ rộng cho việc dịch code. **Transpiler** thường được dùng khi dịch source-to-source, ví dụ TypeScript → JavaScript hoặc JavaScript mới → JavaScript tương thích hơn.
+
+Trong frontend, Babel và SWC được gọi là compiler hoặc transpiler tùy ngữ cảnh. Điều cần quan tâm là **transform nào được thực hiện**, không phải tranh luận tên gọi.
+
+### 2.3. Build tool không đồng nghĩa với bundler
+
+Bundler là một phần của build pipeline. Build tool thường bổ sung:
+
+- Dev server, file watching và HMR.
+- Cấu hình mặc định cho ứng dụng.
+- File HTML khởi đầu (HTML entry), CSS/assets và environment variables.
+- Hệ thống plugins và tích hợp framework.
+- CLI thống nhất cho development và production build.
+
+Vì vậy, **Vite vs Rsbuild** là so sánh ở tầng build tool; **Webpack vs Rspack** là so sánh ở tầng bundler. Vite và Webpack vẫn có thể được so sánh như hai lựa chọn toolchain cho một ứng dụng, nhưng cần nhớ Webpack thường đi cùng thêm loaders, plugins và dev server.
+
+### 2.4. `npm run build` không nói lên bundler nào đang chạy
+
+Lệnh này chỉ chạy script `build` trong `package.json`:
+
+```json
+{
+  "scripts": {
+    "build": "tsc --noEmit && vite build"
+  }
+}
+```
+
+Trong ví dụ này, npm điều hành script; TypeScript kiểm tra type; Vite điều hành production build. npm không trực tiếp compile hoặc bundle ứng dụng.
+
+Với project khác, script có thể là `next build`, `rsbuild build`, `webpack` hoặc `turbo run build`. Luôn đọc script trước khi kết luận về toolchain.
+
+## 3. Đi qua một build pipeline cụ thể
+
+### 3.1. Các file của ví dụ và nơi ứng dụng bắt đầu
+
+Ví dụ dùng **Vite + React + TypeScript**, có source chạy được trong repository:
+
+<SourceRef project="frontend-build-lab" file="src/App.tsx" variant="button">Mở source đầy đủ · Frontend build lab</SourceRef>
+
+```text
+index.html           ← HTML entry của Vite
+src/
+  main.tsx           ← khởi động React, render App
+  App.tsx            ← UI, static import math và dynamic import admin
+  math.ts            ← các hàm tính toán
+  admin.ts           ← chức năng tải khi bấm nút
+  styles.css         ← stylesheet
+```
+
+Cách chạy và quan sát output ở phần 11. Các đoạn ngắn dưới đây vẫn giữ inline để đọc cùng giải thích; mở drawer khi cần toàn bộ config/file.
+
+Phần quan trọng của <SourceRef project="frontend-build-lab" file="index.html">index.html</SourceRef>:
+
+```html
+<div id="root"></div>
+<script type="module" src="/src/main.tsx"></script>
+```
+
+`div` là chỗ để React render. `script` chỉ ra file khởi động JavaScript; browser không tự hiểu TSX, Vite phải transform trước khi phục vụ hoặc build.
+
+<SourceRef project="frontend-build-lab" file="src/main.tsx">main.tsx</SourceRef> khởi tạo React và render component:
+
+```tsx
+import { createRoot } from 'react-dom/client';
+import App from './App';
+import './styles.css';
+
+const element = document.getElementById('root');
+if (!element) throw new Error('Missing #root');
+createRoot(element).render(<App />);
+```
+
+Trong <SourceRef project="frontend-build-lab" file="src/math.ts">math.ts</SourceRef>:
+
+```ts
+export function sum(a: number, b: number): number {
+  return a + b;
+}
+
+export function unusedMessage(): string {
+  return 'UNUSED_MATH_SENTINEL';
+}
+```
+
+`export` cho module khác import hàm, không tự chạy hàm và không biến `math.ts` thành entry. `App.tsx` chỉ import `sum`, rồi hiển thị **Kết quả: 5**.
+
+<SourceRef project="frontend-build-lab" file="src/App.tsx" region="lazy-import">Hàm xử lý nút trong App</SourceRef> dùng dynamic import:
+
+```tsx
+async function openAdmin() {
+  const { getAdminMessage } = await import('./admin');
+  setMessage(getAdminMessage());
+}
+```
+
+<SourceRef project="frontend-build-lab" file="src/admin.ts">admin.ts</SourceRef> vẫn rất nhỏ:
+
+```ts
+export function getAdminMessage(): string {
+  return 'Admin module đã được tải';
+}
+```
+
+Luồng: browser nhận HTML → Vite xử lý entry/imports → main render App → App dùng `sum` → khi bấm nút mới yêu cầu module admin và hiển thị thông báo. Source `unusedMessage` vẫn tồn tại, nhưng bundler có thể loại nó khỏi runtime output nếu an toàn.
+
+### 3.2. Entry: file được chọn làm điểm bắt đầu
+
+**Entry**, hay **entry point**, nghĩa là **điểm bắt đầu**. Trong quá trình build, đó là file/input mà công cụ được yêu cầu bắt đầu xử lý, rồi lần theo các import để tìm những module liên quan.
+
+Với ví dụ Vite ở trên, cần phân biệt hai cách nói:
+
+| Cách nói | File cụ thể | Ý nghĩa |
+|---|---|---|
+| **HTML entry của Vite** | `index.html` | Input HTML mà Vite xử lý, chứa tham chiếu đến script của ứng dụng |
+| **JavaScript entry của ứng dụng** | `src/main.tsx` | File khởi động phần code React, được HTML tham chiếu |
+| **Module được import** | `src/math.ts` | File cung cấp hàm cho `App.tsx`, không phải entry của ví dụ |
+
+**Tên `main.tsx` không tự có tính chất đặc biệt.** Nếu đổi thành `src/start.tsx` và sửa script trong HTML cho đúng, file đó vẫn có thể khởi động ứng dụng. Điều quyết định là tham chiếu/cấu hình, không phải tên file hay số lượng `export`.
+
+Các tool chọn entry theo cách khác nhau:
+
+- Vite app thông thường bắt đầu từ HTML, ví dụ `index.html`.
+- Webpack có thể chọn script bằng cấu hình `entry: './src/main.tsx'`.
+- Rollup có thể chọn source của library bằng `input: 'src/index.js'`.
+- Framework như Next.js xác định các điểm bắt đầu theo quy tắc của framework; không nhất thiết có một file `main.tsx` để bạn tự cấu hình.
+
+Một build cũng có thể có nhiều entries. Không cần coi mọi project là “một ứng dụng luôn có đúng một file main”.
+
+#### Module resolution: tìm file mà import đang nói đến
+
+Sau khi có điểm bắt đầu, công cụ gặp dòng:
+
+```ts
+import { sum } from './math';
+```
+
+Nó cần xác định **`./math` là file nào**. Trong ví dụ, đó là `src/math.ts` vì đường dẫn được tính từ file `src/App.tsx` đang import nó.
+
+Quá trình tìm đúng file/module cho một import gọi là **module resolution**. Có thể hiểu ngắn gọn là **“tìm địa chỉ thật của thứ đang được import”**.
+
+Với các dạng import khác, quy tắc tìm cũng khác:
+
+- `./math` là đường dẫn tương đối; công cụ tìm file theo extensions được hỗ trợ, chẳng hạn `.ts`.
+- `react-dom/client` là tên package/subpath; công cụ tìm trong dependency đã cài và đọc các quy tắc của package, như trường `exports` trong `package.json`.
+- `@/components/Button` sử dụng alias; công cụ cần mapping cho biết `@` trỏ đến thư mục nào.
+- Một package có thể cung cấp implementation khác nhau cho browser, Node.js, ESM hoặc CommonJS. Môi trường và cấu hình quyết định implementation được chọn.
+
+Alias là nơi dễ gặp tình trạng **“IDE hiểu nhưng build không hiểu”**. `paths` trong `tsconfig.json` không tự bảo đảm mọi runtime/bundler hiểu alias, và `tsc` không tự rewrite đường dẫn đó trong JavaScript output. Một số build tool hỗ trợ đọc mapping, một số cần cấu hình riêng. Với Vite 8, việc đọc `paths` có thể bật bằng `resolve.tsconfigPaths`; mặc định tính năng này không được bật.
+
+### 3.3. Parsing và transformation
+
+Compiler parse source thành **AST — Abstract Syntax Tree**, rồi transform cú pháp và sinh code mới. Ví dụ TypeScript:
+
+```ts
+import { sum } from './math';
+const total: number = sum(2, 3);
+```
+
+Sau khi bỏ type annotation, JavaScript về mặt khái niệm là:
+
+```js
+import { sum } from './math';
+const total = sum(2, 3);
+```
+
+**Import vẫn còn.** Transform file này không đồng nghĩa với đã bundle cả `math.ts`.
+
+JSX cũng cần được transform. Với automatic JSX runtime, JSX trở thành lời gọi helper từ JSX runtime của React; tên helper, import và cách tối ưu cụ thể tùy compiler/configuration.
+
+### 3.4. Type checking là một nhiệm vụ riêng
+
+Đoạn này hợp lệ về cú pháp TypeScript nhưng sai type:
+
+```ts
+const age: number = 'hai mươi';
+```
+
+Một transformer chỉ bỏ type có thể xuất:
+
+```js
+const age = 'hai mươi';
+```
+
+JavaScript đó vẫn chạy. Type checker mới là thành phần phát hiện `string` không thể gán cho `number`.
+
+Điểm cần nhớ:
+
+- Babel TypeScript transform, SWC và esbuild không thay thế TypeScript type checker.
+- Một framework có thể tự chạy type checking trong lệnh build, dù compiler bên dưới không kiểm tra type.
+- Vite core không tự type-check source TypeScript; script của template có thể chạy `tsc` trước Vite.
+- `tsc --noEmit` phải đọc đúng tsconfig chứa source cần kiểm tra. Với project references, có thể cần `tsc -b` thay vì chỉ chạy ở một solution tsconfig rỗng.
+
+**Build thành công chỉ chứng minh những bước đã được cấu hình đều thành công.** Nó không tự chứng minh type, lint, test và runtime behavior đều đúng.
+
+### 3.5. Xây dependency graph và bundling
+
+Sau khi xác định điểm bắt đầu, bundler đọc các import để biết ứng dụng cần những module nào. Trong ví dụ Vite, nó đi từ HTML đến script `src/main.tsx`, rồi lần theo các import của script:
+
+```d2 title="Module graph và dynamic import"
+direction: right
+html: "index.html"
+main: "src/main.tsx"
+html -> main
+main -> react: "react-dom/client"
+main -> css: "styles.css"
+main -> app: "App.tsx"
+app -> math: "math.ts"
+admin: "import('./admin')"
+app -> admin: "Chỉ tải khi bấm nút" {style.stroke-dash: 4}
+```
+
+Nếu `math.ts` còn import một file khác, bundler tiếp tục đi theo import đó. Tập hợp những file/module cùng quan hệ phụ thuộc này gọi là **dependency graph — sơ đồ phụ thuộc**.
+
+Bundler quyết định cách biểu diễn graph trong output: module nào nằm chung, phần nào dùng chung, phần nào tải riêng và runtime nào cần để kết nối các chunk.
+
+Bundling **không phải đơn giản nối chuỗi các file**. Công cụ phải bảo toàn module semantics, xử lý dependency, exports, circular imports và các quy tắc của từng module format.
+
+Bundler cũng không bắt buộc xuất một file duy nhất. Output thường là nhiều JavaScript chunks, CSS files và assets.
+
+### 3.6. Code splitting
+
+**Code splitting** chia code thành các phần có thể tải độc lập. Dynamic import thường là điểm phù hợp để tạo chunk:
+
+```ts
+const { getAdminMessage } = await import('./admin');
+```
+
+Mục tiêu là không bắt người dùng tải toàn bộ code admin khi chỉ xem trang chính. Việc thật sự tạo file riêng còn phụ thuộc bundler, output format và các tùy chọn như inline dynamic imports.
+
+Không nên chia càng nhiều càng tốt: nhiều chunk có thể tăng request, phát sinh dependency waterfall hoặc làm người dùng chờ lúc chuyển trang. Cần cân bằng initial load, cache reuse và latency khi tương tác.
+
+### 3.7. Tree shaking, dead-code elimination và minification
+
+Ba khái niệm có liên quan nhưng không giống nhau:
+
+| Kỹ thuật | Mục tiêu | Ví dụ |
+|---|---|---|
+| **Tree shaking** | Dựa trên module graph để loại phần không được sử dụng khi an toàn | Bỏ export `unusedMessage` |
+| **Dead-code elimination** | Loại code không thể thực thi hoặc không cần thiết theo phân tích/giả định | Bỏ nhánh điều kiện đã biết là false |
+| **Minification** | Giảm kích thước biểu diễn code, thường kết hợp nhiều tối ưu | Rút gọn tên biến, biểu thức, whitespace |
+
+Tree shaking thường hiệu quả nhất với ESM `import`/`export` vì cấu trúc có thể phân tích tĩnh. CommonJS và dynamic patterns có thể khiến việc xác định phần cần giữ khó hơn.
+
+**Side effect** là hành vi xảy ra khi module được thực thi, không chỉ khi một export được gọi. Import một file đăng ký plugin, patch global hoặc inject CSS có thể cần được giữ dù không sử dụng export nào.
+
+Không khai báo toàn bộ package là side-effect-free một cách máy móc. Với package có CSS cần giữ, metadata có thể phải thể hiện điều đó:
+
+```json
+{
+  "sideEffects": ["**/*.css"]
+}
+```
+
+Đây chỉ là ví dụ cho package mà các file còn lại thực sự không có side effect. Những file đăng ký global/plugin khác cũng phải được khai báo phù hợp. Một declaration sai có thể khiến giao diện mất CSS hoặc mất initialization code trong production.
+
+### 3.8. Browser target không đồng nghĩa với polyfill
+
+Có hai nhóm vấn đề khác nhau:
+
+- **Syntax:** browser có hiểu optional chaining, class fields hoặc một cú pháp mới không?
+- **Runtime API:** browser có `Promise`, `Array.from`, `Intl` hoặc API cần dùng không?
+
+Transformer có thể hạ cú pháp, nhưng không mặc nhiên bổ sung mọi API thiếu. **Polyfill** cung cấp implementation cho API ở runtime; cách thêm polyfill phải phù hợp với browser policy và major version của tool.
+
+Những ví dụ dùng `es2022` trong tài liệu chỉ minh họa cấu hình cho runtime đã hỗ trợ mức cú pháp đó, không phải khuyến nghị hỗ trợ browser của mọi sản phẩm. Với ứng dụng thật, hãy chọn target từ danh sách browser được cam kết hỗ trợ.
+
+### 3.9. CSS, assets và output
+
+CSS/asset processing có thể bao gồm:
+
+- Compile Sass thành CSS.
+- Transform CSS bằng PostCSS hoặc Lightning CSS.
+- Tạo identifier cho CSS Modules để giảm xung đột tên class; đây không phải sandbox CSS tuyệt đối.
+- Tách CSS ra file hoặc inject bằng JavaScript, tùy cấu hình.
+- Copy, inline hoặc rewrite URL của ảnh/font.
+- Tạo filename có content hash để phục vụ caching.
+
+Content hash thường phù hợp cho assets có cache dài. HTML/manifest cần được cập nhật để tham chiếu đúng phiên bản asset; không áp dụng cùng một cache policy cho HTML và mọi file hash.
+
+### 3.10. Source maps, dev server và HMR
+
+**Source map** ánh xạ code đã transform/minify về source gốc để debug stack trace. Bật source map không đồng nghĩa phải public source map cho mọi người. Trong production, cân nhắc upload riêng cho hệ thống theo dõi lỗi và kiểm soát truy cập.
+
+**Dev server** phục vụ code phục vụ phát triển. **HMR — Hot Module Replacement** thay phần module bị thay đổi mà không luôn reload cả trang. Nếu update không thể được chấp nhận an toàn, hệ thống vẫn có thể invalidate module cha hoặc reload.
+
+**React Fast Refresh** là cơ chế tích hợp React nhằm cập nhật component và giữ state khi có thể. Nó sử dụng hạ tầng cập nhật của toolchain nhưng không đồng nghĩa với HMR nói chung, và không bảo đảm giữ mọi state sau mọi thay đổi.
+
+Production thường ưu tiên output tối ưu và deployment ổn định; development ưu tiên tốc độ phản hồi khi sửa code. Hai pipeline có thể sử dụng graph, serving strategy và tối ưu khác nhau.
+
+## 4. Package managers và runtime
+
+### 4.1. npm
+
+**Vai trò:** quản lý package, cài dependency và chạy scripts. npm thường đi kèm khi cài Node.js, nhưng npm không phải JavaScript runtime.
+
+npm đọc `package.json`, resolve dependency và sử dụng `package-lock.json` để ghi nhận dependency tree. Cách bố trí `node_modules` thường có hoisting/deduplication khi phù hợp; không nên dựa vào việc một transitive dependency tình cờ xuất hiện ở root để import nó trực tiếp.
+
+Các thao tác quan trọng:
+
+```bash
+npm install
+npm install -D typescript
+npm run build
+npm ci
+```
+
+`npm install` dùng cho phát triển và có thể cập nhật lockfile khi cần. `npm ci` yêu cầu lockfile tồn tại và khớp manifest, xóa `node_modules` hiện có trước khi cài và không sửa manifest/lockfile. Nếu dependency tree phụ thuộc install flags, CI cũng phải dùng flags tương ứng.
+
+**Khi phù hợp:** muốn quy trình quen thuộc, ít thêm lựa chọn và có hệ sinh thái tooling phổ biến. **Giới hạn:** npm không tự cung cấp bundling, HMR, type checking hay task graph cho nhiều project chỉ vì có script `build`.
+
+Tài liệu: [npm ci](https://docs.npmjs.com/cli/commands/npm-ci/).
+
+### 4.2. pnpm
+
+**Vai trò:** cũng là package manager, nổi bật ở cách lưu và liên kết dependency.
+
+Với layout `node_modules` thông thường của pnpm, nội dung package được chia sẻ qua content-addressable store và liên kết vào project; symbolic links biểu diễn quan hệ dependency. Mục tiêu là giảm việc lưu trùng file và tổ chức dependency rõ ràng hơn.
+
+Mặc định, project không nên tùy tiện truy cập dependency chưa khai báo chỉ vì nó được package khác cài vào. Tuy vậy, hành vi cụ thể vẫn phụ thuộc cấu hình hoisting/linker; không nên khẳng định mọi cấu hình pnpm đều cấm mọi kiểu phantom dependency.
+
+```bash
+pnpm install
+pnpm add -D typescript
+pnpm run build
+pnpm install --frozen-lockfile
+```
+
+`--frozen-lockfile` không cập nhật lockfile và sẽ fail nếu cần thay đổi lockfile. pnpm cũng hỗ trợ workspaces cho nhiều package trong cùng repository.
+
+**Khi phù hợp:** nhiều project hoặc monorepo, muốn dependency layout có tính kỷ luật và tái sử dụng package storage. **Điểm cần kiểm tra:** tooling cũ giả định một layout phẳng, xử lý symlink không đúng hoặc yêu cầu hoisting đặc biệt.
+
+Đổi npm sang pnpm không tự làm thuật toán bundling nhanh hơn. Thời gian install, dependency layout và cache của các tool có thể thay đổi; compile/bundle vẫn là công việc khác.
+
+Tài liệu: [pnpm dependency layout](https://pnpm.io/symlinked-node-modules-structure), [pnpm install](https://pnpm.io/cli/install).
+
+### 4.3. Yarn
+
+**Vai trò:** quản lý dependency và scripts; cần phân biệt Yarn Classic với các major version hiện đại.
+
+Yarn hiện đại hỗ trợ nhiều linker. **Plug'n'Play — PnP** có thể dùng file `.pnp.cjs` để mô tả cách resolve dependency thay vì tạo `node_modules` truyền thống. Yarn cũng hỗ trợ cấu hình dùng `node_modules`; không phải project Yarn nào cũng chạy PnP.
+
+PnP giúp phát hiện dependency chưa khai báo và tránh dựa vào hoisting ngẫu nhiên. Đổi lại, IDE và tooling cần tương thích với cơ chế resolution này hoặc dùng cấu hình/linker phù hợp.
+
+```bash
+yarn install
+yarn add -D typescript
+yarn build
+yarn install --immutable
+```
+
+`--immutable` là lựa chọn của Yarn hiện đại để không cho install thay đổi lockfile. Không sao chép flags giữa Yarn Classic và Yarn hiện đại mà không kiểm tra version.
+
+**Khi phù hợp:** project đã chuẩn hóa Yarn/workspaces hoặc muốn tận dụng PnP. **Giới hạn:** đây vẫn không phải bundler; `yarn build` chỉ gọi script của project.
+
+Tài liệu: [Yarn PnP](https://yarnpkg.com/features/pnp), [Yarn install](https://yarnpkg.com/cli/install).
+
+### 4.4. Node.js và sự chồng lấn chức năng
+
+Node.js chạy phần lớn frontend CLIs, đọc filesystem, khởi động dev server và tải các native bindings cần thiết. Browser không cần cài Node.js để chạy một SPA đã build.
+
+Phiên bản Node.js là một phần của build environment. Cần đối chiếu engine requirements của tool, thống nhất local/CI và ghi rõ phiên bản package manager. Ví dụ Vite 8 yêu cầu Node.js 20.19+ hoặc 22.12+ trong các release line được hỗ trợ.
+
+Một sản phẩm có thể chứa nhiều vai trò: Bun có runtime, package manager, bundler và test runner. Khi đánh giá, phải nói rõ đang so sánh **chức năng nào**, thay vì đặt mọi sản phẩm vào một nhóm duy nhất.
+
+## 5. Compilers, transformers và type checker
+
+### 5.1. Babel
+
+**Vai trò chính:** transform JavaScript/JSX/TypeScript syntax qua hệ thống plugins và presets. Babel không phải module bundler theo mặc định.
+
+Luồng làm việc là parse source → chạy AST transforms → sinh JavaScript. Hai khái niệm cấu hình:
+
+- **Plugin:** một transform hoặc chức năng cụ thể.
+- **Preset:** tập hợp plugins/options cho một mục tiêu, như JavaScript targets, React JSX hoặc TypeScript syntax.
+
+Cấu hình minh họa cho pipeline muốn xuất JavaScript vẫn giữ ESM:
+
+```json
+{
+  "presets": [
+    ["@babel/preset-env", { "modules": false }],
+    ["@babel/preset-react", { "runtime": "automatic" }],
+    "@babel/preset-typescript"
+  ]
+}
+```
+
+Trong ví dụ, `modules: false` chủ động giữ `import`/`export` để bước sau xử lý module graph. Khi Babel được tích hợp qua bundler, mặc định `modules: "auto"` có thể sử dụng caller information để chọn hành vi phù hợp; không nhất thiết luôn override nó.
+
+`preset-env` chọn syntax transforms theo targets. `preset-react` xử lý JSX và `preset-typescript` bỏ TypeScript syntax. **Preset TypeScript không thực hiện type checking.** Việc thêm polyfills là cấu hình riêng; không suy ra rằng dùng `preset-env` là đã có mọi runtime API.
+
+**Điểm mạnh:** hệ sinh thái AST plugins lâu đời, nhiều tích hợp và transform chuyên biệt. Babel thường hữu ích khi project cần một plugin mà compiler khác chưa hỗ trợ tương đương.
+
+**Trade-off:** pipeline nhiều plugins có thể tăng chi phí parse/transform; plugin order và khác biệt semantics cần được kiểm tra khi migration. Không thay Babel bằng SWC/Oxc chỉ bằng việc đổi tên package nếu đang có custom Babel transforms.
+
+**Khi phù hợp:** cần kiểm soát transformation hoặc plugin ecosystem cụ thể. Babel có thể chạy trong loader/plugin của một toolchain, không nhất thiết phải chạy thành một CLI riêng.
+
+Tài liệu: [Babel preset-env](https://babeljs.io/docs/babel-preset-env), [Babel TypeScript preset](https://babeljs.io/docs/babel-preset-typescript).
+
+### 5.2. SWC
+
+**Vai trò chính:** compiler/toolchain viết bằng Rust, thường được dùng để parse và transform JavaScript, TypeScript, JSX; cũng có minifier.
+
+SWC thường nằm bên dưới framework hoặc bundler. Ví dụ Turbopack dùng SWC cho JS/TS transforms; Rspack có `builtin:swc-loader`; Rsbuild mặc định dùng SWC cho TypeScript transformation.
+
+Ví dụ `.swcrc` cho TSX và automatic JSX runtime:
+
+```json
+{
+  "jsc": {
+    "parser": { "syntax": "typescript", "tsx": true },
+    "target": "es2022",
+    "transform": {
+      "react": { "runtime": "automatic" }
+    }
+  },
+  "module": { "type": "es6" },
+  "sourceMaps": true
+}
+```
+
+Cấu hình này nói rõ loại source, cú pháp output, JSX runtime và giữ output dạng ESM. Nó không tự thiết lập entry graph, HTML output hay dev server của ứng dụng.
+
+**SWC transform không type-check.** Nếu cần kiểm tra type, vẫn chạy TypeScript checker hoặc tích hợp bước kiểm tra của framework/build tool.
+
+**Điểm mạnh:** native implementation phù hợp với lượng lớn công việc parsing/transformation. **Trade-off:** Babel plugins không tự chạy nguyên trạng trên SWC; plugin API, hỗ trợ feature và behavior có thể khác. Plugin/native binding cũng phải tương thích với môi trường CI.
+
+Không nên hiểu SWC là một lời cam kết rằng cả build sẽ luôn nhanh hơn một tỷ lệ cố định. Nếu thời gian chủ yếu nằm ở type checking, I/O hoặc plugins khác, thay transformer chỉ giải quyết một phần.
+
+Tài liệu: [SWC compilation](https://swc.rs/docs/configuration/compilation), [SWC minification](https://swc.rs/docs/configuration/minification).
+
+### 5.3. TypeScript compiler — `tsc`
+
+**Vai trò:** kiểm tra type và, tùy cấu hình, emit JavaScript hoặc declaration files. TypeScript là ngôn ngữ; `tsc` là compiler CLI.
+
+Những khả năng cần tách biệt:
+
+| Khả năng | Cấu hình/lệnh | Ý nghĩa |
+|---|---|---|
+| Type checking không emit | `tsc --noEmit` | Chỉ tạo diagnostics |
+| Emit JavaScript | `tsc` với emit được bật | Chuyển source theo tsconfig |
+| Emit declarations | `declaration`, có thể thêm `emitDeclarationOnly` | Tạo `.d.ts` cho người sử dụng thư viện |
+| Build project references | `tsc -b` | Xử lý các TypeScript projects theo quan hệ references |
+
+`tsc` thông thường không bundle toàn bộ module graph thành application chunks. `paths` không tự rewrite JavaScript import paths và compiler không tự polyfill runtime APIs.
+
+Nếu dùng compiler để emit, cần hiểu `noEmitOnError`: việc có diagnostics không mặc nhiên bảo đảm không sinh file output trong mọi cấu hình. Với CI, exit code của type-checking step vẫn phải được xử lý đúng.
+
+**Khi phù hợp:** mọi ứng dụng TypeScript cần một bước type checking đáng tin cậy; thư viện thường cần thêm `.d.ts`. Có thể dùng SWC/Oxc/esbuild để transform nhanh và để `tsc` chỉ phụ trách type checking/declarations.
+
+Ví dụ cho project có một tsconfig bao phủ source:
+
+```json
+{
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && vite build"
+  }
+}
+```
+
+Với template có `tsconfig.app.json`, `tsconfig.node.json` và project references, dùng script phù hợp với cấu trúc đó, không copy mù quáng ví dụ một tsconfig.
+
+Tài liệu: [noEmit](https://www.typescriptlang.org/tsconfig/noEmit.html), [declaration](https://www.typescriptlang.org/tsconfig/declaration.html), [project references](https://www.typescriptlang.org/docs/handbook/project-references.html).
+
+### 5.4. Oxc
+
+**Vai trò:** tập hợp công cụ viết bằng Rust cho parsing, transformation, minification và những nhiệm vụ liên quan. Không nên coi tên Oxc là một CLI duy nhất làm mọi việc.
+
+Trong phạm vi build, hai thành phần quan trọng là:
+
+- **Oxc transformer:** bỏ TypeScript syntax, transform JSX và hạ những cú pháp được hỗ trợ theo target.
+- **Oxc minifier:** tối ưu và giảm kích thước JavaScript.
+
+Rolldown sử dụng Oxc cho các công việc ở tầng compiler/minifier. Vite 8 xây dựng toolchain dựa trên Rolldown và Oxc; đây là lý do Oxc đáng biết ngay cả khi bạn không gọi API của nó trực tiếp.
+
+Oxc transformer không tự thay thế việc chạy TypeScript type checker. Oxc ecosystem còn có Oxlint và khả năng liên quan đến lint/type-aware analysis, nhưng bật transformer không đồng nghĩa đã bật những kiểm tra đó.
+
+**Điểm mạnh:** phối hợp gần với bundler và build tool trong cùng hệ sinh thái native. **Trade-off:** cần kiểm tra feature/transform/plugin cụ thể khi thay một pipeline Babel hoặc SWC đã tùy biến sâu.
+
+**Khi phù hợp:** thường sử dụng gián tiếp qua Vite/Rolldown; dùng trực tiếp khi đang xây custom tooling và có nhu cầu transformer API riêng.
+
+Tài liệu: [Oxc transformer](https://oxc.rs/docs/guide/usage/transformer), [Oxc minifier](https://oxc.rs/docs/guide/usage/minifier).
+
+## 6. Bundlers: đi sâu vào từng công cụ
+
+### 6.1. Webpack
+
+**Vai trò chính:** module bundler cho ứng dụng và những pipeline asset phức tạp. Core ecosystem chạy trong môi trường Node.js, với loaders và plugins mở rộng nhiều tầng của build.
+
+Những thành phần cấu hình cơ bản:
+
+- `entry`: điểm bắt đầu graph.
+- `output`: nơi và cách đặt tên output.
+- `resolve`: cách tìm module, extensions, aliases và package conditions.
+- `module.rules`: chọn cách xử lý từng nhóm file.
+- `plugins`: mở rộng toàn bộ lifecycle của compilation.
+- `optimization`: các lựa chọn như splitting và minification.
+
+**Loader vs plugin:** loader transform một module/file; plugin tham gia các hook rộng hơn, có thể quản lý assets hoặc thay đổi quá trình compilation.
+
+Ví dụ dưới đây chỉ trích phần rules, không phải cấu hình ứng dụng hoàn chỉnh. Cần cài loaders và cấu hình Babel tương ứng:
+
+```js
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.[jt]sx?$/,
+        exclude: /node_modules/,
+        use: 'babel-loader',
+      },
+      {
+        test: /\.css$/,
+        use: ['style-loader', 'css-loader'],
+      },
+    ],
+  },
+};
+```
+
+Loader chain thường thực thi từ phải sang trái: `css-loader` xử lý CSS dependency/exports, rồi `style-loader` inject CSS vào trang. Cách inject này dễ minh họa; production có thể chọn extraction plugin để xuất CSS thành file riêng.
+
+Webpack hỗ trợ tree shaking, dynamic import và shared chunks. `mode: 'production'` bật nhiều tối ưu mặc định, nhưng cấu hình sai về modules/side effects vẫn có thể làm kết quả không như mong muốn.
+
+**Điểm mạnh:** hệ sinh thái loaders/plugins lớn, khả năng tùy biến sâu và nhiều pipeline đã được kiểm chứng trong dự án lâu năm. **Trade-off:** cấu hình có thể trở nên khó theo dõi; JavaScript plugins/loaders, resolution, source maps và minification đều có thể ảnh hưởng thời gian build.
+
+Dev server/HMR thường được cung cấp qua tooling như `webpack-dev-server`, không phải chỉ gọi core bundler là đã có một trải nghiệm application development hoàn chỉnh.
+
+**Khi phù hợp:** project đang dùng tốt Webpack, có custom integration quan trọng hoặc cần khả năng kiểm soát mà migration toolchain khác chưa chứng minh được. Không cần migration chỉ vì công cụ khác mới hơn.
+
+Tài liệu: [Webpack concepts](https://webpack.js.org/concepts/), [loaders](https://webpack.js.org/concepts/loaders/), [tree shaking](https://webpack.js.org/guides/tree-shaking/).
+
+### 6.2. Rollup
+
+**Vai trò chính:** JavaScript module bundler cho ứng dụng và thư viện; thường được chọn cho library output và xử lý ESM.
+
+Rollup phân tích module graph, tree-shake những phần có thể loại bỏ an toàn và emit các module formats được cấu hình. Khả năng xuất nhiều output từ cùng một input phù hợp khi một package cần ESM và CommonJS.
+
+Ví dụ library có source JavaScript trong `src/index.js`:
+
+```js
+import { nodeResolve } from '@rollup/plugin-node-resolve';
+import commonjs from '@rollup/plugin-commonjs';
+
+export default {
+  input: 'src/index.js',
+  external: ['react', 'react/jsx-runtime'],
+  output: [
+    { file: 'dist/index.js', format: 'es', sourcemap: true },
+    { file: 'dist/index.cjs', format: 'cjs', sourcemap: true },
+  ],
+  plugins: [nodeResolve(), commonjs()],
+};
+```
+
+`nodeResolve()` hỗ trợ resolve dependencies từ packages; `commonjs()` chuyển CommonJS để tích hợp vào graph. `external` không bundle những dependency đã chỉ định; output giữ việc phụ thuộc vào chúng.
+
+Với React library, externalizing peer dependencies có thể tránh đóng gói thêm một bản React. Phải liệt kê đúng dependencies/subpaths thực sự sử dụng, đồng bộ với `peerDependencies` và package exports. Chỉ có `external` không tự hoàn tất metadata của package.
+
+Source TypeScript/JSX cần transformer/plugin phù hợp hoặc được transform trước. `.d.ts` cũng là bước riêng; tạo ESM/CJS JavaScript không tự tạo public type declarations.
+
+**Điểm mạnh:** library-oriented output, ESM analysis và plugin API được nhiều toolchain sử dụng. **Trade-off:** dev server, HTML/assets và framework-specific features có thể cần thêm tooling khi build ứng dụng trực tiếp.
+
+**Khi phù hợp:** JavaScript/TypeScript libraries hoặc pipeline cần kiểm soát module formats/external dependencies. Rollup không chỉ dành cho thư viện, và tree shaking không phải tính năng độc quyền của Rollup.
+
+Tài liệu: [Rollup introduction](https://rollupjs.org/introduction/), [configuration](https://rollupjs.org/configuration-options/).
+
+### 6.3. esbuild
+
+**Vai trò:** tool viết bằng Go, có thể transform, bundle và minify. Đây là ví dụ rõ nhất cho việc một công cụ thuộc nhiều nhóm.
+
+esbuild có hai API nên phân biệt:
+
+- **`transform`:** xử lý một đoạn code độc lập; không lần theo imports để bundle filesystem graph.
+- **`build`:** làm việc với entry points, module resolution, bundling và output files.
+
+Ví dụ API trong một build script riêng:
+
+```js
+import * as esbuild from 'esbuild';
+
+await esbuild.build({
+  entryPoints: ['src/main.tsx'],
+  bundle: true,
+  platform: 'browser',
+  format: 'esm',
+  splitting: true,
+  jsx: 'automatic',
+  target: ['es2022'],
+  minify: true,
+  sourcemap: true,
+  outdir: 'dist',
+});
+```
+
+Ví dụ giả định đã cài esbuild, React và có source tương ứng; nó minh họa bundling, không tự tạo `index.html` hay một ứng dụng hoàn chỉnh. Với code splitting, esbuild cần ESM output và output directory phù hợp.
+
+**Không type-check TypeScript**, không tự tạo declarations và không tự bổ sung đầy đủ browser polyfills. Dev serving/watch APIs có ích nhưng không đồng nghĩa một mình esbuild đã cung cấp mọi framework integration và HMR như build tool hoàn chỉnh.
+
+**Điểm mạnh:** phù hợp cho custom build scripts, transform nhanh và những pipeline không cần hệ sinh thái plugins phức tạp. Nó cũng có thể được tool khác sử dụng làm một thành phần bên dưới.
+
+**Trade-off:** plugin model không giống Babel/Rollup/Webpack; cần kiểm tra giới hạn của output formats, splitting và transform semantics cho use case cụ thể.
+
+**Khi phù hợp:** bundle script đơn giản, công cụ nội bộ hoặc backend/frontend package với pipeline có thể tự kiểm soát. Không nên chọn chỉ dựa trên benchmark một file nhỏ nếu ứng dụng có nhiều integration hơn.
+
+Tài liệu: [esbuild API](https://esbuild.github.io/api/), [TypeScript support](https://esbuild.github.io/content-types/#typescript).
+
+### 6.4. Rspack
+
+**Vai trò chính:** bundler viết bằng Rust, hướng tới tương thích hệ sinh thái Webpack.
+
+Rspack giữ nhiều khái niệm quen thuộc: entry/output, rules/loaders, plugins và optimization. Nhờ đó, project Webpack có thể có đường migration ít thay đổi cách tổ chức hơn so với chuyển sang một ecosystem khác.
+
+Rspack tích hợp SWC qua `builtin:swc-loader`. Trích phần rule minh họa cho TSX:
+
+```js
+export default {
+  module: {
+    rules: [
+      {
+        test: /\.[jt]sx?$/,
+        exclude: /node_modules/,
+        use: {
+          loader: 'builtin:swc-loader',
+          options: {
+            jsc: {
+              parser: { syntax: 'typescript', tsx: true },
+              transform: { react: { runtime: 'automatic' } },
+            },
+          },
+        },
+      },
+    ],
+  },
+};
+```
+
+Đây vẫn là cấu hình ở tầng bundler; entry, HTML, CSS, dev setup và type checking phải được cấu hình hoặc cung cấp bởi tầng trên.
+
+**Điểm mạnh:** core native và khả năng tận dụng nhiều Webpack integrations; có hỗ trợ cho các mô hình như Module Federation trong ecosystem tương ứng.
+
+**Trade-off:** Webpack-compatible không đồng nghĩa 100% compatible. Plugin dựa vào internals, custom loader đặc biệt hoặc một behavior cũ có thể cần migration. Dùng loader JavaScript nặng cũng có thể giữ lại bottleneck dù bundler core đã nhanh hơn.
+
+**Khi phù hợp:** đang có Webpack project và cần cải thiện build performance mà muốn giữ nhiều conventions/integrations. Với project mới không cần tự ráp toàn bộ pipeline, Rsbuild thường là tầng dễ sử dụng hơn trên Rspack.
+
+Tài liệu: [Rspack](https://rspack.rs/), [built-in SWC loader](https://rspack.rs/guide/features/builtin-swc-loader).
+
+### 6.5. Rolldown
+
+**Vai trò chính:** bundler viết bằng Rust, có plugin/config API hướng tới tương thích với Rollup, đồng thời tích hợp những khả năng native của Oxc.
+
+Rolldown hỗ trợ nhiều chức năng thường phải ghép từ các plugin trong pipeline Rollup, như package resolution và CommonJS handling. Nó cũng cung cấp JavaScript API và CLI; không chỉ có thể dùng bên trong Vite.
+
+Ví dụ `rolldown.config.js` cho một library có source JavaScript:
+
+```js
+import { defineConfig } from 'rolldown';
+
+export default defineConfig({
+  input: 'src/index.js',
+  external: ['react', 'react/jsx-runtime'],
+  output: {
+    dir: 'dist',
+    format: 'esm',
+    sourcemap: true,
+  },
+});
+```
+
+Rolldown là bundler; Oxc phụ trách nhiều việc parsing/transformation/minification bên dưới. Vite 8 dùng Rolldown trong toolchain, nhưng **Rolldown không tự trở thành Vite**: dev server, conventions và framework integration thuộc tầng build tool.
+
+**Điểm mạnh:** native bundling, tích hợp compiler gần với graph và khả năng tái sử dụng nhiều Rollup conventions/plugins. **Trade-off:** sự tương thích cần được kiểm tra ở plugin/config thực tế; không bảo đảm mọi hook và behavior của mọi plugin đều giống Rollup.
+
+**Khi phù hợp:** custom bundling/library pipeline muốn dùng ecosystem API kiểu Rollup hoặc khi cần hiểu phần lõi của Vite hiện đại. Type checking và declarations vẫn cần bước riêng.
+
+Tài liệu: [Rolldown getting started](https://rolldown.rs/guide/getting-started), [troubleshooting/compatibility](https://rolldown.rs/guide/troubleshooting).
+
+### 6.6. Turbopack
+
+**Vai trò chính:** incremental bundler viết bằng Rust, tích hợp trong Next.js.
+
+Incremental nghĩa là theo dõi quan hệ giữa input và các phép tính/output để tái sử dụng kết quả chưa bị invalidate. Mục tiêu là không làm lại toàn bộ công việc mỗi khi một phần source thay đổi. Trong development, việc xử lý theo nhu cầu cũng giúp tránh xử lý ngay mọi route không được sử dụng.
+
+Turbopack làm việc trong pipeline có cả client và server modules của Next.js. SWC vẫn đảm nhận JS/TS/JSX transformations; không nên hiểu Turbopack là một tên thay thế cho SWC.
+
+Với **Next.js 16**, Turbopack là mặc định cho cả development và production build:
+
+```bash
+npx next dev
+npx next build
+```
+
+Nếu cần Webpack vì một integration chưa được hỗ trợ:
+
+```bash
+npx next dev --webpack
+npx next build --webpack
+```
+
+Các lệnh trên giả định Next.js đã là dependency của project. Trong ứng dụng thật, thường đặt chúng trong `package.json` scripts.
+
+**Giới hạn tương thích quan trọng:** Webpack plugins và callback cấu hình `webpack()` không được Turbopack thực thi như pipeline Webpack. Turbopack hỗ trợ một phần Webpack loader API, không phải toàn bộ; cần kiểm tra giới hạn của từng loader.
+
+`next build` có thể kiểm tra TypeScript ở tầng framework. Điều đó không có nghĩa SWC transformation tự type-check. Tương tự, routing, Server Components, SSR và static export là trách nhiệm của Next.js/toolchain, không phải tất cả đều là tính năng của bundler riêng lẻ.
+
+**Khi phù hợp:** sử dụng Next.js ở các version có hỗ trợ tương ứng, ưu tiên tooling framework tích hợp. Không thay Vite của một SPA bằng Turbopack như thể đây là hai CLI application build độc lập tương đương.
+
+Tài liệu: [Turbopack](https://nextjs.org/docs/app/api-reference/turbopack), [Next.js 16 migration](https://nextjs.org/docs/app/guides/upgrading/version-16).
+
+### 6.7. So sánh nhanh tầng bundler
+
+| Bundler | Hướng sử dụng thường gặp | Ecosystem/cấu hình | Chú ý |
+|---|---|---|---|
+| **Webpack** | Application pipeline tùy biến, project lâu năm | Loaders/plugins phong phú | Đo bottleneck trước khi migration |
+| **Rollup** | Libraries và ESM output | Rollup plugins | Framework/dev experience có thể cần ghép thêm |
+| **esbuild** | Custom scripts, transform/bundle/minify | API và plugins riêng | Không type-check; splitting có điều kiện |
+| **Rspack** | Application bundling, migration từ Webpack | Hướng tương thích Webpack | Kiểm tra plugins/loaders cụ thể |
+| **Rolldown** | Bundling kiểu Rollup, lõi Vite 8 | Hướng tương thích Rollup | Không đồng nhất với build tool Vite |
+| **Turbopack** | Next.js client/server pipeline | Tích hợp Next.js | Không hỗ trợ Webpack plugins nguyên trạng |
+
+Ngôn ngữ implementation là một yếu tố kỹ thuật, không phải bảng xếp hạng tốc độ cho mọi project. Parallelism, caching, plugin overhead, I/O, workload và output requirements đều ảnh hưởng kết quả.
+
+## 7. Build tools: pipeline và developer experience
+
+### 7.1. Vite
+
+**Vai trò:** build tool cung cấp dev server, HMR, HTML/CSS/assets handling, plugin API và production build.
+
+#### Development hoạt động như thế nào
+
+Vite nổi bật với mô hình phục vụ source modules qua native ESM theo nhu cầu. Browser yêu cầu module nào thì dev server xử lý và phục vụ module đó. Dependencies có thể được pre-bundle để chuẩn hóa và tối ưu việc tải; kết quả được cache và invalidated khi những input liên quan thay đổi.
+
+Không nên mô tả Vite là “không bundle bất kỳ thứ gì trong development”: dependency pre-bundling vẫn là bundling. Điểm quan trọng là không luôn phải bundle toàn bộ application source trước khi phục vụ trang đầu tiên.
+
+#### Production và thay đổi ở Vite 8
+
+Production build xử lý graph và tạo output được bundle/tối ưu. **Vite 8 dùng Rolldown và Oxc**; các bản trước Vite 8 thường được giải thích bằng esbuild cho nhiều công việc development/transform và Rollup cho production bundling.
+
+Cùng đợt Vite 8, `@vitejs/plugin-react` v6 dùng Oxc cho React Refresh transform; Babel không còn là dependency mặc định của plugin này. Project dùng plugin version khác hoặc opt-in transforms vẫn có thể có Babel trong pipeline.
+
+Đây là lý do cần đọc **version của Vite lẫn plugins**, không suy luận mọi project Vite đều có cùng implementation.
+
+#### Cấu hình minh họa
+
+Ví dụ độc lập cho React/TypeScript với backend development chạy ở port 8080:
+
+```ts
+import { fileURLToPath, URL } from 'node:url';
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  resolve: {
+    alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
+  },
+  server: {
+    proxy: {
+      '/api': { target: 'http://localhost:8080', changeOrigin: true },
+    },
+  },
+});
+```
+
+Alias này phục vụ module resolution; TypeScript/IDE cũng cần mapping tương ứng nếu bạn sử dụng `@/…` trong source. Một lựa chọn khác ở Vite 8 là dùng `resolve.tsconfigPaths` để đọc tsconfig mapping.
+
+`server.proxy` chỉ phục vụ development; nó không tự tạo proxy hoặc sửa CORS policy khi deploy production. Port 8080 ở đây là địa chỉ backend ví dụ, không phải thông số tuning.
+
+#### Điểm mạnh và giới hạn
+
+**Điểm mạnh:** developer experience tốt cho ứng dụng mới, framework integrations rộng và cấu hình khá gọn cho những use case thông thường.
+
+**Giới hạn:** core không tự type-check TypeScript; plugin compatibility và module behavior phải được kiểm tra khi đổi major version. Development và production không hoàn toàn giống nhau nên cần kiểm tra output bằng build và preview, không chỉ thử dev server.
+
+`vite preview` dùng để kiểm tra build output cục bộ, không phải production server được thiết kế để triển khai như backend thực thụ. Với SPA, output thường nằm trong `dist`; SSR/framework integrations có thể tạo output khác.
+
+**Khi phù hợp:** React/Vue/Svelte SPA mới, hoặc framework/tooling đã chọn Vite làm build layer. Khi migration Vite 7 → 8, đối chiếu các tùy chọn như `build.rolldownOptions` thay vì tiếp tục giả định mọi setting của Rollup/esbuild giữ nguyên.
+
+Tài liệu: [Vite guide](https://vite.dev/guide/), [Vite 8 announcement](https://vite.dev/blog/announcing-vite8), [migration from v7](https://vite.dev/guide/migration).
+
+### 7.2. Parcel
+
+**Vai trò:** bundler/build tool hướng tới out-of-the-box experience, tự xử lý nhiều loại source và assets.
+
+Parcel có thể bắt đầu từ HTML rồi lần theo script, CSS và assets được tham chiếu. Cách tiếp cận này phù hợp với trang web có entry HTML rõ ràng, không cần tự ráp nhiều rules cho các trường hợp phổ biến.
+
+Sau khi cài Parcel vào project:
+
+```bash
+npx parcel index.html
+npx parcel build index.html
+```
+
+Lệnh đầu cung cấp development server/hot updates; lệnh sau tạo production output với các tối ưu như bundling, minification và tree shaking khi phù hợp.
+
+Parcel có caching, hỗ trợ nhiều asset types và một plugin pipeline có thể mở rộng qua cấu hình như `.parcelrc`. “Zero configuration” nghĩa là nhiều defaults có sẵn, **không có nghĩa sản phẩm thật không bao giờ cần cấu hình** browser targets, public URL, deployment paths hoặc plugins.
+
+Parcel transpile `.ts`/`.tsx` nhưng **không type-check theo mặc định**. Chạy TypeScript checker riêng là một lựa chọn rõ ràng; experimental validator là cơ chế khác và cần kiểm tra trạng thái hỗ trợ trước khi dùng.
+
+**Điểm mạnh:** bắt đầu nhanh với HTML/assets, ít cần tự thiết kế build pipeline. **Trade-off:** khi có requirement đặc biệt, cần hiểu plugin pipeline và cách Parcel tự suy luận behavior; không phải mọi assumptions của một toolchain khác đều áp dụng được.
+
+**Khi phù hợp:** website/app có cấu trúc entry đơn giản, muốn ít cấu hình và không bị ràng buộc vào một framework build tool cụ thể.
+
+Tài liệu: [Parcel development](https://parceljs.org/features/development/), [production](https://parceljs.org/features/production/), [TypeScript](https://parceljs.org/languages/typescript/).
+
+### 7.3. Rsbuild
+
+**Vai trò:** build tool dựa trên Rspack, cung cấp defaults, dev server, CLI, plugins và cấu hình ở mức ứng dụng.
+
+Quan hệ cần nhớ:
+
+```d2 title="Rsbuild, Rspack và SWC"
+direction: right
+n0: "Rsbuild\nCấu hình, DX, integrations"
+n1: "Rspack\nModule graph và bundling"
+n2: "SWC\nJS/TS transforms"
+n0 -> n1 -> n2
+```
+
+Rsbuild dùng Rspack để bundling ở development lẫn production. Điều này giúp gần nhau hơn về bundling behavior, nhưng không bảo đảm output development và production giống hệt: optimization, environment và dev features vẫn khác.
+
+Ví dụ config React/TypeScript với type checking được bật rõ ràng. Cần cài `@rsbuild/core`, `@rsbuild/plugin-react`, `@rsbuild/plugin-type-check`, TypeScript và dependencies của React:
+
+```ts
+import { defineConfig } from '@rsbuild/core';
+import { pluginReact } from '@rsbuild/plugin-react';
+import { pluginTypeCheck } from '@rsbuild/plugin-type-check';
+
+export default defineConfig({
+  plugins: [pluginReact(), pluginTypeCheck()],
+  source: {
+    entry: { index: './src/main.tsx' },
+  },
+});
+```
+
+`pluginReact()` tích hợp JSX/React development features; `pluginTypeCheck()` chạy TypeScript checking trong process riêng. Không bật bước checker thì SWC transpilation vẫn không phát hiện mọi type error.
+
+Các lệnh thường đặt trong scripts là `rsbuild dev`, `rsbuild build` và `rsbuild preview`. Nếu cần cấu hình bundler sâu hơn, có thể dùng cơ chế như `tools.rspack`.
+
+**Điểm mạnh:** giữ lợi thế của ecosystem Rspack/Webpack, nhưng tránh phải tự ráp mọi phần application tooling. Tích hợp Module Federation cũng là một hướng sử dụng đáng cân nhắc khi dự án có nhu cầu tương ứng.
+
+**Trade-off:** Rsbuild plugins và Rspack/Webpack plugins nằm ở những tầng API khác nhau; không đặt mọi plugin vào cùng một array rồi kỳ vọng nó hoạt động. Cấu hình phải chuyển đúng tầng và vẫn cần kiểm tra compatibility.
+
+**Khi phù hợp:** muốn trải nghiệm build tool gọn hơn trên Rspack, hoặc migration từ một application toolchain dựa trên Webpack mà còn nhiều integrations liên quan.
+
+Tài liệu: [Rsbuild introduction](https://rsbuild.dev/guide/start/), [TypeScript](https://rsbuild.dev/guide/basic/typescript), [type-check plugin](https://github.com/rstackjs/rsbuild-plugin-type-check).
+
+### 7.4. So sánh Vite, Parcel và Rsbuild
+
+| Tiêu chí | Vite | Parcel | Rsbuild |
+|---|---|---|---|
+| Hướng tiếp cận | Dev experience và ecosystem integrations | Defaults cho source/assets với ít cấu hình | Application tooling trên Rspack |
+| Lõi đáng nhớ | Vite 8: Rolldown + Oxc | Asset pipeline/bundler của Parcel và các transformers | Rspack + SWC và integrations |
+| Development | Source thường được phục vụ theo native ESM, dependencies pre-bundle | Dev server/hot updates tích hợp | Rspack bundling + dev server tích hợp |
+| Ecosystem cần kiểm tra | Vite/Rollup-style plugins và compatibility | Parcel plugins | Rsbuild plugins, Rspack/Webpack integrations |
+| Type checking mặc định của transformation | Không | Không | Không |
+| Trường hợp đáng cân nhắc | SPA mới/framework dùng Vite | HTML-centric site/app | Application hoặc migration có ecosystem Webpack/Rspack |
+
+Đây là khác biệt kiến trúc và trải nghiệm, không phải kết luận tool nào thắng mọi benchmark. Prototype trên dependency graph của chính ứng dụng sẽ đáng tin hơn.
+
+## 8. Minifiers và CSS tooling
+
+### 8.1. Terser
+
+**Vai trò chính:** JavaScript minifier. Terser không tự resolve application graph, compile TypeScript hay cung cấp dev server.
+
+Các nhóm tối ưu chính:
+
+- **Compress:** rút gọn biểu thức và thực hiện các tối ưu theo cấu hình.
+- **Mangle:** đổi tên identifiers trong những phạm vi an toàn theo cấu hình.
+- **Format:** loại whitespace/comments không cần thiết và điều khiển output.
+
+Ví dụ CLI sau khi cài Terser:
+
+```bash
+npx terser input.js --compress --mangle --output output.min.js
+```
+
+Giảm kích thước không phải obfuscation để bảo vệ bí mật. Browser vẫn nhận JavaScript và có thể quan sát hành vi; secrets không được đặt trong frontend source.
+
+**Điểm cần thận trọng:** property mangling có thể làm hỏng public APIs, JSON field access hoặc truy cập property bằng string nếu không có policy bảo vệ phù hợp. Các tùy chọn `unsafe` có thể thay đổi assumptions về behavior. Không bật toàn bộ tối ưu chỉ để giảm thêm vài byte.
+
+**Khi phù hợp:** toolchain hỗ trợ Terser hoặc bạn cần cấu hình minification cụ thể. Với toolchain dùng esbuild/SWC/Oxc minifier, không cần tự chạy thêm Terser nếu chưa xác định được mục tiêu và chi phí.
+
+Tài liệu: [Terser CLI](https://terser.org/docs/cli-usage/), [options](https://terser.org/docs/options/).
+
+### 8.2. Sass
+
+**Vai trò chính:** CSS preprocessor/compiler. Sass hỗ trợ biến, mixins, functions và module system để tổ chức stylesheet, rồi compile thành CSS.
+
+Ví dụ `styles.scss`:
+
+```scss
+$accent: #2563eb;
+
+.button {
+  color: $accent;
+
+  &:hover {
+    text-decoration: underline;
+  }
+}
+```
+
+Có thể compile bằng Dart Sass CLI từ package `sass`:
+
+```bash
+npx sass src/styles.scss dist/styles.css
+```
+
+**Không phải JavaScript bundler**, không tự bundle React và không tự type-check TypeScript. Những tính năng CSS đã được browser hỗ trợ native có thể khiến bạn không còn cần Sass cho một số nhu cầu, nhưng Sass vẫn hữu ích cho codebase/mixins/module structure hiện có.
+
+**Khi phù hợp:** stylesheet cần ngôn ngữ tổ chức và reuse của Sass. Chi phí là thêm một bước compile; tránh nesting quá sâu gây selector specificity khó kiểm soát.
+
+Tài liệu: [Dart Sass CLI](https://sass-lang.com/documentation/cli/dart-sass/).
+
+### 8.3. PostCSS
+
+**Vai trò chính:** framework xử lý CSS qua AST và plugins. PostCSS core không tự là Sass, Autoprefixer hay CSS minifier; behavior phụ thuộc plugins đã cấu hình.
+
+Luồng điển hình: parse CSS → plugins đọc/sửa AST → sinh CSS. Ví dụ **Autoprefixer** là plugin thêm/bỏ vendor prefixes theo browser support data và targets.
+
+Cấu hình ESM minh họa, giả định đã cài PostCSS và Autoprefixer:
+
+```js
+import autoprefixer from 'autoprefixer';
+
+export default {
+  plugins: [autoprefixer()],
+};
+```
+
+Build tool có thể đọc `postcss.config.mjs` và tích hợp pipeline này. PostCSS CLI trực tiếp thì cần package CLI riêng; chỉ cài core không tạo một lệnh compile application hoàn chỉnh.
+
+**Điểm mạnh:** ecosystem plugins linh hoạt. **Trade-off:** plugin order, trùng lặp transforms và browser targets cần được quản lý. Không chạy hai pipeline prefixing/minifying chồng nhau nếu chưa hiểu thứ tự và output.
+
+**Khi phù hợp:** toolchain/framework hoặc CSS plugins của project cần PostCSS. Một ví dụ thực tế là tích hợp plugin CSS của framework thay vì tự xử lý CSS bằng JavaScript bundler.
+
+Tài liệu: [PostCSS architecture](https://postcss.org/docs/postcss-architecture), [plugins](https://postcss.org/docs/postcss-plugins).
+
+### 8.4. Lightning CSS
+
+**Vai trò:** CSS tool viết bằng Rust, có parsing, transformation, minification và bundling cho CSS.
+
+Lightning CSS có thể:
+
+- Hạ những cú pháp CSS được hỗ trợ theo target browser.
+- Thêm/bỏ prefixes khi phù hợp với targets.
+- Minify stylesheet.
+- Xử lý CSS Modules.
+- Bundle dependency qua CSS `@import` theo cấu hình.
+
+Nó không phải Sass compiler cho toàn bộ ngôn ngữ SCSS và không xử lý JavaScript module graph thay cho Webpack/Rolldown.
+
+**Điểm mạnh:** nhiều bước CSS được tích hợp trong một native pipeline; được các build tool sử dụng trực tiếp hoặc gián tiếp. **Trade-off:** không phải mọi PostCSS plugin có equivalent ở Lightning CSS; migration phải đối chiếu feature và syntax đang dùng.
+
+**Khi phù hợp:** build tool cung cấp tích hợp tương ứng hoặc cần CSS processing API hiệu quả. Cần cấu hình targets khi muốn transpilation phù hợp; không suy ra rằng gọi minifier là đã đảm bảo mọi browser compatibility requirement.
+
+Tài liệu: [Lightning CSS transpilation](https://lightningcss.dev/transpilation.html), [bundling](https://lightningcss.dev/bundling.html), [minification](https://lightningcss.dev/minification.html).
+
+## 9. Task orchestration cho nhiều package
+
+### 9.1. Vì sao cần một tầng khác bundler
+
+Giả sử repository có:
+
+```text
+apps/
+  web/
+  admin/
+packages/
+  ui/
+  shared/
+```
+
+`web` và `admin` phụ thuộc `ui`, còn `ui` có thể phụ thuộc `shared`. Những câu hỏi vận hành ở đây là:
+
+- Package nào cần build trước?
+- Source đổi thì task nào bị ảnh hưởng?
+- Task nào chạy song song được?
+- Kết quả build nào có thể khôi phục từ cache?
+
+Bundler xử lý module graph của một build. Task orchestrator xử lý **graph của các công việc/project**, rồi gọi bundler/compiler bên dưới khi cần.
+
+### 9.2. Turborepo
+
+**Vai trò chính:** task orchestration và caching, thường dựa trên package scripts/workspaces.
+
+Turborepo đọc cấu hình tasks để xác định dependencies, inputs và outputs. Ví dụ `turbo.json` cho các packages build ra `dist`:
+
+```json
+{
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "inputs": ["$TURBO_DEFAULT$", ".env*"],
+      "outputs": ["dist/**"],
+      "env": ["VITE_API_BASE_URL"]
+    },
+    "typecheck": {
+      "outputs": []
+    }
+  }
+}
+```
+
+- `^build`: chạy build của dependency packages trước task hiện tại.
+- `inputs`: những input dùng để xác định cache key; `$TURBO_DEFAULT$` giữ lại bộ input mặc định.
+- `outputs`: các files cần lưu và khôi phục khi cache hit.
+- `env`: khai báo biến môi trường ảnh hưởng kết quả; ví dụ này dùng biến public của Vite.
+
+Chạy `turbo run build` vẫn có thể gọi `vite build`, `tsc` hoặc một CLI khác trong từng package. Turborepo không tự chuyển TSX thành JavaScript.
+
+**Điểm mạnh:** thêm orchestration vào cấu trúc workspaces/scripts hiện có; local/remote caching có thể tránh chạy lại công việc không đổi. **Trade-off:** cache chỉ đúng khi input/output/environment được khai báo đúng và task đủ deterministic.
+
+Với Next.js, outputs thường cần cấu hình cho `.next` và các export artifacts thực tế, thay vì copy `dist/**` từ ví dụ Vite. Nếu cache chỉ giữ log mà không giữ artifacts cần deploy, cache hit không giải quyết được build output.
+
+Tài liệu: [Turborepo caching](https://turborepo.dev/docs/crafting-your-repository/caching), [configuration](https://turborepo.dev/docs/reference/configuration).
+
+### 9.3. Nx
+
+**Vai trò chính:** project/task graph, execution/caching và một ecosystem tích hợp rộng hơn cho workspace tooling.
+
+Nx có thể sử dụng plugins để suy luận project configuration và tasks từ những file cấu hình hiện có. Nó cũng hỗ trợ generators/executors, affected-task workflows và các công cụ giúp chuẩn hóa cấu trúc repository; khả năng cụ thể phụ thuộc plugins và setup.
+
+Những khái niệm cốt lõi vẫn cần hiểu:
+
+- **Project graph:** project nào phụ thuộc project nào.
+- **Task graph:** task nào phải chạy trước task nào.
+- **Inputs:** dữ liệu ảnh hưởng cache key.
+- **Outputs:** artifacts được lưu/khôi phục.
+- **Affected:** phạm vi bị ảnh hưởng theo thay đổi và graph.
+
+Ví dụ, một Nx target gọi Vite không làm Vite biến mất: Nx quyết định có cần chạy target không, còn Vite thực hiện build ứng dụng.
+
+**Điểm mạnh:** phù hợp khi muốn cả orchestration và workspace conventions/integrations; có thể hỗ trợ tổ chức code và workflows phức tạp hơn. **Trade-off:** cần học thêm mô hình cấu hình và quản lý plugin/version interactions.
+
+**Nx vs Turborepo:** cả hai đều điều phối và cache tasks. Turborepo thường tiếp cận từ package scripts; Nx cung cấp thêm một lớp project tooling/plugin ecosystem rộng. Không nên kết luận đơn giản rằng Nx chỉ dành cho project lớn hoặc Turborepo không thể dùng cho repository phức tạp.
+
+Tài liệu: [Nx inputs](https://nx.dev/docs/reference/inputs), [how caching works](https://nx.dev/docs/concepts/how-caching-works).
+
+## 10. Cách chọn và kết hợp công cụ
+
+### 10.1. Những so sánh đúng tầng
+
+| So sánh | Thực chất đang quyết định |
+|---|---|
+| npm vs pnpm vs Yarn | Dependency management, linker, workspace policy |
+| Babel vs SWC vs Oxc transformer | Syntax/AST transformation và plugin requirements |
+| `tsc` vs transformer chỉ bỏ type | Có cần type analysis, diagnostics/declarations không |
+| Webpack vs Rspack | Bundler và mức tương thích ecosystem |
+| Rollup vs Rolldown | Bundler/API/plugin behavior cho pipeline tương ứng |
+| Vite vs Rsbuild vs Parcel | Application build experience và integrations |
+| Nx vs Turborepo | Task orchestration, caching và workspace tooling |
+| Next.js vs Vite | Framework/application architecture, không chỉ bundler |
+
+Một cặp không hoàn toàn cùng tầng vẫn có thể liên quan đến quyết định sản phẩm, nhưng phải nêu rõ phạm vi. Ví dụ Next.js có rendering/routing conventions mà Vite core không cung cấp.
+
+### 10.2. Những tổ hợp điển hình
+
+| Kiểu dự án | Điều phối | Build/transform bên dưới | Type checking |
+| --- | --- | --- | --- |
+| React SPA | Package manager scripts và Vite 8 | Rolldown, Oxc, React integration plugin | Script riêng được chạy rõ ràng |
+| Ecosystem Webpack/Rspack | Package manager scripts và Rsbuild | Rspack, SWC theo cấu hình | Checker/plugin được bật rõ ràng |
+| Next.js 16 app | Next.js CLI qua package scripts | Turbopack mặc định, SWC và framework transforms | Các checks của framework và scripts dự án |
+| Monorepo | Workspaces; Nx hoặc Turborepo điều phối task graph | Mỗi app/library có toolchain riêng | Task riêng, đưa vào graph CI |
+
+Đọc bảng từ trái sang phải để phân biệt công cụ gọi task và công cụ thực sự transform source. Nx/Turborepo không thay Vite hay TypeScript compiler; chúng điều phối và cache các task đã khai báo.
+
+Không cần chạy nhiều bundlers cho cùng một output chỉ vì chúng đều phổ biến. Mỗi tầng nên có trách nhiệm rõ và tránh parse/transform/minify lặp lại không cần thiết.
+
+### 10.3. Chọn theo nhu cầu
+
+| Nhu cầu | Lựa chọn đáng bắt đầu đánh giá | Điều cần xác minh |
+|---|---|---|
+| React/Vue SPA mới | Vite; Rsbuild nếu ecosystem phù hợp | Plugins, deployment base path, typecheck |
+| Next.js app | Tooling tích hợp của Next.js | Version, bundler default, custom integrations |
+| Webpack app đang build chậm | Đo Webpack trước; prototype Rspack/Rsbuild | Loaders/plugins, output equivalence, CI behavior |
+| Publish library | Rollup, Rolldown hoặc Vite library mode | ESM/CJS requirements, externals, `.d.ts`, package exports |
+| HTML-centric site ít cấu hình | Parcel | Browser targets, public URL, asset pipeline |
+| Custom build script nhỏ | esbuild | HTML/assets, source maps và checks phải tự tổ chức |
+| Nhiều app/package có build lặp lại | Nx hoặc Turborepo bên trên build tools | Task graph, cache inputs/outputs/env |
+| Cần custom Babel plugin | Giữ/tích hợp Babel ở đúng tầng | Feature equivalence khi chuyển transformer |
+
+## 11. Bài thực hành: quan sát pipeline bằng Vite
+
+### 11.1. Chạy project mẫu có sẵn
+
+Từ thư mục gốc repository tài liệu, dùng Node.js **22.12+** và npm:
+
+```bash
+cd examples/frontend-build-lab
+npm install
+npm ls vite @vitejs/plugin-react typescript
+npm run dev
+```
+
+<SourceRef project="frontend-build-lab" file="package.json">package.json</SourceRef> chọn Vite 8, React plugin 6 và các scripts đầy đủ. Không cần scaffold bằng `latest` rồi tự ráp source từ nhiều phần của bài. Nếu chỉ đọc website, copy các file từ drawer vào một thư mục mới theo đúng cấu trúc; không cài tất cả tools minh họa vào repository tài liệu.
+
+| File | Vai trò |
+| --- | --- |
+| <SourceRef project="frontend-build-lab" file="package.json">package.json</SourceRef> | Dependencies và quality gates |
+| <SourceRef project="frontend-build-lab" file="tsconfig.json">tsconfig.json</SourceRef> | Kiểm tra TS/TSX; lab dùng một tsconfig, không có project references |
+| <SourceRef project="frontend-build-lab" file="vite.config.ts">vite.config.ts</SourceRef> | React plugin, tạo build manifest, không publish source maps trong lab này |
+| <SourceRef project="frontend-build-lab" file="index.html">index.html</SourceRef>, <SourceRef project="frontend-build-lab" file="src/main.tsx">main.tsx</SourceRef> | HTML entry và khởi tạo React |
+| <SourceRef project="frontend-build-lab" file="src/App.tsx">App.tsx</SourceRef> | State, nút tải admin và static import math |
+
+Phần scripts đáng đọc ngay:
+
+```json
+{
+  "typecheck": "tsc --noEmit",
+  "build": "npm run typecheck && vite build"
+}
+```
+
+Đây là hai script trong file đầy đủ. Nếu áp dụng vào template có project references, có thể phải dùng `tsc -b`; đừng copy checker của lab sang một cấu trúc tsconfig khác mà không kiểm tra.
+
+### 11.2. Đối chiếu source trước khi build
+
+- <SourceRef project="frontend-build-lab" file="src/math.ts">math.ts</SourceRef> có `sum` và `unusedMessage`; chỉ `sum` được sử dụng.
+- <SourceRef project="frontend-build-lab" file="src/admin.ts">admin.ts</SourceRef> được tải từ <SourceRef project="frontend-build-lab" file="src/App.tsx" region="lazy-import">dynamic import trong App</SourceRef>, không phải static import lúc khởi động.
+- Không thêm side effect vào `math.ts` trong thí nghiệm, để việc bỏ export `UNUSED_MATH_SENTINEL` dễ quan sát.
+
+Các hàm ngắn đã giữ inline ở phần 3; không cần lặp lại toàn bộ component ở đây. Source trong drawer và source chạy local là cùng một bộ file.
+
+### 11.3. Quan sát development
+
+Chạy `npm run dev`, mở Network tab rồi reload:
+
+1. Xem các source modules được phục vụ trong development.
+2. Nhấn nút và xem request liên quan đến `admin.ts`.
+3. Sửa nội dung component, quan sát hot update và state có được giữ không.
+4. So sánh sửa component với sửa cấu hình hoặc module được nhiều nơi import.
+
+Đừng suy ra cứ một source file là một production chunk; development serving và production bundling là hai việc khác nhau.
+
+### 11.4. Quan sát production output
+
+```bash
+npm run build
+find dist -type f
+cat dist/.vite/manifest.json
+grep -R 'UNUSED_MATH_SENTINEL' dist/assets --include='*.js'
+npm run preview
+```
+
+Build manifest được bật trong <SourceRef project="frontend-build-lab" file="vite.config.ts">config của lab</SourceRef>; đối chiếu `index.html`, entry assets và dynamic entry `admin` thay vì đoán tên hash. Manifest là file phục vụ đối chiếu/build tooling, không phải module ứng dụng cần tải để render.
+
+Lệnh `grep` **không tìm thấy** chuỗi là kết quả mong đợi trong ví dụ này; exit code `1` nghĩa là không có match, không phải Vite build lỗi. Nếu bật source maps chứa source gốc, tìm cả source map có thể thấy chuỗi dù runtime bundle đã được tree-shake.
+
+Quan sát:
+
+- JavaScript đã không còn type annotations/JSX source.
+- Export không dùng trong ví dụ có thể bị loại khỏi runtime output.
+- `admin` có output chunk riêng ở cấu hình mặc định phù hợp.
+- Asset filenames có hash; số lượng và tên chính xác có thể khác theo versions/config.
+- Trong Network tab của preview, đối chiếu chunk được tải khi tương tác thay vì chỉ xem tên file.
+
+Nếu sản phẩm có preloading/prefetching hoặc plugin bổ sung, thời điểm request có thể khác thí nghiệm tối giản này.
+
+### 11.5. Quan sát sự khác nhau giữa type checking và build
+
+Đổi implementation của `sum` thành một return sai type:
+
+```ts
+export function sum(a: number, b: number): number {
+  return String(a + b);
+}
+```
+
+Chạy lần lượt:
+
+```bash
+npm run typecheck
+npx vite build
+npm run build
+```
+
+Trong pipeline lab:
+
+- Checker báo lỗi vì hàm khai báo trả về `number` nhưng thực tế trả `string`.
+- Gọi Vite trực tiếp có thể vẫn tạo JavaScript vì type annotation được bỏ đi.
+- Script `build` đã ghép checker với Vite sẽ dừng khi checker thất bại.
+
+Để kiểm tra tự động lab Vite và SharedWorker, chạy `npm run examples:labs:test` từ root repository tài liệu; script cài/build trong thư mục tạm và quan sát request thật bằng browser.
+
+Sau thí nghiệm, khôi phục `return a + b`. Bài học là **quality gates nằm trong pipeline được cấu hình**, không phải tự động xuất hiện chỉ vì source là TypeScript.
+
+## 12. Đo hiệu năng và debug đúng tầng
+
+### 12.1. Không gộp mọi thứ thành một con số “build nhanh”
+
+Các phép đo cần tách riêng:
+
+| Phép đo | Đo điều gì |
+|---|---|
+| Dependency install | Thời gian cài packages, bao gồm network/store |
+| Cold dev startup | Dev server khởi động khi chưa có cache phù hợp |
+| First page/route load | Từ khi truy cập đến lúc route thực sự dùng được |
+| Warm startup | Khởi động lại khi cache còn hợp lệ |
+| Hot update latency | Từ edit đến UI cập nhật |
+| Production build | Tạo output phục vụ deployment |
+| Type checking | Thời gian chạy checker độc lập |
+| Output/runtime performance | Bytes, requests, parse/execute cost và trải nghiệm người dùng |
+
+Dev server in dòng “ready” nhanh không nhất thiết route đầu tiên render nhanh. Production build nhanh không nhất thiết bundle nhỏ hơn. Bundle nhỏ hơn cũng chưa đủ nếu critical code bị chia thành chuỗi tải nối tiếp.
+
+Khi benchmark, giữ cùng Node/tool versions, machine/container resources, lockfile, cache state, source maps, minification và type-check policy. Một toolchain bỏ qua checker không phải so sánh tương đương với toolchain chạy checker.
+
+### 12.2. Xác định toolchain thực tế
+
+```bash
+node --version
+npm --version
+npm pkg get scripts
+npm ls vite next webpack @rspack/core @rsbuild/core rollup rolldown esbuild typescript
+```
+
+`npm ls` có thể hiển thị cả transitive dependencies. Một package xuất hiện trong tree không chứng minh ứng dụng đang dùng nó làm bundler chính; đối chiếu scripts, config và version-specific behavior.
+
+CLI examples trong tài liệu giả định tool đã là dependency local. Nếu `npx` phải tải package mới vì project chưa cài, bạn có thể vô tình chạy một version khác; với CI, ưu tiên scripts và lockfile đã chuẩn hóa.
+
+### 12.3. Tìm bottleneck thay vì đổi tool ngay
+
+Một pipeline chậm có thể do:
+
+- Type checking toàn project.
+- Loader/plugin transform nhiều lần.
+- Source maps hoặc minification.
+- Dependency resolution và filesystem I/O.
+- Dependency graph quá lớn.
+- Cache bị invalidate bởi config/environment.
+- Native binding không phù hợp với container/platform.
+
+Ví dụ Webpack có thể xuất profile/stats để phân tích; Vite có debug logging; esbuild có `metafile` và API phân tích bundle. Chọn công cụ quan sát theo pipeline đang dùng, và đo lại sau mỗi thay đổi.
+
+Thay bundler Rust/Go có thể giảm thời gian xử lý graph hoặc transform, nhưng không tự giải quyết remote package downloads, type checking hay custom plugin đang chặn toàn build.
+
+## 13. Checklist các lỗi dễ nhầm
+
+| Triệu chứng/nhận định | Tầng cần kiểm tra | Cách hiểu đúng |
+|---|---|---|
+| Build pass nhưng sai type | Checker và build scripts | Transform có thể chỉ bỏ type; phải chạy đúng checker |
+| IDE resolve alias nhưng build fail | Module resolution | Mapping TypeScript và bundler phải thống nhất |
+| Dev chạy, production mất CSS | Tree shaking/side effects và CSS pipeline | Kiểm tra metadata, CSS imports và extraction |
+| Dev proxy gọi API được, deploy fail | Deployment/network/CORS | Dev proxy không tự tồn tại trong production |
+| Lazy import lỗi sau deployment | HTML/assets cache và rollout | Client cũ có thể yêu cầu chunk cũ đã bị xóa |
+| Đổi API URL nhưng cache vẫn trả build cũ | Task cache inputs/environment | Biến ảnh hưởng output phải tham gia cache key |
+| Import `node:fs` vào component | Runtime boundary | Browser không có filesystem API của Node |
+| Thêm target nhưng API vẫn undefined | Runtime API/polyfills | Syntax lowering không tự bổ sung mọi API |
+| “SWC đã thay Turbopack” | Compiler vs bundler | Hai thành phần có trách nhiệm khác nhau |
+| “Dùng Rsbuild nên không dùng Rspack” | Build tool vs bundler | Rsbuild sử dụng Rspack bên dưới |
+| “Có Nx nên không cần Vite” | Orchestration vs build | Nx có thể gọi/cached task Vite, không thay công việc bundling |
+| “Minify là giấu được secret” | Frontend security | Code/giá trị gửi xuống browser không phải bí mật |
+
+Với biến môi trường, đặc biệt phân biệt giá trị public được nhúng vào client bundle với secrets ở server. Ví dụ `VITE_*` phục vụ client code và có thể quan sát trong output; không đặt password, signing keys hay AWS credentials trong đó. Đổi giá trị đã được nhúng lúc build thường cần rebuild; server-side environment của framework có thể có lifecycle khác.
+
+Với lazy chunks, một chiến lược triển khai cần đồng bộ HTML/assets và có thể giữ assets của version cũ trong khoảng rollout. Không chữa mọi lỗi bằng cách tắt toàn bộ cache: phải xác định client đang tham chiếu artifact version nào.
+
+Nếu vấn đề là API cross-origin, xem tài liệu [CORS và cách debug trong production](/web/01-cors), thay vì sửa compiler/bundler.
+
+## 14. Tóm tắt để ghi nhớ
+
+- **Runtime chạy code. Package manager chuẩn bị dependencies.**
+- **Compiler/transformer đổi code; type checker đánh giá tính đúng đắn của type.**
+- **Bundler xử lý module graph và tổ chức output chunks.**
+- **Minifier thu nhỏ JavaScript; CSS tooling xử lý stylesheet.**
+- **Build tool tích hợp các bước với dev server và application conventions.**
+- **Nx/Turborepo điều phối tasks/projects và caching bên trên các công cụ đó.**
+- **Framework tooling còn chịu trách nhiệm rendering/routing và client/server boundaries.**
+
+Đừng bắt đầu bằng “tool nào nhanh nhất”. Hãy bắt đầu bằng **project cần output gì, integrations nào bắt buộc, checks nào phải chạy và bottleneck hiện tại nằm ở tầng nào**. Sau đó mới chọn hoặc thay từng thành phần của toolchain.

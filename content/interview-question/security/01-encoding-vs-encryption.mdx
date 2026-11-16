@@ -1,0 +1,595 @@
+---
+title: "Encoding, Encryption và Hashing: hiểu đúng để bảo vệ dữ liệu"
+description: "Từ UTF-8 và Base64 đến AES-GCM, HMAC và password hashing: cách hoạt động, ví dụ Java chạy được và lựa chọn theo nhu cầu thực tế."
+---
+
+Giả sử bạn mở một bản ghi trong database và thấy chuỗi `Y3VzdG9tZXItMTIz`. Nó không giống dữ liệu ban đầu, nhưng chưa chắc đã được bảo vệ. Chỉ cần Base64 decode, bạn sẽ nhận lại `customer-123` mà không cần bất kỳ secret nào.
+
+Một chuỗi khó đọc có thể là dữ liệu đã encode, ciphertext sau encryption, hoặc digest sau hashing. Ba cơ chế này giải quyết ba vấn đề khác nhau. Nếu chọn nhầm, hệ thống có thể vẫn chạy đúng chức năng nhưng không bảo vệ được dữ liệu như bạn nghĩ.
+
+<Callout type="info" title="Phạm vi bài học">
+
+Bạn chỉ cần kiến thức cơ bản về chuỗi, bytes và request HTTP để bắt đầu. Ví dụ dùng Java 17 trở lên và thư viện chuẩn; mọi giá trị đều là dữ liệu demo. Phần mã hóa là bài thực hành về cơ chế, không phải một thư viện quản lý key hoàn chỉnh để đưa thẳng lên production.
+
+</Callout>
+
+## Mục lục
+
+- [Bắt đầu từ mục đích của dữ liệu](#bắt-đầu-từ-mục-đích-của-dữ-liệu)
+- [Encoding đổi cách biểu diễn dữ liệu](#encoding-đổi-cách-biểu-diễn-dữ-liệu)
+  - [Từ ký tự đến bytes với UTF-8](#từ-ký-tự-đến-bytes-với-utf-8)
+  - [Base64 biến bytes thành text](#base64-biến-bytes-thành-text)
+  - [Base64URL và percent-encoding giải quyết hai việc khác nhau](#base64url-và-percent-encoding-giải-quyết-hai-việc-khác-nhau)
+  - [Thực hành encode và decode bằng Java](#thực-hành-encode-và-decode-bằng-java)
+- [Encryption bảo vệ bí mật bằng key](#encryption-bảo-vệ-bí-mật-bằng-key)
+  - [Plaintext, ciphertext và key](#plaintext-ciphertext-và-key)
+  - [Symmetric và asymmetric encryption](#symmetric-và-asymmetric-encryption)
+  - [AES-GCM kết hợp bảo mật và phát hiện sửa đổi](#aes-gcm-kết-hợp-bảo-mật-và-phát-hiện-sửa-đổi)
+  - [Phân biệt key, nonce, tag và AAD](#phân-biệt-key-nonce-tag-và-aad)
+- [Kết hợp encryption với encoding](#kết-hợp-encryption-với-encoding)
+- [Thực hành AES-GCM bằng Java](#thực-hành-aes-gcm-bằng-java)
+  - [Chương trình hoàn chỉnh](#chương-trình-hoàn-chỉnh)
+  - [Chạy và đọc kết quả](#chạy-và-đọc-kết-quả)
+  - [Những giới hạn cần giữ rõ](#những-giới-hạn-cần-giữ-rõ)
+- [Hashing tạo dấu vân tay của dữ liệu](#hashing-tạo-dấu-vân-tay-của-dữ-liệu)
+  - [Một chiều không có nghĩa là không thể đoán](#một-chiều-không-có-nghĩa-là-không-thể-đoán)
+  - [Hash chỉ đáng tin khi giá trị đối chiếu đáng tin](#hash-chỉ-đáng-tin-khi-giá-trị-đối-chiếu-đáng-tin)
+- [HMAC kiểm tra message bằng secret dùng chung](#hmac-kiểm-tra-message-bằng-secret-dùng-chung)
+  - [Ví dụ webhook thanh toán](#ví-dụ-webhook-thanh-toán)
+  - [HMAC khác digital signature](#hmac-khác-digital-signature)
+- [Password hashing dành riêng cho mật khẩu](#password-hashing-dành-riêng-cho-mật-khẩu)
+  - [Luồng đăng ký và đăng nhập](#luồng-đăng-ký-và-đăng-nhập)
+  - [Salt, cost và pepper](#salt-cost-và-pepper)
+  - [Chọn thuật toán và nâng cost](#chọn-thuật-toán-và-nâng-cost)
+- [Những lớp bảo vệ trong web application](#những-lớp-bảo-vệ-trong-web-application)
+  - [Basic authentication và HTTPS](#basic-authentication-và-https)
+  - [JWT có chữ ký vẫn có thể đọc được](#jwt-có-chữ-ký-vẫn-có-thể-đọc-được)
+  - [Encryption at rest khác application-level encryption](#encryption-at-rest-khác-application-level-encryption)
+- [Quản lý key và vòng đời dữ liệu](#quản-lý-key-và-vòng-đời-dữ-liệu)
+  - [Tách quyền đọc database khỏi quyền dùng key](#tách-quyền-đọc-database-khỏi-quyền-dùng-key)
+  - [Envelope encryption](#envelope-encryption)
+  - [Rotation và khôi phục backup](#rotation-và-khôi-phục-backup)
+- [Chọn cơ chế cho một thiết kế cụ thể](#chọn-cơ-chế-cho-một-thiết-kế-cụ-thể)
+- [Tài liệu tham khảo và bài tiếp theo](#tài-liệu-tham-khảo-và-bài-tiếp-theo)
+
+## Bắt đầu từ mục đích của dữ liệu
+
+Hình dung một ứng dụng bán hàng có ba loại dữ liệu:
+
+- Ảnh sản phẩm cần đi qua một API JSON.
+- Địa chỉ giao hàng cần lưu để nhân viên được phân quyền có thể đọc lại.
+- Password chỉ cần được kiểm tra khi khách hàng đăng nhập.
+
+Ảnh cần một cách biểu diễn bằng text nếu API đã chọn nhúng bytes vào JSON. Địa chỉ cần giữ bí mật nhưng vẫn khôi phục được. Password không cần được khôi phục: ứng dụng chỉ cần xác định giá trị người dùng nhập có đúng hay không.
+
+Từ ba nhu cầu đó, bạn có thể phân biệt:
+
+| Cơ chế | Mục đích | Cách lấy lại dữ liệu gốc | Secret cần bảo vệ |
+| --- | --- | --- | --- |
+| Encoding | Đổi representation để lưu hoặc truyền đúng format | Decode theo quy tắc công khai | Không có |
+| Encryption | Giữ bí mật nhưng cho phép bên được cấp quyền đọc lại | Decrypt bằng đúng key và tham số | Encryption key hoặc private key, tùy cơ chế |
+| Cryptographic hashing | Tạo digest, tức một giá trị đại diện cho dữ liệu | Không có thao tác decode/decrypt | Hash thông thường không dùng secret |
+| HMAC | Kiểm tra message bằng secret dùng chung | Không dùng để khôi phục message | HMAC key |
+| Password hashing | Kiểm tra password và làm mỗi lần đoán tốn tài nguyên | Verify password bằng thư viện | Không nhất thiết có secret riêng; pepper là lớp tùy chọn |
+
+**Chọn theo điều bạn cần bảo vệ, không theo hình dạng output.** Một digest có thể được hiển thị bằng hex. Ciphertext có thể được hiển thị bằng Base64. Cả hai vẫn là chuỗi text, nhưng lớp biểu diễn bên ngoài không quyết định tính bảo mật.
+
+Với ảnh sản phẩm, Base64 chỉ là một lựa chọn về API. Nếu không bắt buộc nhúng vào JSON, upload binary hoặc multipart thường tránh được phần kích thước tăng thêm do Base64.
+
+## Encoding đổi cách biểu diễn dữ liệu
+
+Encoding giống việc viết cùng một nội dung bằng một quy ước khác mà hai bên đều biết. Điểm quan trọng là quy ước đó không bí mật. Nó giúp hai hệ thống hiểu cùng dữ liệu, chứ không quyết định ai có quyền đọc dữ liệu.
+
+### Từ ký tự đến bytes với UTF-8
+
+Máy tính lưu và truyền bytes. Một byte gồm 8 bit. Còn chuỗi như `Chào bạn` là văn bản, nên cần một quy tắc để chuyển các ký tự thành bytes.
+
+UTF-8 là một quy tắc như vậy. Chẳng hạn ký tự `á` ở dạng Unicode U+00E1 được biểu diễn bằng hai byte, viết dưới dạng hex là `c3 a1`. Chữ `A` chỉ cần một byte `41`.
+
+Bởi vậy, số ký tự không nhất thiết bằng số bytes. Khi một giới hạn quy định “tối đa 72 bytes”, bạn không thể hiểu thành “72 ký tự”, đặc biệt với tiếng Việt.
+
+Khi chuyển ngược bytes thành chuỗi, bên nhận phải dùng đúng charset — bộ quy tắc ánh xạ ký tự và bytes. Decode bytes UTF-8 bằng charset khác có thể tạo chữ lỗi. Đây là lỗi biểu diễn, không phải lỗi giải mã mật mã.
+
+### Base64 biến bytes thành text
+
+Giả sử bạn muốn đưa bytes của một ảnh vào một trường JSON. Bytes bất kỳ có thể chứa giá trị không thể chèn trực tiếp vào JSON string. Base64 giải quyết việc này bằng cách chuyển bytes thành các ký tự ASCII có thể biểu diễn trong text.
+
+Base64 chuẩn dùng 64 ký tự: `A–Z`, `a–z`, `0–9`, `+` và `/`. Mỗi ký tự biểu diễn 6 bit. Ba byte đầu vào có 24 bit nên được biểu diễn bằng bốn ký tự Base64.
+
+Ví dụ `Man` có ba byte ASCII:
+
+| Cách nhìn | Giá trị |
+| --- | --- |
+| Bytes dạng hex | `4d 61 6e` |
+| Bits của ba byte | `01001101 01100001 01101110` |
+| Chia thành nhóm 6 bit | `010011 010110 000101 101110` |
+| Chỉ số trong bảng Base64 | `19 22 5 46` |
+| Ký tự tương ứng | `T W F u` |
+
+Kết quả là `TWFu`. Bên decode dùng cùng bảng công khai để ghép lại các bit ban đầu. Không bước nào cần key.
+
+Nếu số bytes không chia hết cho ba, Base64 chuẩn dùng `=` làm padding ở cuối. Một byte ASCII `M` trở thành `TQ==`. Padding này giúp biểu diễn khối cuối, không liên quan đến padding trong một thuật toán encryption.
+
+Với `n` bytes, Base64 chuẩn có padding tạo `4 × ceil(n / 3)` ký tự. Với dữ liệu lớn, kích thước tăng khoảng một phần ba, chưa tính lớp JSON hay các phần đóng gói khác. **Base64 không nén dữ liệu và không giữ bí mật.**
+
+### Base64URL và percent-encoding giải quyết hai việc khác nhau
+
+Base64URL là biến thể dùng `-` thay `+` và `_` thay `/`. Một số protocol, chẳng hạn các segment của JWT, còn bỏ padding `=` theo quy định của chúng.
+
+Base64URL vẫn là encoding của bytes. Nó không tự xác nhận rằng chuỗi là một URL hợp lệ hay rằng giá trị đã được kiểm tra quyền truy cập.
+
+Percent-encoding lại xử lý cú pháp URL. Ví dụ dấu cách có thể được biểu diễn thành `%20`, còn ký tự `&` bên trong một giá trị query có thể thành `%26` để không bị hiểu là dấu phân cách giữa các tham số.
+
+Dùng API dựng URL hoặc encode đúng **thành phần** URL bạn đang tạo. Không encode toàn bộ URL một cách máy móc, vì `:`, `/`, `?` có thể là dấu phân cách cần giữ. Với form encoding, dấu cách còn có thể thành `+`; đây là quy tắc khác mà phía nhận phải hiểu đúng.
+
+Điểm chung của tất cả các ví dụ trên là không có secret. Percent-encode password hay Base64URL-encode token không khiến chúng an toàn để xuất hiện trong log.
+
+### Thực hành encode và decode bằng Java
+
+Lưu đoạn dưới thành `EncodingDemo.java`. Ví dụ chỉ rõ UTF-8 ở cả hai chiều, thay vì phụ thuộc charset mặc định của môi trường.
+
+```java title="EncodingDemo.java"
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+
+public class EncodingDemo {
+    public static void main(String[] args) {
+        String original = "customer-123";
+        byte[] bytes = original.getBytes(StandardCharsets.UTF_8);
+
+        String encoded = Base64.getUrlEncoder()
+            .withoutPadding()
+            .encodeToString(bytes);
+
+        byte[] restoredBytes = Base64.getUrlDecoder().decode(encoded);
+        String restored = new String(restoredBytes, StandardCharsets.UTF_8);
+
+        System.out.println(encoded);
+        System.out.println(restored);
+        System.out.println(original.equals(restored));
+    }
+}
+```
+
+Chạy bằng `java EncodingDemo.java`. Kết quả:
+
+```text
+Y3VzdG9tZXItMTIz
+customer-123
+true
+```
+
+Người nhận chỉ cần biết đây là Base64URL để lấy lại `customer-123`. Bỏ padding không thêm một lớp bảo mật nào. Với chuỗi này, số bytes đã chia hết cho ba nên ngay cả encoder có padding cũng không thêm dấu `=`.
+
+## Encryption bảo vệ bí mật bằng key
+
+Giả sử địa chỉ giao hàng phải được lưu trong database, nhưng một người chỉ lấy được bản sao database không được phép đọc nó. Encoding không đáp ứng yêu cầu này. Bạn cần encryption và phải đặt key ngoài phạm vi quyền truy cập database đó.
+
+### Plaintext, ciphertext và key
+
+**Plaintext** là dữ liệu trước khi mã hóa. Nó có thể là văn bản, ảnh hoặc bytes của bất kỳ file nào; từ “text” không giới hạn nó ở chuỗi ký tự.
+
+**Ciphertext** là dữ liệu sau khi mã hóa. Để khôi phục plaintext, bên nhận cần đúng key và các tham số mà cơ chế mã hóa yêu cầu.
+
+**Key** là giá trị bí mật điều khiển phép biến đổi. Thuật toán có thể công khai. Thiết kế không nên dựa vào việc attacker không biết bạn dùng AES hay không tìm được hàm decrypt trong source code.
+
+Mục tiêu giữ bí mật này gọi là **confidentiality**: bên không có quyền dùng key không đọc được nội dung. Tuy nhiên, chỉ che nội dung chưa đủ nếu attacker còn có thể sửa dữ liệu. Đó là lý do cần quan tâm thêm tính toàn vẹn và xác thực dữ liệu.
+
+### Symmetric và asymmetric encryption
+
+Với **symmetric encryption**, hai chiều encrypt và decrypt dùng cùng một secret key. AES là ví dụ phổ biến. Nó phù hợp để mã hóa dữ liệu ứng dụng, nhưng ai có key cũng có khả năng đọc dữ liệu tương ứng.
+
+Với **asymmetric encryption**, public key và private key là một cặp có liên hệ toán học. Trong một cơ chế encryption phù hợp, bên gửi có thể dùng public key của người nhận để bảo vệ dữ liệu mà không cần biết private key. Người nhận giữ private key để giải mã.
+
+Không phải mọi thuật toán public-key đều dùng để encrypt. Một số dùng cho chữ ký, một số dùng để hai bên thiết lập secret chung. Vì vậy, không nên mô tả mọi thao tác dùng private key là “encrypt bằng private key”.
+
+Trong thực tế, các cơ chế lai thường kết hợp public-key cryptography để thiết lập hoặc bảo vệ key với symmetric encryption để mã hóa nội dung. Với ứng dụng lưu dữ liệu, hãy dùng thư viện hoặc dịch vụ đã cung cấp cơ chế kết hợp chuẩn thay vì tự ghép các phép toán mật mã cơ bản.
+
+### AES-GCM kết hợp bảo mật và phát hiện sửa đổi
+
+Giả sử attacker không đọc được một bản ghi đã encrypt, nhưng có thể thay đổi các byte của bản ghi đó. Nếu ứng dụng chỉ tập trung vào việc che nội dung mà bỏ qua kiểm tra sửa đổi, nó có thể xử lý dữ liệu không còn đáng tin.
+
+AES-GCM là một dạng **AEAD — Authenticated Encryption with Associated Data**. Ngoài che plaintext, nó tạo một authentication tag để phát hiện dữ liệu không vượt qua bước xác thực.
+
+Hai thuộc tính cần phân biệt:
+
+- **Confidentiality:** người không có key không đọc được plaintext.
+- **Integrity/authenticity của dữ liệu:** thay đổi trái phép ciphertext hoặc thông tin được ràng buộc vào phép mã hóa sẽ làm kiểm tra tag thất bại, trừ xác suất giả mạo rất nhỏ theo giới hạn của cơ chế.
+
+“Authenticity” ở đây không tự chứng minh người dùng nào đã gửi dữ liệu. Với symmetric key, mọi bên có key đều có thể tạo dữ liệu hợp lệ. Authentication của user và authorization — kiểm tra user được phép làm gì — vẫn là trách nhiệm của ứng dụng.
+
+Với thiết kế mới, mình ưu tiên một AEAD được thư viện hỗ trợ tốt, như AES-GCM hoặc ChaCha20-Poly1305. Không dùng AES-ECB cho dữ liệu ứng dụng và không tự ghép AES-CBC với một hàm hash để thay AEAD.
+
+### Phân biệt key, nonce, tag và AAD
+
+Trong AES-GCM, bốn thành phần này có vai trò riêng:
+
+| Thành phần | Vai trò | Cần bí mật | Cách xử lý |
+| --- | --- | --- | --- |
+| Key | Cho phép encrypt và decrypt | Có | Sinh bằng nguồn ngẫu nhiên mật mã; quản lý quyền và vòng đời riêng |
+| Nonce, còn được gọi là IV trong API GCM | Phân biệt các lần encrypt dưới cùng key | Không | Không được lặp lại với cùng key; thường dùng 12 bytes cho GCM |
+| Authentication tag | Cho phép phát hiện dữ liệu không hợp lệ | Không | Lưu cùng ciphertext và kiểm tra khi decrypt |
+| AAD — Associated Authenticated Data | Ràng buộc ngữ cảnh vào ciphertext mà không mã hóa ngữ cảnh đó | Không được che bởi AEAD | Cung cấp đúng cùng bytes ở cả hai chiều |
+
+Ví dụ bạn encrypt email của customer `123`. AAD có thể là chuỗi UTF-8 `customer:123:email:v1`. Khi ai đó chuyển ciphertext sang bản ghi customer `456`, ứng dụng dựng AAD từ customer đang được truy cập, tức `customer:456:email:v1`. Tag không còn khớp nên decrypt thất bại.
+
+Ràng buộc này chỉ hữu ích nếu ứng dụng tự xác định ngữ cảnh mong đợi. Nếu ứng dụng tin cả ciphertext lẫn AAD do attacker đưa vào, attacker có thể chuyển cả hai cùng nhau. AAD cũng không tự ngăn phát lại một bản ghi cũ vẫn hợp lệ; chống replay cần version, trạng thái hoặc cơ chế riêng.
+
+<Callout type="warn" title="Nonce không phải một password thứ hai">
+
+Nonce có thể lưu công khai cạnh ciphertext. Yêu cầu nghiêm ngặt là không lặp nonce với cùng AES-GCM key. Lặp nonce có thể làm mất cả bí mật dữ liệu lẫn khả năng chống giả mạo. Không dùng một nonce cố định, timestamp đơn lẻ hoặc bộ đếm bị reset sau mỗi lần restart.
+
+</Callout>
+
+## Kết hợp encryption với encoding
+
+Sau AES-GCM, bạn có bytes ciphertext và tag. Nếu cần lưu vào trường JSON string, bạn vẫn phải chuyển bytes đó thành text. Vì vậy, encode và encrypt thường xuất hiện trong cùng một luồng, không phải hai lựa chọn loại trừ nhau.
+
+Sơ đồ dưới mô tả chiều ghi. Key và AAD là đầu vào của phép encrypt; Base64URL chỉ đóng gói kết quả để đưa vào JSON.
+
+```d2 interactive=false title="Chiều ghi: encrypt nội dung, encode kết quả"
+direction: down
+plaintext: "Plaintext bytes"
+encrypt: "AES-GCM encrypt"
+key: "Secret key"
+context: "AAD từ ngữ cảnh bản ghi"
+payload: "Nonce + ciphertext + tag"
+json: "Base64URL để lưu trong JSON"
+plaintext -> encrypt: "Nội dung cần che"
+key -> encrypt: "Quyền sử dụng key"
+context -> encrypt: "Ràng buộc ngữ cảnh"
+encrypt -> payload: "Kết quả dạng bytes"
+payload -> json: "Encode, không thêm bảo mật"
+```
+
+Khi đọc, ứng dụng Base64URL decode trước, lấy nonce và ciphertext/tag, rồi mới decrypt với đúng key và AAD. **Decode thành công chỉ chứng minh chuỗi có thể đọc theo format; nó không chứng minh nội dung hợp lệ.**
+
+Trong Java GCM, `Cipher.doFinal()` ở chiều encrypt trả về ciphertext kèm tag ở cuối. Không phải API nào cũng đóng gói giống vậy: một thư viện khác có thể trả ciphertext và tag thành hai trường riêng. Khi tích hợp nhiều ngôn ngữ, phải thống nhất format, độ dài tag và cách biểu diễn AAD.
+
+## Thực hành AES-GCM bằng Java
+
+### Chương trình hoàn chỉnh
+
+Lưu đoạn dưới thành `EncryptionDemo.java`. Chương trình sinh một key demo trong memory, encrypt email, encode kết quả thành Base64URL rồi decrypt lại.
+
+Ba thử nghiệm tiếp theo cố ý sửa ciphertext, đổi AAD và dùng sai key. Chúng giúp bạn kiểm tra rằng chương trình không chỉ khôi phục được dữ liệu ở nhánh thành công mà còn từ chối dữ liệu không vượt qua xác thực.
+
+```java title="EncryptionDemo.java"
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.SecureRandom;
+import java.util.Arrays;
+import java.util.Base64;
+import javax.crypto.AEADBadTagException;
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
+
+public class EncryptionDemo {
+    private static final SecureRandom RANDOM = new SecureRandom();
+    private static final int NONCE_BYTES = 12;
+    private static final int TAG_BITS = 128;
+
+    record Payload(String nonce, String ciphertextAndTag) {}
+
+    static SecretKey newKey() throws GeneralSecurityException {
+        KeyGenerator generator = KeyGenerator.getInstance("AES");
+        generator.init(256);
+        return generator.generateKey();
+    }
+
+    static Payload encrypt(byte[] plaintext, byte[] aad, SecretKey key)
+            throws GeneralSecurityException {
+        byte[] nonce = new byte[NONCE_BYTES];
+        RANDOM.nextBytes(nonce);
+
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.ENCRYPT_MODE, key,
+            new GCMParameterSpec(TAG_BITS, nonce));
+        cipher.updateAAD(aad);
+        byte[] ciphertextAndTag = cipher.doFinal(plaintext);
+
+        Base64.Encoder encoder = Base64.getUrlEncoder().withoutPadding();
+        return new Payload(encoder.encodeToString(nonce),
+            encoder.encodeToString(ciphertextAndTag));
+    }
+
+    static byte[] decrypt(Payload payload, byte[] aad, SecretKey key)
+            throws GeneralSecurityException {
+        Base64.Decoder decoder = Base64.getUrlDecoder();
+        byte[] nonce = decoder.decode(payload.nonce());
+        byte[] ciphertextAndTag = decoder.decode(payload.ciphertextAndTag());
+        if (nonce.length != NONCE_BYTES || ciphertextAndTag.length < TAG_BITS / 8) {
+            throw new IllegalArgumentException("Invalid payload format");
+        }
+
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.DECRYPT_MODE, key,
+            new GCMParameterSpec(TAG_BITS, nonce));
+        cipher.updateAAD(aad);
+        return cipher.doFinal(ciphertextAndTag);
+    }
+
+    static void expectRejected(String label, Payload payload,
+            byte[] aad, SecretKey key) throws GeneralSecurityException {
+        try {
+            decrypt(payload, aad, key);
+            throw new AssertionError(label + " was accepted");
+        } catch (AEADBadTagException expected) {
+            System.out.println(label + ": rejected");
+        }
+    }
+
+    public static void main(String[] args) throws GeneralSecurityException {
+        SecretKey key = newKey();
+        byte[] plaintext = "demo@example.com".getBytes(StandardCharsets.UTF_8);
+        byte[] aad = "customer:123:email:v1".getBytes(StandardCharsets.UTF_8);
+        Payload payload = encrypt(plaintext, aad, key);
+
+        byte[] restored = decrypt(payload, aad, key);
+        if (!Arrays.equals(plaintext, restored)) {
+            throw new AssertionError("Round-trip failed");
+        }
+        System.out.println("Round-trip: " + new String(restored, StandardCharsets.UTF_8));
+
+        byte[] modified = Base64.getUrlDecoder().decode(payload.ciphertextAndTag());
+        modified[0] ^= 1;
+        Payload tampered = new Payload(payload.nonce(),
+            Base64.getUrlEncoder().withoutPadding().encodeToString(modified));
+        expectRejected("Changed ciphertext", tampered, aad, key);
+        expectRejected("Changed AAD", payload,
+            "customer:456:email:v1".getBytes(StandardCharsets.UTF_8), key);
+        expectRejected("Wrong key", payload, aad, newKey());
+    }
+}
+```
+
+Đọc code theo ba điểm chính:
+
+1. `encrypt()` tạo nonce mới cho mỗi lần gọi. Nonce được trả về trong `Payload`, không cần giấu.
+2. `updateAAD()` chạy trước `doFinal()` ở cả hai chiều. Đổi AAD khiến cùng ciphertext không còn được chấp nhận.
+3. `decrypt()` chỉ trả plaintext sau khi `doFinal()` hoàn tất và kiểm tra tag thành công. Không bắt lỗi rồi trả dữ liệu rỗng như thể decrypt đã thành công.
+
+Tên `NoPadding` trong `AES/GCM/NoPadding` không có nghĩa là thiếu một lớp bảo vệ. GCM không cần padding kiểu block như một số mode khác. Tag 128 bit ở đây là phần kiểm tra tính toàn vẹn, không phải padding và cũng không phải độ dài key AES 256 bit.
+
+### Chạy và đọc kết quả
+
+Trong thư mục chứa file, chạy `java EncryptionDemo.java`. Kết quả mong đợi:
+
+```text
+Round-trip: demo@example.com
+Changed ciphertext: rejected
+Changed AAD: rejected
+Wrong key: rejected
+```
+
+Chương trình không in key, nonce hay ciphertext. Mỗi lần chạy sinh key và nonce mới, nên không nên tạo một ciphertext cố định làm kết quả kiểm thử.
+
+Bạn có thể sửa thêm một byte trong nonce hoặc tag để kiểm tra việc từ chối. Đừng kiểm tra một chuỗi Base64 bị hỏng rồi kết luận đã kiểm thử integrity: khi đó chương trình có thể chỉ thất bại ở bước decode, chưa chạy kiểm tra tag.
+
+Ở API thật, lỗi format, sai key và lỗi tag cần được xử lý theo contract của service. Trả một lỗi chung phù hợp cho client; không trả exception chứa payload và không log plaintext. Bên trong hệ thống vẫn cần phân loại lỗi vận hành mà không tiết lộ dữ liệu nhạy cảm.
+
+### Những giới hạn cần giữ rõ
+
+Key trong demo chỉ tồn tại đến khi process kết thúc. Nếu bạn lưu `Payload` rồi restart chương trình, `newKey()` sinh key khác và không thể đọc dữ liệu cũ. Production phải có cách truy xuất đúng key đã dùng, không sinh key mới mỗi lần cần decrypt.
+
+`SecureRandom` tạo nonce 96 bit với xác suất trùng thấp, nhưng không chứng minh uniqueness tuyệt đối. Với nhiều instance dùng chung key, phải tính tổng số lần encrypt, tuân thủ giới hạn dùng GCM và có chính sách rotation. Đừng đợi một instance đạt ngưỡng rồi mới tính đến các instance còn lại.
+
+Demo cũng chưa giới hạn kích thước đầu vào, lưu key ID, phân quyền, quản lý backup hay migration format. Nó đủ để quan sát encode, encrypt và xác thực tag; các phần vận hành được bàn tiếp ở phần quản lý key.
+
+## Hashing tạo dấu vân tay của dữ liệu
+
+Giả sử bạn tải một file cài đặt và muốn kiểm tra file nhận được có giống bản nhà phát hành công bố hay không. Bạn không cần che file và cũng không cần decrypt. Bạn cần một giá trị đại diện để so sánh.
+
+Cryptographic hash nhận dữ liệu đầu vào và tạo một **digest** có độ dài cố định theo thuật toán. SHA-256 tạo digest 256 bit, tức 32 bytes. Nếu hiển thị bằng hex, mỗi byte thành hai ký tự nên bạn thấy 64 ký tự hex.
+
+Cùng một chuỗi bytes luôn cho cùng một SHA-256 digest. Khác charset, khác newline hoặc thêm một dấu cách là khác bytes đầu vào. Vì vậy, khi hai bên đối chiếu hash, phải thống nhất dữ liệu thực sự được hash, không chỉ nội dung “nhìn giống nhau” trên màn hình.
+
+Hash không có bước decrypt. Một hàm nhận đầu vào dài tùy ý nhưng chỉ trả 256 bit không thể là phép ánh xạ một-một cho mọi đầu vào. Hai đầu vào khác nhau có cùng digest được gọi là **collision**. Thuật toán cryptographic hash tốt khiến việc chủ động tìm collision hay tìm đầu vào khớp một digest trở nên không khả thi trong phạm vi an toàn được kỳ vọng; không có nghĩa là collision không tồn tại về mặt toán học.
+
+### Một chiều không có nghĩa là không thể đoán
+
+Giả sử database lưu `SHA-256(phoneNumber)`. Số điện thoại có cấu trúc và tập giá trị hữu hạn. Attacker có thể hash từng số có khả năng xuất hiện rồi so sánh với digest trong database.
+
+Attacker không “decrypt SHA-256”. Họ chọn một candidate — giá trị có khả năng là đầu vào ban đầu — rồi tính hash và kiểm tra. Cách này vẫn có thể thành công dù thuật toán hash không có lỗ hổng mật mã.
+
+Sự khác biệt đó đặc biệt quan trọng với password: nhiều người chọn password nằm trong các danh sách phổ biến. Fast hash cho phép kiểm tra nhiều candidate với chi phí thấp. Thêm một salt rồi dùng SHA-256 trực tiếp vẫn không biến nó thành một cơ chế lưu password phù hợp.
+
+### Hash chỉ đáng tin khi giá trị đối chiếu đáng tin
+
+Nếu website công bố file và SHA-256 bên cạnh, hash giúp phát hiện file bị lỗi khi tải. Nhưng nếu attacker thay được cả file lẫn digest trên cùng website, họ có thể công bố digest của file giả.
+
+Hash thông thường không dùng secret, nên không chứng minh ai đã tạo dữ liệu. Muốn xác thực nguồn, bạn cần digest được cung cấp qua kênh tin cậy hoặc một cơ chế như digital signature. Với hai service có secret dùng chung, HMAC có thể đáp ứng nhu cầu xác thực message.
+
+## HMAC kiểm tra message bằng secret dùng chung
+
+HMAC kết hợp một cryptographic hash với secret key theo một cơ chế đã được chuẩn hóa. Bên gửi tính authentication tag từ message và key. Bên nhận dùng cùng key để tính lại và đối chiếu.
+
+Người chỉ biết message không thể tạo tag hợp lệ cho message mới nếu không có key, theo giả định an toàn của HMAC và thuật toán được chọn. Nhưng message vẫn có thể đọc được: **HMAC không encrypt nội dung.**
+
+### Ví dụ webhook thanh toán
+
+Giả sử cổng thanh toán gửi body JSON chứa `orderId` và `amount`. Nó gửi kèm một tag HMAC-SHA-256 được tính theo protocol của cổng thanh toán.
+
+Bên nhận nên xử lý theo thứ tự:
+
+1. Lấy đúng bytes mà protocol quy định dùng để ký. Thường đây là raw body trước khi parse JSON, có thể kèm timestamp và thông tin khác.
+2. Kiểm tra tag bằng HMAC key tương ứng và API so sánh constant-time, tức tránh dừng so sánh ngay ở byte khác đầu tiên.
+3. Chỉ xử lý nội dung sau khi verify thành công.
+4. Áp dụng quy tắc chống replay và xử lý idempotency theo protocol.
+
+Không parse JSON rồi tự stringify lại trước khi verify nếu protocol ký raw body. Thứ tự field hoặc khoảng trắng có thể đổi dù ý nghĩa JSON không đổi, dẫn đến khác bytes và khác tag.
+
+Một request cũ có HMAC hợp lệ vẫn có thể bị gửi lại. Timestamp chỉ giúp chống replay nếu nó nằm trong dữ liệu được xác thực và phía nhận kiểm tra khoảng thời gian cho phép. Event ID cần cơ chế lưu/đối chiếu để không xử lý cùng sự kiện nhiều lần.
+
+Dùng API HMAC chuẩn. Không tự thay bằng `SHA-256(secret + message)` hoặc một kiểu ghép chuỗi tùy ý; đó không phải HMAC và có thể có tính chất bảo mật khác hẳn.
+
+### HMAC khác digital signature
+
+Với HMAC, bên verify biết secret dùng để tạo tag. Do đó, bên đó cũng có thể tạo message mới với tag hợp lệ. HMAC không giúp chứng minh với một bên thứ ba rằng chỉ riêng một sender cụ thể đã tạo message.
+
+Digital signature dùng private key để ký và public key để verify. Bên chỉ có public key có thể kiểm tra mà không tự ký được. Đây là khác biệt hữu ích khi một bên phát hành token hoặc gói phần mềm cho nhiều bên kiểm tra.
+
+Cả HMAC lẫn chữ ký đều không tự che nội dung. Giữ bí mật và xác thực dữ liệu là hai nhu cầu có thể xuất hiện cùng nhau, nhưng phải được đáp ứng bằng cơ chế phù hợp.
+
+## Password hashing dành riêng cho mật khẩu
+
+Ứng dụng đăng nhập không cần biết password gốc để gửi lại cho người dùng. Nó chỉ cần kiểm tra password được nhập có đúng không. Vì vậy, lưu password bằng encryption tạo thêm khả năng khôi phục mà chức năng đăng nhập không cần.
+
+Password hashing được thiết kế để mỗi lần thử candidate tốn tài nguyên. Argon2id còn dùng memory để làm việc đoán password trên phần cứng chuyên dụng tốn kém hơn. Đây là mục tiêu khác với SHA-256, vốn được thiết kế để hash nhanh.
+
+### Luồng đăng ký và đăng nhập
+
+Sơ đồ dưới tách hai thời điểm: khi đăng ký, hệ thống tạo verifier — dữ liệu dùng để kiểm tra password; khi đăng nhập, thư viện dùng verifier đó để xác minh password mới nhập.
+
+```d2 interactive=false title="Password được verify, không được decrypt"
+direction: down
+register: "Đăng ký: password mới"
+hash: "Password-hashing library\nSinh salt, áp dụng cost"
+stored: "Verifier trong database\nAlgorithm + cost + salt + hash" {shape: cylinder}
+login: "Đăng nhập: password vừa nhập"
+verify: "Library verify"
+result: "Khớp hoặc không khớp"
+register -> hash: "Không ghi password vào log"
+hash -> stored: "Lưu verifier, không lưu plaintext"
+stored -> verify: "Đọc tham số đã dùng"
+login -> verify: "Password cần kiểm tra"
+verify -> result: "Không có bước decrypt"
+```
+
+Khi đăng nhập, không tạo salt mới rồi so trực tiếp hai chuỗi hash. Thư viện cần dùng salt và cost được lưu trong verifier để kiểm tra candidate. API verify của thư viện thường xử lý việc này cho bạn.
+
+Nếu quên password, người dùng đi qua quy trình reset được xác thực phù hợp rồi đặt password mới. Hệ thống không gửi lại password cũ, vì không có lý do để giữ khả năng đọc lại nó.
+
+### Salt, cost và pepper
+
+**Salt** là giá trị ngẫu nhiên riêng cho từng bản ghi password. Hai người dùng có cùng password nhưng salt khác nhau sẽ có verifier khác nhau. Salt ngăn attacker dùng một kết quả tính sẵn để đối chiếu hàng loạt tài khoản.
+
+Salt không bí mật và có thể nằm cùng hash trong database. Nó không ngăn attacker đoán từng password sau khi lấy được database; nó buộc họ tính riêng với salt tương ứng. Hãy để thư viện password-hashing tin cậy sinh và đóng gói salt khi API hỗ trợ.
+
+**Cost** là tham số điều khiển tài nguyên cần cho mỗi lần hash hoặc verify. Với Argon2id, các tham số bao gồm memory, số lần lặp và parallelism. Cost cao hơn thường khiến việc đoán password tốn hơn, nhưng cũng làm mỗi request đăng nhập của hệ thống tốn hơn.
+
+**Pepper** là secret bổ sung, được quản lý ngoài database password. Khác salt, pepper có thể dùng chung cho nhiều bản ghi. Nó có thể giúp khi attacker chỉ lấy được database mà không có quyền truy cập secret store, nhưng không thay thế salt hoặc password-hashing algorithm.
+
+Pepper làm recovery và rotation phức tạp hơn: với các cách triển khai phổ biến, không có password gốc thì không thể tạo lại toàn bộ verifier dưới pepper mới. Nếu sử dụng, hãy dùng một thiết kế được hướng dẫn rõ và chuẩn bị cả phương án reset khi pepper bị lộ.
+
+### Chọn thuật toán và nâng cost
+
+Với ứng dụng mới, mình ưu tiên Argon2id từ thư viện được duy trì. Theo OWASP Password Storage Cheat Sheet, cấu hình tối thiểu được khuyến nghị là 19 MiB memory, 2 iterations và parallelism 1. Đây là mốc khởi đầu tối thiểu, không phải kết quả benchmark cho hạ tầng của bạn.
+
+Nếu Argon2id không có sẵn, cân nhắc scrypt. Bcrypt thường gặp ở hệ thống cũ và có giới hạn đầu vào 72 bytes cần kiểm tra theo thư viện. Nếu môi trường yêu cầu tuân thủ FIPS — bộ tiêu chuẩn có quy định về module mật mã — PBKDF2 trong một implementation phù hợp có thể là lựa chọn cần thiết. Đừng tự chuyển từ thuật toán này sang thuật toán khác chỉ bằng cách đổi tên hàm: format verifier và các giới hạn cũng thay đổi.
+
+Benchmark cost trên môi trường gần production, dưới mức concurrency đăng nhập dự kiến. Đồng thời giới hạn request để attacker không biến thao tác verify tốn tài nguyên thành một cách làm cạn CPU hoặc memory của service.
+
+Khi nâng cost, giữ khả năng verify bản ghi cũ. Sau một lần đăng nhập thành công, dùng password vừa được xác minh để tạo verifier mới với policy hiện tại. Không cần và cũng không có bước decrypt password hash cũ.
+
+## Những lớp bảo vệ trong web application
+
+Các cơ chế trên thường xuất hiện chồng lên nhau. Khi review một luồng dữ liệu, hãy tách từng lớp để biết phần nào thực sự giữ bí mật và phần nào chỉ đổi format.
+
+### Basic authentication và HTTPS
+
+HTTP Basic authentication biểu diễn cặp `username:password` bằng Base64 trong header `Authorization`. Ai đọc được header đều có thể decode credential. Base64 ở đây chỉ giúp đóng gói theo format của protocol.
+
+Nếu request đi qua HTTPS, TLS mới là lớp bảo vệ dữ liệu trên chặng kết nối đó. Sau điểm terminate TLS — nơi TLS được giải mã, chẳng hạn reverse proxy — header có thể được application hoặc proxy đọc.
+
+Vì vậy, phải redact `Authorization` khỏi access log, trace và error report. Nếu proxy gọi tiếp backend, chặng proxy–backend cần được đánh giá riêng. HTTPS ở phía browser không tự chứng minh mọi chặng phía sau đều được encrypt.
+
+### JWT có chữ ký vẫn có thể đọc được
+
+JWT dạng JWS compact thường có ba segment: `header.payload.signature`. Header và payload được Base64URL encode. Chữ ký hoặc MAC bảo vệ dữ liệu khỏi bị sửa mà vẫn được chấp nhận, nhưng không che payload.
+
+Chỉ decode payload để hiển thị thông tin không đồng nghĩa verify token. Trước khi tin claims — các trường dữ liệu trong token — backend cần kiểm tra chữ ký/MAC và thuật toán được cho phép. Nó còn phải kiểm tra issuer (bên phát hành), audience (bên nhận token dự kiến), thời hạn và các điều kiện của ứng dụng.
+
+Không đặt password hoặc secret vào JWS. Nếu client không nên thấy dữ liệu, ưu tiên không đưa nó vào token; có thể dùng opaque token chỉ chứa một giá trị tham chiếu và giữ dữ liệu ở server. JWE là cơ chế mã hóa trong họ JOSE, nhưng nó cũng cần thiết kế phân phối và quản lý key, không phải một lựa chọn miễn phí về vận hành.
+
+### Encryption at rest khác application-level encryption
+
+Database hoặc disk encryption at rest bảo vệ dữ liệu ở tầng lưu trữ theo cơ chế và quyền của dịch vụ. Nó hữu ích với rủi ro như lấy được storage hoặc backup ngoài phạm vi quyền được phép giải mã. Nhưng một SQL query được database chấp nhận thường vẫn trả dữ liệu rõ cho client có quyền đọc.
+
+Application-level encryption mã hóa field trước khi ghi vào database. Người chỉ có quyền đọc bảng sẽ thấy ciphertext nếu họ không đồng thời có quyền dùng key. Đổi lại, các chức năng search, sort và index trên plaintext không còn hoạt động như trước.
+
+Chẳng hạn email được encrypt bằng AES-GCM với nonce mới không thể dùng ciphertext làm khóa tìm kiếm equality ổn định. Một blind index bằng HMAC có thể hỗ trợ exact lookup, nhưng làm lộ quan hệ bằng nhau giữa các giá trị trong cùng ngữ cảnh index. Đây là một trade-off phải thiết kế rõ, không phải lý do để cố định nonce.
+
+Cả hai lớp encryption đều không ngăn application đã có quyền đọc cố tình trả dữ liệu cho sai user. Authorization vẫn phải được kiểm tra trước khi đọc hoặc trả kết quả.
+
+## Quản lý key và vòng đời dữ liệu
+
+Một hàm AES-GCM đúng vẫn không cứu được thiết kế lưu raw key ngay cạnh ciphertext. Nếu cùng một lần lộ database lấy được cả hai, attacker có thể thực hiện decrypt như ứng dụng.
+
+### Tách quyền đọc database khỏi quyền dùng key
+
+Bắt đầu bằng **threat model**: nêu rõ bạn đang chống ai và họ có quyền gì. Ví dụ “attacker lấy được bản backup database nhưng không có identity của workload” là một phạm vi khác với “attacker đã chiếm toàn bộ process ứng dụng”.
+
+KMS — Key Management Service — và HSM — Hardware Security Module — có thể giữ key và thực hiện các thao tác mật mã dưới quyền được kiểm soát. Secret store thường cho phép ứng dụng lấy secret về dùng. Các lựa chọn này không có cùng ranh giới bảo vệ: key không export được trong KMS/HSM khác raw key mà process có thể đọc.
+
+Mặc định nên cấp quyền tối thiểu cho workload cần thiết, tách quyền quản trị database khỏi quyền dùng key và ghi audit cho thao tác quan trọng. Không hard-code key, commit key hay in key vào log. Bất kỳ nơi nào lấy được raw key đều nằm trong phạm vi cần bảo vệ, kể cả công cụ debug và crash dump.
+
+Nếu attacker chiếm được application có quyền decrypt, họ có thể gọi decrypt trong phạm vi quyền đó, ngay cả khi không export được key. KMS giúp kiểm soát quyền và audit; nó không tự làm application bị compromise trở nên an toàn.
+
+### Envelope encryption
+
+Với dữ liệu lớn, hệ thống thường dùng **data encryption key — DEK** để encrypt nội dung. Sau đó một **key encryption key — KEK** bảo vệ DEK. Cách đóng gói này gọi là envelope encryption.
+
+KMS có thể giữ KEK. Ứng dụng lưu ciphertext và DEK đã được bọc — wrapped DEK — cùng nhau. Khi đọc, workload được cấp quyền nhờ KMS mở DEK, rồi dùng DEK để decrypt nội dung trong memory.
+
+Wrapped DEK nằm cạnh ciphertext không tương đương raw key nằm cạnh ciphertext: cần quyền dùng KEK để mở nó. Tuy vậy, nếu process đã có plaintext DEK thì phải bảo vệ bộ nhớ và chỉ giữ key trong phạm vi thời gian cần thiết.
+
+Không phải mỗi field đều cần một lần gọi KMS. Đơn vị dùng DEK, việc cache và thời gian giữ key là quyết định thiết kế dựa trên lưu lượng, yêu cầu cô lập và rủi ro. Nên dùng SDK hoặc thư viện envelope encryption đã được kiểm chứng thay vì tự phát minh một protocol đóng gói key.
+
+### Rotation và khôi phục backup
+
+Một payload production thường cần `version` để biết format và tham chiếu key đủ ổn định để tìm đúng key đã dùng. Không chỉ lưu một tên trỏ tới “key hiện tại” nếu tên đó sẽ chuyển sang key khác và làm mất cách đọc dữ liệu cũ.
+
+Một quy trình migration có thể gồm:
+
+1. Cho read path hỗ trợ format/key version cũ và mới.
+2. Chuyển write path sang key mới.
+3. Re-encrypt dữ liệu cũ bằng job có giới hạn tốc độ, kiểm tra tiến độ và khả năng chạy lại.
+4. Xác minh dữ liệu đang dùng, rollback window và backup trước khi thu hồi key cũ.
+
+Rotation key trong một dịch vụ không nhất thiết mã hóa lại mọi ciphertext. Với envelope encryption, có thể có trường hợp chỉ cần bọc lại DEK; nếu DEK đã lộ thì chỉ bọc lại nó không bảo vệ được ciphertext cũ mà attacker đã lấy. Phải phân biệt đổi KEK, đổi DEK và xử lý key compromise.
+
+Mất key có thể đồng nghĩa mất khả năng đọc dữ liệu vĩnh viễn. Một bản backup ciphertext nhưng không có phương án phục hồi quyền/key tương ứng chưa phải kế hoạch recovery đầy đủ. Hãy kiểm thử restore cả dữ liệu lẫn khả năng decrypt trước khi thật sự cần đến backup.
+
+## Chọn cơ chế cho một thiết kế cụ thể
+
+Giả sử bạn đang thêm hồ sơ khách hàng gồm ảnh, địa chỉ, email và password vào một service. Thay vì chọn một “thuật toán bảo mật” chung cho cả record, hãy quyết định theo từng chức năng:
+
+| Nhu cầu | Cơ chế nên xem xét | Điều không được suy ra |
+| --- | --- | --- |
+| Nhúng bytes ảnh vào JSON | Base64 nếu contract bắt buộc | Ảnh được giữ bí mật |
+| Đưa địa chỉ vào query parameter | URL builder và encoding đúng thành phần | Địa chỉ an toàn để xuất hiện trong URL/log |
+| Bảo vệ request qua mạng | HTTPS/TLS, đánh giá từng chặng | Plaintext không còn tồn tại tại endpoint |
+| Lưu địa chỉ để application đọc lại | AEAD và quản lý key theo threat model | User nào cũng có quyền đọc nếu decrypt được |
+| Tìm chính xác email đã encrypt | Thiết kế index riêng, chẳng hạn HMAC blind index | Không có leakage từ index |
+| Kiểm tra password đăng nhập | Password-hashing library và policy cost | Có thể khôi phục password cũ |
+| Kiểm tra webhook thanh toán | HMAC hoặc signature theo protocol nhà cung cấp | Request hợp lệ chưa từng được xử lý trước đó |
+| Kiểm tra file tải về | Cryptographic hash với digest đáng tin, hoặc chữ ký | Hash cạnh file tự chứng minh nguồn phát hành |
+
+Sau đó đi theo luồng dữ liệu thật: request vào đâu, plaintext xuất hiện ở đâu, ai có quyền đọc, dữ liệu nào đi vào log, queue, cache và backup. Một field được encrypt trong database vẫn có thể lộ nếu handler ghi plaintext vào trace trước khi encrypt.
+
+Trước khi hoàn tất thiết kế, xác nhận các điểm sau:
+
+- Dữ liệu có thật sự cần lưu không; có thể bỏ hoặc giảm mức chi tiết không.
+- Chỗ cần khôi phục đã dùng encryption; chỗ chỉ cần verify password không giữ khả năng decrypt.
+- Base64, hex và URL encoding chỉ được coi là representation.
+- Key, nonce, AAD và tag được dùng đúng; lỗi xác thực không bị bỏ qua.
+- Quyền đọc dữ liệu và quyền dùng key được xác định rõ.
+- Log, metric, trace và exception không đưa secret hoặc plaintext nhạy cảm ra ngoài ranh giới dự kiến.
+- Rotation, migration và restore đã có quy trình kiểm thử.
+
+Điểm bắt đầu tốt nhất không phải chọn một thuật toán mạnh hơn, mà là xác định dữ liệu cần đi đâu và bên nào được phép đọc nó. Từ đó bạn mới chọn đúng lớp biểu diễn, bảo mật và xác thực cho từng đoạn của luồng.
+
+## Tài liệu tham khảo và bài tiếp theo
+
+- [RFC 4648 — Base16, Base32 và Base64](https://www.rfc-editor.org/rfc/rfc4648): bảng ký tự, padding và biến thể URL-safe.
+- [OWASP Cryptographic Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html): chọn encryption, quản lý key và giới hạn của từng lớp bảo vệ.
+- [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html): Argon2id, salt, pepper và nâng cấp password verifier.
+- [Java 17 Cipher API](https://docs.oracle.com/en/java/javase/17/docs/api/java.base/javax/crypto/Cipher.html): AEAD, thứ tự cung cấp AAD và hành vi kiểm tra authentication tag.
+
+<Cards>
+  <Card title="SSL/TLS" href="/security/02-ssl-tls" description="Theo dõi cách một kết nối bảo vệ dữ liệu trên đường truyền và nơi TLS kết thúc." />
+  <Card title="Tìm kiếm trên dữ liệu đã mã hóa" href="/database/04-fuzzy-search-encrypted-column" description="Đi tiếp vào blind index, exact/fuzzy search và dữ liệu mà index có thể làm lộ." />
+</Cards>

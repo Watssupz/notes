@@ -1,0 +1,778 @@
+---
+title: "Fuzzy search trên dữ liệu mã hóa: thiết kế từ nhu cầu đến vận hành"
+description: "Hiểu giới hạn tìm kiếm trên ciphertext, thiết kế blind index và n-gram để chọn candidate, xác minh sau giải mã, kiểm soát rò rỉ thông tin và vận hành index an toàn."
+---
+
+<Callout type="info" title="Phạm vi và kiến thức nền">
+  Bài dành cho bạn đã biết SQL, index và API backend. Ví dụ xuyên suốt là tìm tên
+  khách hàng trong một ứng dụng nhiều tenant, tức nhiều tổ chức dùng chung hệ
+  thống nhưng dữ liệu phải được cách ly. SQL dùng PostgreSQL; demo chạy độc lập
+  bằng Node.js 22 trở lên. Thiết kế n-gram trong bài là mô hình để học cơ chế và
+  đánh giá trade-off, không phải một giao thức searchable encryption đã được
+  thẩm định bảo mật.
+</Callout>
+
+## Mục lục
+
+- [Bắt đầu từ màn hình tìm khách hàng](#bắt-đầu-từ-màn-hình-tìm-khách-hàng)
+- [Xác định loại tìm kiếm trước khi chọn kỹ thuật](#xác-định-loại-tìm-kiếm-trước-khi-chọn-kỹ-thuật)
+  - [Exact, prefix, substring và fuzzy là các hợp đồng khác nhau](#exact-prefix-substring-và-fuzzy-là-các-hợp-đồng-khác-nhau)
+  - [Tách chất lượng tìm kiếm khỏi tính đúng của phép xác minh](#tách-chất-lượng-tìm-kiếm-khỏi-tính-đúng-của-phép-xác-minh)
+- [Mã hóa ở đâu quyết định ai còn thấy plaintext](#mã-hóa-ở-đâu-quyết-định-ai-còn-thấy-plaintext)
+  - [Mã hóa ổ đĩa không che dữ liệu khỏi database đang chạy](#mã-hóa-ổ-đĩa-không-che-dữ-liệu-khỏi-database-đang-chạy)
+  - [Mã hóa ở application tạo ra ranh giới khác](#mã-hóa-ở-application-tạo-ra-ranh-giới-khác)
+  - [Những cách làm có vẻ tiện nhưng đổi mất mục tiêu bảo vệ](#những-cách-làm-có-vẻ-tiện-nhưng-đổi-mất-mục-tiêu-bảo-vệ)
+- [Chọn kiến trúc ít phức tạp nhất đáp ứng yêu cầu](#chọn-kiến-trúc-ít-phức-tạp-nhất-đáp-ứng-yêu-cầu)
+- [Tách ciphertext và search index thành hai trách nhiệm](#tách-ciphertext-và-search-index-thành-hai-trách-nhiệm)
+  - [Ciphertext giữ nội dung gốc](#ciphertext-giữ-nội-dung-gốc)
+  - [Blind index phục vụ exact lookup](#blind-index-phục-vụ-exact-lookup)
+  - [Tách key và domain để tránh liên kết ngoài ý muốn](#tách-key-và-domain-để-tránh-liên-kết-ngoài-ý-muốn)
+- [Chuẩn hóa tên và chia thành n-gram](#chuẩn-hóa-tên-và-chia-thành-n-gram)
+  - [Chuẩn hóa là một phần của hợp đồng dữ liệu](#chuẩn-hóa-là-một-phần-của-hợp-đồng-dữ-liệu)
+  - [Từ một tên thành tập trigram](#từ-một-tên-thành-tập-trigram)
+  - [Overlap chỉ là tín hiệu chọn candidate](#overlap-chỉ-là-tín-hiệu-chọn-candidate)
+  - [Giới hạn với chuỗi ngắn và tên nhiều từ](#giới-hạn-với-chuỗi-ngắn-và-tên-nhiều-từ)
+- [Thiết kế bảng và truy vấn candidate trong PostgreSQL](#thiết-kế-bảng-và-truy-vấn-candidate-trong-postgresql)
+  - [Schema giữ tenant và version ngay trong dữ liệu](#schema-giữ-tenant-và-version-ngay-trong-dữ-liệu)
+  - [Luồng ghi cập nhật ciphertext và token cùng nhau](#luồng-ghi-cập-nhật-ciphertext-và-token-cùng-nhau)
+  - [Luồng đọc lọc candidate rồi mới giải mã](#luồng-đọc-lọc-candidate-rồi-mới-giải-mã)
+  - [Candidate limit không phải lời hứa tìm đủ kết quả](#candidate-limit-không-phải-lời-hứa-tìm-đủ-kết-quả)
+- [Demo chạy được bằng Node.js](#demo-chạy-được-bằng-nodejs)
+  - [Mã hóa, tạo token và xác minh kết quả](#mã-hóa-tạo-token-và-xác-minh-kết-quả)
+  - [Chạy demo và đọc kết quả](#chạy-demo-và-đọc-kết-quả)
+  - [Những gì demo chưa giải quyết](#những-gì-demo-chưa-giải-quyết)
+- [Rò rỉ thông tin và giới hạn bảo mật](#rò-rỉ-thông-tin-và-giới-hạn-bảo-mật)
+  - [Database không biết token gốc nhưng vẫn thấy cấu trúc](#database-không-biết-token-gốc-nhưng-vẫn-thấy-cấu-trúc)
+  - [Search API có thể trở thành công cụ dò dữ liệu](#search-api-có-thể-trở-thành-công-cụ-dò-dữ-liệu)
+  - [AEAD không chứng minh tính đầy đủ hay độ mới của index](#aead-không-chứng-minh-tính-đầy-đủ-hay-độ-mới-của-index)
+- [Vận hành index trong hệ thống thật](#vận-hành-index-trong-hệ-thống-thật)
+  - [Ghi đồng bộ và ghi qua outbox](#ghi-đồng-bộ-và-ghi-qua-outbox)
+  - [Backfill và thay đổi normalization](#backfill-và-thay-đổi-normalization)
+  - [Rotation key mã hóa và key tìm kiếm](#rotation-key-mã-hóa-và-key-tìm-kiếm)
+  - [Xóa dữ liệu ở mọi bản sao liên quan](#xóa-dữ-liệu-ở-mọi-bản-sao-liên-quan)
+- [Đánh giá chất lượng và chi phí bằng kiểm thử](#đánh-giá-chất-lượng-và-chi-phí-bằng-kiểm-thử)
+  - [Bộ dữ liệu đánh giá phải phản ánh cách người dùng gõ](#bộ-dữ-liệu-đánh-giá-phải-phản-ánh-cách-người-dùng-gõ)
+  - [Đo database và application riêng](#đo-database-và-application-riêng)
+  - [Các kiểm thử an toàn không được bỏ qua](#các-kiểm-thử-an-toàn-không-được-bỏ-qua)
+- [Checklist trước khi triển khai](#checklist-trước-khi-triển-khai)
+- [Tài liệu tham khảo và bài liên quan](#tài-liệu-tham-khảo-và-bài-liên-quan)
+
+## Bắt đầu từ màn hình tìm khách hàng
+
+Giả sử bạn đang xây một CRM. Nhân viên nhập `Nguyem` để tìm một khách hàng tên `Nguyễn`. Sản phẩm muốn vẫn hiện ra đúng người dù người dùng bỏ dấu hoặc gõ sai một ký tự. Đồng thời, yêu cầu bảo mật nói rằng bản dump database không được chứa tên khách hàng ở dạng đọc được.
+
+Nếu chỉ lưu tên ở dạng plaintext — nội dung trước mã hóa — việc tìm kiếm tương đối quen thuộc: chuẩn hóa tên, tạo text index rồi tính độ giống nhau. Nhưng khi application mã hóa tên trước khi gửi tới database, database chỉ còn **ciphertext**, tức dữ liệu sau mã hóa. Các đoạn giống nhau của hai tên không còn biểu hiện thành những đoạn giống nhau trong ciphertext.
+
+Đây không phải vấn đề thêm một index SQL là xong. Bạn phải quyết định bên nào được thấy tên thật, database được biết thêm thông tin gì để tìm kiếm, và sản phẩm chấp nhận bỏ sót kết quả đến mức nào.
+
+Bài này xây dựng thiết kế theo thứ tự đó. Mục tiêu không phải làm cho `LIKE` chạy được trên mọi ciphertext, mà là hiểu cách tạo một đường tìm kiếm riêng bên cạnh dữ liệu được mã hóa.
+
+## Xác định loại tìm kiếm trước khi chọn kỹ thuật
+
+### Exact, prefix, substring và fuzzy là các hợp đồng khác nhau
+
+Từ “search gần đúng” thường bị dùng cho nhiều hành vi. Với tên `Nguyễn Văn An`, các yêu cầu sau không tương đương:
+
+| Loại tìm kiếm | Input minh họa | Quy tắc mong muốn |
+| --- | --- | --- |
+| Exact sau chuẩn hóa | `NGUYEN VAN AN` | Bằng toàn bộ tên sau lowercase, bỏ dấu và chuẩn hóa khoảng trắng |
+| Prefix | `nguyen va` | Tên bắt đầu bằng đoạn đã nhập |
+| Substring | `van` | Tên chứa đoạn đã nhập ở một vị trí bất kỳ |
+| Fuzzy theo lỗi gõ | `nguyen van am` | Chấp nhận một số thao tác thêm, xóa hoặc thay ký tự |
+| Theo các từ không cần đúng thứ tự | `an nguyen` | Các từ cần xuất hiện nhưng không nhất thiết theo thứ tự ban đầu |
+| Theo ý nghĩa | `khách mua thường xuyên` | Tìm theo một ý niệm, không phải độ giống ký tự của tên |
+
+`LIKE '%van%'` giải quyết substring, không tự sửa lỗi `vna`. Một full-text index thường xử lý từ và ngôn ngữ, nhưng không mặc nhiên đáp ứng mọi quy tắc sửa lỗi tên riêng. Vector search phục vụ độ gần về ý nghĩa cũng không thay thế quy tắc so khớp định danh.
+
+Trong bài, demo chọn một hợp đồng hẹp: **so sánh toàn bộ tên đã chuẩn hóa, chấp nhận Levenshtein distance không quá 1**. Levenshtein distance là số thao tác thêm, xóa hoặc thay một ký tự ít nhất để biến chuỗi này thành chuỗi kia. Vì `nguyen` thành `nguyem` chỉ cần thay `n` cuối bằng `m`, distance bằng 1.
+
+Đảo hai ký tự kề nhau không phải một thao tác trong Levenshtein chuẩn. Nếu sản phẩm muốn tính lỗi đảo ký tự là một bước, bạn cần một quy tắc khác, chẳng hạn Damerau–Levenshtein, và phải kiểm thử lại cả bước chọn candidate.
+
+### Tách chất lượng tìm kiếm khỏi tính đúng của phép xác minh
+
+Một pipeline thường có hai bước:
+
+1. **Candidate generation:** tìm một tập nhỏ các row có khả năng phù hợp.
+2. **Verification:** giải mã những row đó trong vùng tin cậy rồi áp dụng quy tắc khớp thật sự.
+
+Ví dụ, index chọn ra 80 khách hàng có một số đoạn tên giống query. Application giải mã 80 tên rồi giữ lại những tên có distance không quá 1. Không có gì đảm bảo cả 80 đều là kết quả đúng.
+
+**False positive** là một candidate được chọn nhưng không đạt phép xác minh. Bước verification có thể loại nó. **False negative** là một row đúng đáng lẽ phải trả về nhưng không được chọn làm candidate; verification không thể cứu row chưa từng được đọc.
+
+Hai thước đo hữu ích là **precision**, tỷ lệ kết quả trả về thực sự phù hợp, và **recall**, tỷ lệ kết quả phù hợp mà hệ thống tìm được. Bạn có thể xác minh rất chính xác từng row được trả về nhưng vẫn có recall thấp vì bước chọn candidate bỏ sót quá nhiều.
+
+Chốt hợp đồng trước: tìm tên để hỗ trợ nhân viên chọn thủ công có thể chấp nhận một mức bỏ sót đã đo. Quy trình chống trùng bắt buộc hoặc quyết định pháp lý không nên dựa vào một bộ lọc heuristic chưa chứng minh được độ bao phủ.
+
+## Mã hóa ở đâu quyết định ai còn thấy plaintext
+
+### Mã hóa ổ đĩa không che dữ liệu khỏi database đang chạy
+
+Mã hóa ổ đĩa hoặc storage bảo vệ dữ liệu khi thiết bị bị lấy đi mà kẻ tấn công không có key. Khi hệ thống đã mở khóa và đang chạy, database vẫn có thể đọc giá trị của cột.
+
+Nếu đây là ranh giới bảo vệ cần thiết, bạn có thể dùng tìm kiếm thông thường. Chẳng hạn PostgreSQL có `pg_trgm` để so sánh text bằng trigram và hỗ trợ index GIN/GiST. Tên xuất hiện dưới dạng đọc được bên trong database; mã hóa storage không biến nó thành một cột opaque đối với SQL.
+
+Đừng xây blind index chỉ vì có từ “encrypted” trong tài liệu hạ tầng. Trước hết hãy ghi rõ bạn muốn chống mất ổ đĩa, lộ backup, tài khoản SQL bị chiếm hay database administrator đọc dữ liệu.
+
+### Mã hóa ở application tạo ra ranh giới khác
+
+Nếu muốn database không nhận tên thật, application phải mã hóa trước khi ghi. Key nằm ngoài database, và database không được gọi một đường giải mã hộ nó.
+
+Trong thiết kế của bài, backend application là vùng tin cậy. Nó có thể nhận query plaintext, tạo token tìm kiếm và giải mã candidate. Database chỉ lưu ciphertext cùng search index có kiểm soát rò rỉ. Kẻ lấy được bản dump nhưng không lấy được key sẽ không đọc trực tiếp được tên qua một câu `SELECT`.
+
+Điều này **không bảo vệ tên khi backend đã bị chiếm quyền**. Backend có quyền giải mã thì kẻ kiểm soát backend có thể khai thác quyền đó. KMS, dịch vụ quản lý key, giúp quản lý quyền và lifecycle của key; nó không tự ngăn một workload đã được cấp quyền lạm dụng đường giải mã.
+
+Nếu yêu cầu cả backend cũng không được biết plaintext, ranh giới phải chuyển về client hoặc một vùng thực thi được tin cậy riêng. Pipeline trong bài không còn đủ để đáp ứng yêu cầu đó.
+
+### Những cách làm có vẻ tiện nhưng đổi mất mục tiêu bảo vệ
+
+| Cách làm | Vấn đề |
+| --- | --- |
+| `LIKE` trên ciphertext đã encode Base64 | Base64 chỉ đổi cách biểu diễn; substring của ciphertext không đại diện substring tên |
+| Mã hóa query rồi dùng equality với ciphertext ngẫu nhiên | Cùng plaintext nhưng mỗi lần có nonce mới sẽ cho ciphertext khác |
+| Giải mã mọi row trong SQL rồi chạy `LIKE` | Database phải tiếp cận key và plaintext; phá vỡ ranh giới vừa đặt ra, đồng thời thường tốn chi phí quét |
+| Tạo index trên kết quả giải mã | Cấu trúc index có thể lưu thông tin plaintext; không còn là thiết kế database chỉ thấy ciphertext |
+| Lưu thêm `name_normalized` không mã hóa | Bỏ dấu và lowercase không ẩn danh tên; bản dump vẫn đọc được thông tin chính |
+| Dùng SHA-256 không có key cho tên hoặc n-gram | Kẻ lấy index có thể tự hash danh sách tên và các gram để đối chiếu |
+| Cố định nonce của AES-GCM để tìm equality | Tái sử dụng nonce với cùng key phá vỡ điều kiện an toàn của GCM; không được làm |
+
+Deterministic encryption là một nhóm kỹ thuật riêng: cùng input trong cùng ngữ cảnh cho cùng output, nên có thể hỗ trợ equality nhưng để lộ mẫu bằng nhau. Nó không tự hỗ trợ fuzzy search. Nếu có nhu cầu dùng, phải chọn một scheme được thiết kế cho mục đích đó; tuyệt đối không biến GCM thành deterministic bằng cách tái sử dụng nonce.
+
+## Chọn kiến trúc ít phức tạp nhất đáp ứng yêu cầu
+
+Không phải màn hình tìm kiếm nào cũng cần n-gram token. Mình sẽ bắt đầu bằng phương án đơn giản nhất trong bảng sau, rồi mới tăng độ phức tạp khi có bằng chứng nó không đủ.
+
+| Hoàn cảnh | Hướng ưu tiên | Đánh đổi cần chấp nhận |
+| --- | --- | --- |
+| Database được phép thấy tên; cần bảo vệ storage và kết nối | Text search thông thường, encryption at rest và TLS | Không che tên khỏi bên có quyền đọc database |
+| Chỉ cần lookup đúng toàn bộ giá trị sau chuẩn hóa | Ciphertext ngẫu nhiên và exact blind index | Lộ mẫu bằng nhau trong phạm vi index |
+| Có thể giới hạn trước một tập nhỏ bằng phạm vi nghiệp vụ được cấp quyền | Đọc tập đó, giải mã trong application rồi so khớp | Chi phí đọc và giải mã tỷ lệ với kích thước tập; phải có giới hạn thực tế |
+| Cần typo-tolerant search trên tập lớn; chấp nhận leakage và recall đã đánh giá | Token index theo n-gram, sau đó xác minh | Index lớn, rò rỉ cấu trúc, chọn candidate có thể bỏ sót |
+| Cần ranking phong phú; search service được phép thấy dữ liệu | Search service trong ranh giới tin cậy được phê duyệt | Search index trở thành một bản sao nhạy cảm phải bảo vệ |
+| Không chấp nhận mức rò rỉ của token index thông thường | Đánh giá sản phẩm hoặc giao thức chuyên dụng cùng chuyên gia bảo mật | Phụ thuộc operator, threat model, chi phí và giới hạn của từng giải pháp |
+
+Ví dụ, một nhân viên chỉ được tìm trong danh sách khách của một lịch hẹn có số lượng nhỏ và được chặn cứng. Giải mã danh sách đã được phân quyền đó có thể dễ kiểm soát hơn việc duy trì hàng triệu token. Ngược lại, chỉ thêm `tenant_id` không đảm bảo tập nhỏ: một tenant vẫn có thể có rất nhiều khách hàng.
+
+Với sản phẩm quảng cáo “queryable encryption” hoặc “searchable encryption”, hãy kiểm tra operator được hỗ trợ trên đúng phiên bản. Equality, range, prefix và substring vẫn khác fuzzy matching theo edit distance. Tên tính năng không thay cho việc đọc security model.
+
+## Tách ciphertext và search index thành hai trách nhiệm
+
+### Ciphertext giữ nội dung gốc
+
+Tên gốc cần giữ nguyên để hiển thị, ví dụ `Nguyễn`, không phải chỉ `nguyen`. Application mã hóa tên bằng một primitive có xác thực như AES-GCM. **AEAD** là cơ chế vừa giữ bí mật nội dung, vừa phát hiện nội dung bị sửa khi giải mã.
+
+Một envelope, tức gói dữ liệu đủ để chọn key và giải mã, thường gồm:
+
+| Thành phần | Vai trò |
+| --- | --- |
+| Ciphertext | Nội dung tên đã mã hóa |
+| Nonce/IV | Giá trị dùng cho từng lần mã hóa; không được tái sử dụng với cùng key trong GCM |
+| Authentication tag | Dữ liệu dùng kiểm tra tính toàn vẹn và ngữ cảnh |
+| Key ID và format version | Chọn key và cách đọc envelope; không phải secret key |
+
+**AAD**, additional authenticated data, là dữ liệu được xác thực nhưng không được mã hóa. Bạn có thể dùng tenant, row ID và tên field làm AAD để một ciphertext của khách hàng A không giải mã hợp lệ khi bị chuyển sang khách hàng B.
+
+AAD phải được dựng từ ngữ cảnh mà application kiểm tra, không chỉ tin một nhãn tùy ý gửi kèm ciphertext. Nếu database bị coi là không đáng tin, việc xác thực quyền và danh tính row vẫn phải có cơ sở tin cậy tương ứng.
+
+### Blind index phục vụ exact lookup
+
+Với exact lookup, application tạo thêm một token ổn định từ tên đã chuẩn hóa:
+
+```text
+normalized = normalize(name)
+token = HMAC(K_search, encode(domain, tenant_id, normalized))
+```
+
+HMAC là hàm xác thực có secret key. Nó cho cùng token với cùng key và input, nhưng người chỉ có index và không có key không thể đơn giản tự hash mọi tên để đối chiếu như với SHA-256 thuần.
+
+Khi tìm, application tạo lại token từ query, database tìm bằng equality, rồi application giải mã và xác minh. Ciphertext vẫn ngẫu nhiên; phần ổn định nằm riêng ở index.
+
+Ở đây “blind index” được dùng theo nghĩa rộng là một lookup token có key. Các thư viện cụ thể có thể dùng KDF, cắt ngắn token hoặc thêm cơ chế khác. Demo dùng đủ output HMAC-SHA-256 để minh họa, không mô phỏng đầy đủ thiết kế của CipherSweet hay sản phẩm nào khác.
+
+Một salt ngẫu nhiên khác nhau cho từng row sẽ làm cùng tên cho token khác nhau. Khi đó application không thể tạo một token query chung để lookup mọi row. Salt công khai cố định cũng không thay thế được secret key. Đây là lý do kỹ thuật hash password không thể được bê nguyên sang search index.
+
+### Tách key và domain để tránh liên kết ngoài ý muốn
+
+Key mã hóa và key tìm kiếm phải độc lập về mục đích. Hệ thống thật có thể quản lý chúng riêng hoặc derive bằng KDF chuẩn với domain separation, tức tách ngữ cảnh sử dụng bằng các nhãn khác nhau.
+
+Ví dụ domain của token là `customer.name.trigram.v1`; token còn bao gồm tenant. Khi đó cùng gram `ngu` ở hai tenant không cho cùng token. Một field khác như địa chỉ cũng không dùng chung ngữ cảnh với tên.
+
+Dùng encoding rõ ràng như mảng JSON có thứ tự cố định hoặc định dạng binary có độ dài từng phần. Đừng ghép chuỗi bằng một dấu phân cách nếu input được phép chứa chính dấu đó: hai bộ input khác nhau có thể tạo cùng chuỗi trước khi HMAC.
+
+Đưa tenant vào token chỉ giảm khả năng liên kết token giữa tenant. Nó không thay thế `WHERE tenant_id = ...`, kiểm tra quyền hay chính sách cấp key. Khi ứng dụng có cùng một root key cho tất cả tenant, lộ root key vẫn ảnh hưởng toàn bộ phạm vi đó.
+
+## Chuẩn hóa tên và chia thành n-gram
+
+### Chuẩn hóa là một phần của hợp đồng dữ liệu
+
+Giả sử sản phẩm muốn `Đặng   Ánh` và `dang anh` được xem là tương đương khi tìm. Một quy tắc có thể là:
+
+1. Chuyển chữ thường.
+2. Dùng Unicode NFD để tách chữ và dấu kết hợp.
+3. Loại dấu kết hợp, chuyển riêng `đ` thành `d`.
+4. Thu gọn khoảng trắng liên tiếp và bỏ khoảng trắng đầu cuối.
+
+Kết quả phục vụ tìm kiếm là `dang anh`. Tên gốc vẫn được mã hóa và giữ nguyên.
+
+Bỏ dấu là một lựa chọn sản phẩm có mất thông tin: `Hòa` và `Hoa` trở thành bằng nhau. Nó phù hợp với tìm kiếm tên không dấu, nhưng không tự chứng minh hai hồ sơ thuộc cùng một người. Cũng đừng áp normalization của tên lên email, số tài khoản hay mã định danh mà chưa xác định semantics riêng của field đó.
+
+Normalization phải giống nhau ở lúc ghi, lúc query và lúc xác minh. Thay đổi cách xử lý dấu câu hoặc Unicode mà không rebuild index sẽ khiến các row cũ và query mới nói hai “ngôn ngữ” khác nhau. Vì vậy, hãy version cả normalization lẫn cách sinh gram.
+
+### Từ một tên thành tập trigram
+
+**N-gram** là một đoạn gồm `n` ký tự liên tiếp. Với `n = 3`, ta gọi là trigram. Ví dụ không thêm padding ở biên:
+
+| Chuỗi đã chuẩn hóa | Tập trigram duy nhất |
+| --- | --- |
+| `nguyen` | `ngu`, `guy`, `uye`, `yen` |
+| `nguyem` | `ngu`, `guy`, `uye`, `yem` |
+| `ngan` | `nga`, `gan` |
+
+Application tạo một HMAC token cho từng gram. Database lưu quan hệ giữa token và customer ID. Cấu trúc “token này xuất hiện trong những row nào” gọi là **inverted index**.
+
+Sơ đồ dưới cho thấy thứ được lưu sau một lần ghi, không phải trình tự thời gian của mọi bước:
+
+```d2 interactive=false title="Tên gốc và dữ liệu phục vụ tìm kiếm có hai đường lưu trữ"
+direction: right
+name: "Tên gốc\nNguyễn"
+app: "Application tin cậy"
+cipher: "Ciphertext + nonce + tag"
+tokens: "Normalize rồi tạo\nHMAC cho từng trigram"
+db: "PostgreSQL" {
+  shape: cylinder
+  icon: /interview-question/postgresql.svg
+}
+name -> app: "Input đã được cấp quyền ghi"
+app -> cipher: "AEAD với key mã hóa"
+app -> tokens: "Key tìm kiếm riêng"
+cipher -> db: "Bảng customer"
+tokens -> db: "Bảng customer_name_term"
+```
+
+Database không cần biết token nào đại diện `ngu`. Nó chỉ cần so sánh token query với token đã lưu. Đổi lại, nó thấy token nào xuất hiện ở nhiều row và những row nào có các token chung. Phần leakage phía sau sẽ phân tích giới hạn này.
+
+Với chuỗi dài `L` code point, cách chia không padding tạo tối đa `L - 2` trigram khi `L` từ 3 trở lên. Các gram lặp được loại trùng: `aaaaa` chỉ có một gram duy nhất là `aaa`. Vì vậy, số token là một tín hiệu về cấu trúc chuỗi, không phải phép đo độ dài chính xác.
+
+### Overlap chỉ là tín hiệu chọn candidate
+
+Hai tập của `nguyen` và `nguyem` có ba gram chung. Chúng là candidate hợp lý dù không bằng nhau.
+
+Có thể tính Jaccard similarity, tức số phần tử chung chia số phần tử của hợp hai tập:
+
+```text
+intersection = 3
+union = 4 + 4 - 3 = 5
+Jaccard = 3 / 5 = 0.6
+```
+
+Con số này mô tả độ giống của **tập gram**, không phải xác suất hai người giống nhau hay phần trăm ký tự đúng. Jaccard cũng không bằng Levenshtein distance. Hai phép đo trả lời hai câu khác nhau.
+
+Để minh họa candidate generation đơn giản, SQL và demo bên dưới dùng ít nhất một token chung, sắp theo số token chung giảm dần. Application sau đó kiểm tra distance thật. Không có ngưỡng overlap nào trong ví dụ được tuyên bố là tối ưu cho tên tiếng Việt.
+
+### Giới hạn với chuỗi ngắn và tên nhiều từ
+
+Hai chuỗi `cat` và `cut` chỉ khác một ký tự, nhưng tập trigram lần lượt chỉ có `cat` và `cut`: không có gram chung. Bộ lọc “ít nhất một trigram chung” bỏ sót kết quả này dù phép Levenshtein sẽ chấp nhận.
+
+Với `An`, cách chia trigram không padding còn không sinh token nào. Bạn phải có chính sách rõ ràng: yêu cầu query dài hơn, chuyển sang exact lookup, hoặc thu hẹp một tập đã được phân quyền rồi giải mã. Không được vô tình biến query rỗng thành quét và giải mã toàn bộ tenant.
+
+Tên nhiều từ có thêm lựa chọn. Giữ khoảng trắng và chia trên cả chuỗi sẽ tạo cả gram đi qua ranh giới từ. Chia riêng từng từ thì mất một phần thông tin thứ tự. Chấp nhận `an nguyen` khớp `nguyen van an` lại cần cách xác minh theo từ, không phải distance toàn chuỗi trong demo.
+
+Code bên dưới dùng code point của Unicode, không dùng từng byte UTF-8. Code point vẫn không luôn bằng một ký tự mà mắt người nhìn thấy, chẳng hạn một số emoji ghép. Với ngôn ngữ và dữ liệu ngoài phạm vi tên minh họa, cần đánh giá segmentation theo grapheme, tức cụm hiển thị, và version thuật toán khi thay đổi.
+
+## Thiết kế bảng và truy vấn candidate trong PostgreSQL
+
+### Schema giữ tenant và version ngay trong dữ liệu
+
+Chỉ chạy schema minh họa này trong database thực hành riêng. Nó không yêu cầu `pg_trgm`, vì database so sánh token binary bằng B-tree thay vì phân tích tên plaintext.
+
+```sql
+CREATE TABLE customer (
+    tenant_id       UUID NOT NULL,
+    customer_id     UUID NOT NULL,
+    name_ciphertext BYTEA NOT NULL,
+    name_nonce      BYTEA NOT NULL CHECK (octet_length(name_nonce) = 12),
+    name_tag        BYTEA NOT NULL CHECK (octet_length(name_tag) = 16),
+    enc_key_id      TEXT NOT NULL,
+    row_version     BIGINT NOT NULL CHECK (row_version > 0),
+    PRIMARY KEY (tenant_id, customer_id)
+);
+
+CREATE TABLE customer_name_term (
+    tenant_id      UUID NOT NULL,
+    index_version  SMALLINT NOT NULL,
+    token          BYTEA NOT NULL CHECK (octet_length(token) = 32),
+    customer_id    UUID NOT NULL,
+    source_version BIGINT NOT NULL CHECK (source_version > 0),
+    PRIMARY KEY (tenant_id, index_version, token, customer_id),
+    FOREIGN KEY (tenant_id, customer_id)
+        REFERENCES customer (tenant_id, customer_id) ON DELETE CASCADE
+);
+
+CREATE INDEX customer_name_term_by_customer
+    ON customer_name_term (tenant_id, customer_id, index_version);
+```
+
+Primary key của bảng term giúp đi từ tenant, version và token tới customer ID. Index thứ hai phục vụ xóa và thay toàn bộ token của một customer, vì thứ tự cột trong primary key không tối ưu cho đường truy cập đó.
+
+`enc_key_id` chỉ version của key mã hóa. `index_version` chỉ một cấu hình tìm kiếm, có thể bao gồm key tìm kiếm, normalization và n-gram policy. Hai version này không cần tăng cùng nhau. `source_version` ghi nhận phiên bản customer mà bộ token được tạo từ đó.
+
+Schema không tự đảm bảo mọi token có `source_version` mới nhất. Đây là invariant mà luồng ghi hoặc worker phải duy trì. Ràng buộc foreign key chỉ đảm bảo customer tham chiếu tồn tại đúng tenant.
+
+### Luồng ghi cập nhật ciphertext và token cùng nhau
+
+Trước transaction, application kiểm tra quyền cập nhật rồi chuẩn hóa và mã hóa dữ liệu trong vùng tin cậy. Nếu quy trình còn gọi KMS từ xa để lấy vật liệu key, tránh giữ row lock trong lúc chờ network khi có thể chuẩn bị an toàn trước đó.
+
+Trong một transaction ngắn, writer:
+
+1. Cập nhật customer với điều kiện version phù hợp, hoặc khóa row theo quy tắc concurrency đã chọn.
+2. Tăng `row_version`.
+3. Xóa token của customer ở các index version đang được duy trì.
+4. Ghi tập token mới với `source_version` bằng version mới của customer.
+5. Commit cả ciphertext và index cùng nhau.
+
+Nếu bước ghi token lỗi, transaction phải rollback cả thay đổi tên. Nếu hai writer chạy đồng thời, chúng phải tuân thủ cùng một giao thức version/locking; nếu không, token của một lần ghi có thể đi cùng ciphertext của lần ghi khác.
+
+Việc ghi cả `v1` và `v2` trong thời gian migration cũng nằm trong cùng quy tắc này. Token trùng trong một customer phải được loại trùng trước insert, hoặc xử lý conflict theo một cách không che lỗi version.
+
+### Luồng đọc lọc candidate rồi mới giải mã
+
+Query được chuẩn hóa và HMAC trong application. Chỉ các token binary được gửi tới PostgreSQL. Sơ đồ dưới mô tả một lượt đọc logic; API không đưa key cho database:
+
+```d2 interactive=false title="Database chọn candidate, application xác minh tên thật"
+direction: down
+query: "Query plaintext"
+app: "Application\nkiểm tra quyền + tạo token"
+db: "PostgreSQL\nlookup token trong tenant" {
+  shape: cylinder
+  icon: /interview-question/postgresql.svg
+}
+verify: "Application\ngiải mã + xác minh + ranking"
+result: "Kết quả được phép hiển thị"
+query -> app: "Input từ người dùng"
+app -> db: "Tenant + index version + tokens"
+db -> verify: "Candidate ID + ciphertext envelope"
+verify -> result: "Chỉ giữ row đạt quy tắc"
+```
+
+SQL sau là **parameterized statement** cho driver PostgreSQL. `$1` là tenant đã suy ra từ phiên đăng nhập và được kiểm tra quyền; `$2` là index version; `$3` là mảng `bytea[]` token query. Không chạy nguyên câu này trong `psql` mà chưa bind parameter hoặc `PREPARE`.
+
+```sql
+WITH query_tokens AS (
+    SELECT DISTINCT token
+    FROM unnest($3::bytea[]) AS q(token)
+    WHERE token IS NOT NULL
+), candidates AS (
+    SELECT t.customer_id,
+           t.source_version,
+           COUNT(*) AS matched_grams
+    FROM customer_name_term AS t
+    JOIN query_tokens AS q ON q.token = t.token
+    WHERE t.tenant_id = $1::uuid
+      AND t.index_version = $2::smallint
+    GROUP BY t.customer_id, t.source_version
+)
+SELECT c.customer_id,
+       c.name_ciphertext, c.name_nonce, c.name_tag, c.enc_key_id,
+       c.row_version, x.matched_grams
+FROM candidates AS x
+JOIN customer AS c
+  ON c.tenant_id = $1::uuid
+ AND c.customer_id = x.customer_id
+ AND c.row_version = x.source_version
+ORDER BY x.matched_grams DESC, c.customer_id
+LIMIT 201;
+```
+
+`query_tokens` loại token trùng để một gram không bị đếm nhiều lần. Điều kiện tenant ở cả phần chọn term lẫn join customer giữ phạm vi truy vấn rõ ràng. Nếu quyền còn giới hạn theo chi nhánh, nhóm hoặc từng hồ sơ, phải thêm điều kiện đó **trước candidate limit**, không chờ tới lúc trả response mới lọc.
+
+Join theo `source_version` không cho bộ token cũ được dùng như thể nó mô tả tên mới. Nó có thể khiến row chưa cập nhật index tạm thời biến mất khỏi tìm kiếm; đó là trade-off consistency, không phải lỗi đã được giải quyết hoàn toàn bằng một điều kiện SQL.
+
+Application kiểm tra số candidate rồi mới giải mã, kiểm tra authentication tag, normalize lại và tính distance. Row không qua kiểm tra AEAD phải bị từ chối theo chính sách lỗi an toàn; đừng hiển thị một phần plaintext hay coi nó là “không khớp” mà không có tín hiệu vận hành.
+
+### Candidate limit không phải lời hứa tìm đủ kết quả
+
+Giả sử ngân sách minh họa là 200 candidate. Query lấy tối đa 201 row để biết có vượt ngân sách hay không. Khi nhận 201 row, application có thể yêu cầu thêm ký tự hoặc thu hẹp phạm vi, thay vì âm thầm coi 200 row đầu là toàn bộ kết quả.
+
+Số 200 chỉ là ví dụ thiết kế, không phải benchmark hay khuyến nghị chung. Cần đo chi phí database, giải mã, xếp hạng và số request đồng thời để chọn giới hạn.
+
+`LIMIT 201` cũng không giới hạn database chỉ đọc 201 term. Database có thể vẫn phải join, group và sort rất nhiều row trước khi biết top candidate. Gram phổ biến như một đoạn trong họ thường gặp có thể tạo danh sách row rất dài. Dùng timeout cho statement, giới hạn input và xem execution plan trên dữ liệu đại diện.
+
+Không đưa `LIMIT 20` của giao diện vào trước verification rồi mặc định đó là 20 kết quả tốt nhất. Một candidate có nhiều gram chung vẫn có thể không qua distance check; thứ hạng overlap không phải thứ hạng cuối. Phân trang toàn cục cần một thiết kế riêng, với candidate cursor, trạng thái tìm kiếm hoặc giới hạn phạm vi được công bố rõ.
+
+## Demo chạy được bằng Node.js
+
+### Mã hóa, tạo token và xác minh kết quả
+
+Demo dưới lưu row và token trong RAM để bạn thấy đầy đủ cơ chế mà không cần database hoặc thư viện bên ngoài. Nó dùng cùng key cho một lần chạy, nonce mới mỗi lần mã hóa, AAD gắn tenant/row/field, và token có domain theo tenant.
+
+Lưu toàn bộ block thành `encrypted-name-search.mjs`. Đây là chương trình một file có kiểm thử bằng `assert`, không phải các đoạn rời cần tự đoán hàm còn thiếu.
+
+```js title="encrypted-name-search.mjs"
+import assert from 'node:assert/strict';
+import {
+  createCipheriv, createDecipheriv, createHmac, randomBytes,
+} from 'node:crypto';
+
+// Chỉ dùng cho demo: restart sẽ mất key và toàn bộ dữ liệu trong RAM.
+const encryptionKey = randomBytes(32);
+const searchKey = randomBytes(32);
+const rows = [];
+const MAX_CANDIDATES = 200;
+
+function normalizeName(value) {
+  return value.toLowerCase().normalize('NFD')
+    .replace(/\p{M}/gu, '').replace(/đ/g, 'd')
+    .replace(/\s+/gu, ' ').trim();
+}
+
+function trigrams(normalized) {
+  const chars = Array.from(normalized);
+  return [...new Set(chars.slice(0, Math.max(0, chars.length - 2))
+    .map((_, i) => chars.slice(i, i + 3).join('')))];
+}
+
+function tokenFor(tenant, gram) {
+  const input = JSON.stringify(['customer.name.trigram.v1', tenant, gram]);
+  return createHmac('sha256', searchKey).update(input).digest('hex');
+}
+
+function aadFor(tenant, id) {
+  return Buffer.from(JSON.stringify(['customer.name.envelope.v1', tenant, id]));
+}
+
+function encryptName(tenant, id, name) {
+  const nonce = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', encryptionKey, nonce);
+  cipher.setAAD(aadFor(tenant, id));
+  const ciphertext = Buffer.concat([cipher.update(name, 'utf8'), cipher.final()]);
+  return { nonce, ciphertext, tag: cipher.getAuthTag() };
+}
+
+function decryptName(tenant, id, envelope) {
+  const decipher = createDecipheriv('aes-256-gcm', encryptionKey, envelope.nonce);
+  decipher.setAAD(aadFor(tenant, id));
+  decipher.setAuthTag(envelope.tag);
+  // Không trả dữ liệu từ update() trước khi final() xác thực thành công.
+  return Buffer.concat([
+    decipher.update(envelope.ciphertext), decipher.final(),
+  ]).toString('utf8');
+}
+
+function distance(left, right) {
+  const a = Array.from(left);
+  const b = Array.from(right);
+  let previous = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j++) {
+      current[j] = Math.min(
+        current[j - 1] + 1,
+        previous[j] + 1,
+        previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+    previous = current;
+  }
+  return previous[b.length];
+}
+
+function addCustomer(tenant, id, name) {
+  const normalized = normalizeName(name);
+  if (!normalized || Array.from(normalized).length > 100) {
+    throw new Error('Invalid name');
+  }
+  if (rows.some((row) => row.tenant === tenant && row.id === id)) {
+    throw new Error('Duplicate customer');
+  }
+  rows.push({
+    tenant, id,
+    envelope: encryptName(tenant, id, name),
+    tokens: new Set(trigrams(normalized).map((g) => tokenFor(tenant, g))),
+  });
+}
+
+function searchCustomers(session, tenant, query) {
+  // Mô hình quyền đơn giản: session do backend đã xác thực tạo ra.
+  // Demo cấp quyền đọc mọi customer trong các tenant này.
+  if (!session.allowedTenants.includes(tenant)) throw new Error('Forbidden');
+  const normalized = normalizeName(query);
+  const length = Array.from(normalized).length;
+  if (length < 3 || length > 100) throw new Error('Query length must be 3..100');
+  const queryTokens = trigrams(normalized).map((g) => tokenFor(tenant, g));
+
+  // Trong PostgreSQL, bước này là lookup inverted index, không quét RAM.
+  const candidates = rows.filter((row) => row.tenant === tenant)
+    .map((row) => ({
+      row,
+      overlap: queryTokens.filter((t) => row.tokens.has(t)).length,
+    }))
+    .filter(({ overlap }) => overlap > 0)
+    .sort((a, b) => b.overlap - a.overlap || a.row.id - b.row.id)
+    .slice(0, MAX_CANDIDATES + 1);
+  if (candidates.length > MAX_CANDIDATES) throw new Error('Narrow the search');
+
+  return candidates.map(({ row }) => {
+    const name = decryptName(tenant, row.id, row.envelope);
+    return { id: row.id, name, distance: distance(normalized, normalizeName(name)) };
+  }).filter((hit) => hit.distance <= 1)
+    .sort((a, b) => a.distance - b.distance || a.id - b.id);
+}
+
+const staff = { allowedTenants: ['tenant-a'] };
+addCustomer('tenant-a', 1, 'Nguyễn');
+addCustomer('tenant-a', 2, 'Ngọc');
+addCustomer('tenant-a', 3, 'Cut');
+addCustomer('tenant-b', 4, 'Nguyễn');
+
+assert.equal(normalizeName('  Đặng   Ánh  '), 'dang anh');
+assert.equal(normalizeName('Nguye\u0302\u0303n'), 'nguyen');
+assert.deepEqual(trigrams('nguyen'), ['ngu', 'guy', 'uye', 'yen']);
+assert.deepEqual(trigrams('aaaaa'), ['aaa']);
+assert.deepEqual(trigrams('an'), []);
+assert.equal(tokenFor('tenant-a', 'ngu'), tokenFor('tenant-a', 'ngu'));
+assert.notEqual(tokenFor('tenant-a', 'ngu'), tokenFor('tenant-b', 'ngu'));
+
+const first = encryptName('tenant-a', 99, 'Nguyễn');
+const second = encryptName('tenant-a', 99, 'Nguyễn');
+assert.notDeepEqual(first.nonce, second.nonce);
+assert.equal(decryptName('tenant-a', 99, first), 'Nguyễn');
+assert.throws(() => decryptName('tenant-a', 100, first));
+const corrupted = { ...first, tag: Buffer.from(first.tag) };
+corrupted.tag[0] ^= 1;
+assert.throws(() => decryptName('tenant-a', 99, corrupted));
+
+const hits = searchCustomers(staff, 'tenant-a', 'Nguyem');
+assert.deepEqual(hits, [{ id: 1, name: 'Nguyễn', distance: 1 }]);
+assert.throws(() => searchCustomers(staff, 'tenant-b', 'Nguyem'), /Forbidden/);
+assert.throws(() => searchCustomers(staff, 'tenant-a', 'An'), /Query length/);
+
+// Cố ý chứng minh false negative của candidate generation.
+assert.equal(distance('cat', 'cut'), 1);
+assert.deepEqual(searchCustomers(staff, 'tenant-a', 'cat'), []);
+
+console.log(JSON.stringify(hits));
+console.log('All demo checks passed; cat/cut is an expected false negative.');
+```
+
+`decryptName()` chỉ trả plaintext sau khi `final()` thành công. Với GCM, output tạm từ `update()` chưa đủ để kết luận nội dung hợp lệ. Không stream phần đó tới client trước khi xác thực authentication tag.
+
+Token trong demo encode hex cho dễ dùng với `Set`. Trong schema PostgreSQL, token lưu bằng 32 byte binary; driver có thể chuyển từ hex bằng `Buffer.from(token, 'hex')` trước khi bind. Chuỗi hex dài 64 ký tự không có nghĩa output HMAC dài 64 byte.
+
+### Chạy demo và đọc kết quả
+
+Trong thư mục thực hành của bạn, chạy:
+
+```bash
+node encrypted-name-search.mjs
+```
+
+Output mong đợi khi các assertion thành công:
+
+```text
+[{"id":1,"name":"Nguyễn","distance":1}]
+All demo checks passed; cat/cut is an expected false negative.
+```
+
+`Nguyem` và `Nguyễn` gặp nhau ở ba gram sau normalization. Row của `tenant-b` không được đọc trong lượt tìm của `tenant-a`. Test đổi row ID và test sửa tag phải làm bước giải mã thất bại.
+
+Test `cat/cut` quan trọng không kém happy path: nó giữ cho tài liệu và implementation không vô tình hứa rằng một trigram index tìm được mọi chuỗi cách query một edit. Nếu sản phẩm yêu cầu bảo đảm đó, phải thay candidate strategy hoặc bổ sung đường fallback đã được đánh giá.
+
+### Những gì demo chưa giải quyết
+
+Demo không có HTTP server, authentication thật, KMS, persistence, update transaction hay index migration. `allowedTenants` chỉ mô phỏng một quyết định quyền từ backend; trong API thật, không được nhận danh sách quyền do client tự khai.
+
+Các key sinh ngẫu nhiên trong RAM chỉ hợp lý vì dữ liệu cũng ở RAM và mất sau mỗi lần chạy. Nếu lưu ciphertext lâu dài nhưng sinh lại key mỗi lần restart, dữ liệu cũ sẽ không giải mã được. Hệ thống thật cần key ID, kho key bền vững, phân quyền và kế hoạch backup/recovery tương ứng.
+
+AES-GCM với nonce ngẫu nhiên 96 bit trong demo không phải một chính sách sử dụng key hoàn chỉnh. Production cần quản lý xác suất trùng nonce, giới hạn lượng dữ liệu trên mỗi key và rotation theo thư viện hoặc dịch vụ đã chọn. Tuyệt đối không lấy test nonce ngẫu nhiên ở đây làm bằng chứng rằng nonce không bao giờ trùng.
+
+Thuật toán distance có chi phí thời gian tỷ lệ với tích độ dài hai chuỗi. Giới hạn độ dài và số candidate là một phần của ngân sách CPU. Có thể tối ưu bằng distance có ngưỡng hoặc thư viện phù hợp, nhưng kết quả phải giữ cùng semantics đã công bố.
+
+## Rò rỉ thông tin và giới hạn bảo mật
+
+### Database không biết token gốc nhưng vẫn thấy cấu trúc
+
+HMAC ngăn cách đối chiếu từ điển trực tiếp khi kẻ tấn công không có key. Nó không xóa những quan hệ mà database cần để tìm kiếm.
+
+| Thông tin quan sát được | Suy luận có thể phát sinh |
+| --- | --- |
+| Token giống nhau trong cùng domain và tenant | Các row có ít nhất một gram chung |
+| Số row chứa một token | Một đặc trưng xuất hiện phổ biến hay hiếm |
+| Số token của mỗi row và các token đi cùng nhau | Tín hiệu về độ dài, độ lặp và cấu trúc tương tự |
+| Token query lặp lại | Người dùng đang tìm cùng một đặc trưng nhiều lần |
+| Những row được trả về và số lượng kết quả | Quan hệ giữa query và dữ liệu, thường gọi là access pattern |
+| Độ dài ciphertext nếu không padding | Tín hiệu về độ dài plaintext theo byte |
+
+Ví dụ, một người có thể tạo các hồ sơ tên do họ chọn và quan sát thay đổi của index sẽ có thêm cơ sở gán ý nghĩa cho token. Một người chỉ có snapshot database ít khả năng hơn người vừa quan sát database vừa điều khiển request. Vì vậy, **threat model** — mô tả đối thủ được làm gì và thấy gì — phải bao gồm cả khả năng tương tác, không chỉ “lộ file backup”.
+
+N-gram index để lộ nhiều quan hệ hơn một token exact cho cả tên. Thêm bigram, prefix, suffix và nhiều biến thể giúp tìm tốt hơn nhưng cũng bổ sung thông tin quan sát được. Không thể kết luận “vẫn HMAC nên thêm bao nhiêu index cũng an toàn”.
+
+Cắt ngắn token hoặc dùng Bloom filter có thể thay đổi false positive và mức leakage, nhưng không tự biến thiết kế thành bảo mật mạnh hơn trong mọi tình huống. Đây là các lựa chọn cần phân tích theo số lượng bản ghi, số index và khả năng đối thủ, không nên tự chọn vài bit theo cảm giác.
+
+### Search API có thể trở thành công cụ dò dữ liệu
+
+Ngay cả khi database không lộ, API cho phép thử nhiều tên và xem kết quả có thể giúp dò xem ai có hồ sơ. Mã hóa ở storage không chặn được suy luận từ hành vi hợp lệ của API.
+
+Một API thực tế cần phối hợp:
+
+- Xác thực và kiểm tra quyền tìm kiếm theo mục đích nghiệp vụ.
+- Tenant và phạm vi truy cập do server quyết định; row-level policy nếu cần.
+- Rate limit và ngân sách candidate theo user, tenant và workload, không chỉ theo IP.
+- Giới hạn query rỗng, quá ngắn, quá dài và số biến thể được phép mở rộng.
+- Chỉ trả field cần hiển thị; cân nhắc che bớt thông tin cho vai trò ít quyền.
+- Phát hiện hành vi quét dữ liệu bằng số liệu tổng hợp không chứa tên thật.
+
+Không log plaintext query hoặc toàn bộ candidate vào trace để “debug cho dễ”. Token ổn định và ID kết quả cũng là dữ liệu nhạy cảm có thể liên kết hành vi. Audit log nên ghi người thực hiện, phạm vi, thời điểm, số lượng và kết quả chính sách với retention và quyền đọc phù hợp.
+
+### AEAD không chứng minh tính đầy đủ hay độ mới của index
+
+AEAD giúp phát hiện một ciphertext bị sửa hoặc gắn sai AAD. Nó không chứng minh database đã trả **đủ** mọi row khớp. Một database ác ý vẫn có thể bỏ một số term hoặc không trả candidate.
+
+Tương tự, nếu cả envelope cũ và version metadata đều bị replay, xác thực ciphertext chưa chắc phát hiện được dữ liệu đã cũ. Chống rollback có thể cần trạng thái version tin cậy bên ngoài database hoặc giao thức chuyên dụng. Đừng gọi một trường `row_version` do chính database trả về là bằng chứng chống replay hoàn chỉnh.
+
+Quy tắc thiết kế ở đây rõ ràng: dùng AEAD cho tính toàn vẹn của payload trong ngữ cảnh đã chọn; dùng transaction và version để quản lý consistency của application. Nếu còn cần chứng minh completeness hoặc freshness trước một database chủ động gian lận, đó là yêu cầu bổ sung, không phải thuộc tính sẵn có của HMAC index.
+
+## Vận hành index trong hệ thống thật
+
+### Ghi đồng bộ và ghi qua outbox
+
+Cùng một PostgreSQL, cập nhật ciphertext và token trong một transaction thường là điểm bắt đầu dễ hiểu nhất. Search sau commit đọc primary sẽ thấy cặp dữ liệu tương ứng. Nếu đọc replica, vẫn cần tính đến replication lag, tức replica chưa nhận kịp commit mới.
+
+Khi index ở một service khác, application không thể dùng local database transaction để commit cả hai nơi. Một hướng là **transactional outbox**: trong cùng transaction với customer, ghi một sự kiện cần đồng bộ. Worker đọc sự kiện rồi cập nhật index.
+
+Sự kiện nên chứa ID, tenant và version cần xử lý, không mặc định nhét plaintext tên vào queue. Worker được cấp quyền đọc và giải mã dữ liệu cần thiết trong vùng tin cậy. Token nếu được gửi qua queue cũng phải được bảo vệ và áp retention phù hợp vì vẫn có tính liên kết.
+
+Worker phải xử lý lặp an toàn và không để sự kiện version cũ ghi đè index mới. Xử lý lặp an toàn, hay **idempotent**, nghĩa là chạy lại cùng công việc không tạo thêm tác động sai. Đọc version hiện tại, áp điều kiện version ở đích và lưu tiến độ xử lý là các phần cần thiết của giao thức đó.
+
+Chọn outbox đồng nghĩa chấp nhận một khoảng thời gian search chưa thấy tên vừa cập nhật. Hãy quyết định UX cho khoảng trễ này, thay vì gọi hệ thống là “nhất quán” chỉ vì cuối cùng worker sẽ chạy.
+
+### Backfill và thay đổi normalization
+
+**Backfill** là tạo index cho những row đã có trước khi tính năng hoặc version mới xuất hiện. Nếu `v2` đổi cách xử lý dấu câu, chỉ cập nhật code query sẽ làm mất khả năng khớp với token `v1`.
+
+Một lộ trình an toàn hơn là:
+
+1. Định nghĩa rõ `v2`: normalization, gram policy, key ID và hợp đồng xác minh.
+2. Deploy writer có thể duy trì cả `v1` lẫn `v2` cho dữ liệu mới và dữ liệu cập nhật.
+3. Backfill theo batch nhỏ bằng worker được cấp quyền, tránh log plaintext.
+4. Chỉ ghi token nếu version nguồn vẫn đúng; gặp conflict thì đọc lại và làm lại.
+5. Đối soát số row, độ mới và chất lượng của `v2`, không chỉ tổng số token.
+6. Chuyển read sang `v2` khi đạt tiêu chí; giữ khả năng quay lại version cũ trong cửa sổ đã định.
+7. Ngừng duy trì rồi xóa `v1` sau khi hết nhu cầu rollback và đáp ứng retention.
+
+Trong giai đoạn đọc cả hai version, tạo đúng token cho từng version, gộp theo customer ID rồi xác minh trên tên hiện tại. Tránh đếm trùng candidate và đừng cắt top-K độc lập ở mỗi version mà không đánh giá tác động tới recall.
+
+Một worker backfill đọc tên cũ rồi ghi token sau khi tên đã đổi sẽ làm index sai. Có `source_version` nhưng không dùng conditional write hoặc locking thì chưa giải quyết được race này.
+
+### Rotation key mã hóa và key tìm kiếm
+
+Hai loại rotation có công việc khác nhau:
+
+| Loại thay đổi | Công việc chính |
+| --- | --- |
+| Đổi key mã hóa, giữ nội dung tên và search policy | Giải mã và mã hóa lại envelope với key mới; token có thể giữ nguyên |
+| Đổi key tìm kiếm | Tính lại mọi token liên quan từ plaintext trong vùng tin cậy |
+| Đổi normalization hoặc n-gram policy | Tạo index version mới và đánh giá lại semantics, recall và leakage |
+| Nghi ngờ key bị lộ | Khoanh vùng ảnh hưởng, thu hồi quyền, điều tra và rebuild theo kế hoạch ứng phó |
+
+Để đổi key tìm kiếm mà không có khoảng mất search, thường cần duy trì index cũ và mới trong giai đoạn chuyển tiếp. Đổi key mã hóa cần đọc được envelope cũ cho tới khi toàn bộ dữ liệu và các quy trình recovery đã chuyển xong.
+
+Rotation không làm kẻ tấn công quên dữ liệu đã lấy trước đó. Nếu đối thủ có token cũ, ciphertext cũ và key cũ tương ứng, việc deploy key mới không khôi phục tính bí mật của snapshot đó.
+
+### Xóa dữ liệu ở mọi bản sao liên quan
+
+Xóa customer trong schema minh họa sẽ cascade term cùng database. Nhưng dữ liệu thật còn có thể nằm ở search service, queue, cache, replica, analytics và backup.
+
+Cần tránh tình huống customer đã xóa nhưng một sự kiện cũ làm worker dựng lại index. Worker phải kiểm tra trạng thái hiện tại hoặc một bản ghi đánh dấu đã xóa có version phù hợp. Quy trình retention của sự kiện và bản ghi đánh dấu cần được thiết kế cùng nhau.
+
+Backup thường được xử lý theo chính sách retention và restore, không bằng một câu `DELETE` trực tiếp. Sau restore, phải có cách áp lại những thao tác xóa bắt buộc. Hủy key có thể hỗ trợ một số mô hình crypto-erasure, nhưng chỉ có ý nghĩa khi phạm vi key phù hợp và không còn bản key hoặc plaintext khác có thể khôi phục dữ liệu.
+
+## Đánh giá chất lượng và chi phí bằng kiểm thử
+
+### Bộ dữ liệu đánh giá phải phản ánh cách người dùng gõ
+
+Đừng chỉ test `Nguyem` vì thiết kế đã được chọn từ chính ví dụ đó. Tạo một tập query và kết quả mong muốn độc lập, được phép sử dụng cho kiểm thử:
+
+| Nhóm | Ví dụ hoặc điều cần kiểm tra |
+| --- | --- |
+| Không dấu và Unicode khác biểu diễn | `Nguyễn`, `NGUYEN`, cùng tên ở Unicode dựng sẵn và tách dấu |
+| Lỗi thêm, xóa, thay ký tự | Lỗi ở đầu, giữa, cuối; không chỉ vị trí giữ được nhiều gram |
+| Lỗi đảo ký tự | Xác nhận sản phẩm dùng Levenshtein hay quy tắc có transposition |
+| Tên ngắn | `An`, tên ba ký tự và query tạo rỗng tập gram |
+| Tên nhiều từ | Thừa khoảng trắng, thiếu từ, đổi thứ tự, tên trùng nhau |
+| Phân bố phổ biến | Họ phổ biến tạo posting list dài; query khớp nhiều customer |
+| Ranh giới quyền | Cùng tên nhưng khác tenant, khác chi nhánh hoặc vai trò không được xem |
+
+Với bộ dữ liệu có đáp án mong muốn, đo recall ở bước candidate riêng với precision và ranking cuối. Nếu candidate recall đã thấp thì tối ưu hàm distance không giải quyết được.
+
+Mọi thay đổi `n`, ngưỡng overlap, candidate limit hoặc quy tắc normalization đều có thể đổi chất lượng. Những con số này cần được version, đo và review như thay đổi hành vi sản phẩm.
+
+### Đo database và application riêng
+
+Giả sử có một triệu tên, mỗi tên dài trung bình 20 code point. Cách chia trigram không padding tạo tối đa 18 triệu quan hệ token–customer trước khi loại gram trùng trong từng tên. Đây chỉ là phép tính quy mô minh họa, không phải kích thước index hay tốc độ đo được.
+
+Mỗi quan hệ còn chứa tenant, version, customer ID và overhead của row/index. Thêm exact index, bigram hoặc version chuyển tiếp sẽ tăng thêm storage và write amplification, tức số thao tác ghi phát sinh cho một cập nhật nghiệp vụ.
+
+Trong môi trường test với dữ liệu đại diện, theo dõi ít nhất:
+
+- Số term đọc, số candidate trước và sau verification, tỷ lệ request vượt ngân sách.
+- Execution plan và lượng I/O; dùng `EXPLAIN (ANALYZE, BUFFERS)` cho query đọc trên môi trường test vì `ANALYZE` thực sự thực thi query.
+- Thời gian lấy vật liệu key, giải mã và tính distance ở application.
+- Latency p50/p95/p99, tức các phân vị để thấy cả trường hợp thường gặp lẫn phần đuôi chậm.
+- CPU, memory, connection pool và throughput khi nhiều request chạy đồng thời.
+- Index lag, số row lệch version và tốc độ backfill trong khi vẫn có cập nhật.
+
+Một biểu đồ latency tốt không đủ nếu request âm thầm trả kết quả thiếu. Luôn xem số liệu chất lượng và hiệu năng cạnh nhau, đồng thời giữ metric không chứa dữ liệu nhận diện không cần thiết.
+
+### Các kiểm thử an toàn không được bỏ qua
+
+Demo có những kiểm thử cơ chế cơ bản; hệ thống thật cần mở rộng sang concurrency, persistence và failure recovery:
+
+| Kiểm thử | Điều phải chứng minh |
+| --- | --- |
+| Ghi cùng tên hai lần | Ciphertext dùng nonce hợp lệ theo chính sách; token cùng domain ổn định |
+| Đổi tenant, row hoặc field của envelope | AAD sai làm xác thực thất bại |
+| Sửa ciphertext, tag hoặc nonce | Không có plaintext chưa được xác thực lọt ra response hoặc log |
+| Search bằng quyền của tenant khác | Bị chặn trước khi đọc và giải mã candidate |
+| Row-level permission | Row không được cấp quyền không chiếm candidate budget và không được giải mã |
+| Token ghi lỗi giữa transaction | Ciphertext và term rollback cùng nhau |
+| Hai writer cập nhật cùng tên khách hàng | Không tồn tại bộ token mới trỏ tới payload sai version |
+| Worker nhận sự kiện lặp hoặc đảo thứ tự | Index không lùi version và không nhân bản tác động |
+| Crash và restart trong backfill | Chạy tiếp an toàn, không bỏ sót hoặc ghi đè dữ liệu mới |
+| Query rỗng, ngắn, dài hoặc gram phổ biến | Chính sách giới hạn hoạt động; không thành full decrypt scan ngoài ý muốn |
+| Restore backup và rotation | Vẫn giải mã được dữ liệu hợp lệ, giữ đúng version và chính sách xóa |
+
+Không viết một assertion ngẫu nhiên cho nonce rồi gọi đó là kiểm toán mật mã. Test hành vi giúp bắt lỗi tích hợp; việc chọn primitive, quản lý key và phân tích leakage vẫn cần review độc lập.
+
+## Checklist trước khi triển khai
+
+Trước khi chọn token n-gram làm thiết kế production, hãy chốt được những điều sau:
+
+- [ ] Có hợp đồng riêng cho exact, prefix, substring, typo và tên nhiều từ; không dùng một từ “fuzzy” để thay mọi quy tắc.
+- [ ] Đã xác định bên nào được thấy plaintext, bên nào giữ key và đối thủ có thể quan sát hay điều khiển gì.
+- [ ] Đã so sánh với exact lookup hoặc giải mã một tập nhỏ được phân quyền; không dùng index phức tạp khi chưa cần.
+- [ ] Normalization, encoding và token domain được version và kiểm thử hai chiều ghi/query.
+- [ ] Ciphertext dùng AEAD, AAD phù hợp, envelope có key ID; không tái sử dụng nonce để hỗ trợ search.
+- [ ] Key mã hóa và key tìm kiếm được tách mục đích, phân quyền và có kế hoạch recovery.
+- [ ] Tenant cùng phạm vi quyền được áp trước candidate limit và trước giải mã.
+- [ ] Recall đã được đo, kể cả tên ngắn; UX công bố và xử lý trường hợp search quá rộng.
+- [ ] Ciphertext và token được đồng bộ bằng transaction hoặc giao thức có version, retry và theo dõi index lag.
+- [ ] Đã review leakage của token, access pattern, query API, log và các bản sao dữ liệu.
+- [ ] Có phương án backfill, rotation, xóa dữ liệu, restore và xử lý worker chạy lại.
+- [ ] Có giới hạn tài nguyên và số liệu thực nghiệm; không coi các giới hạn minh họa trong bài là capacity plan.
+
+Nếu còn chưa chốt threat model hoặc không chấp nhận lượng thông tin lộ qua các token chung, hãy dừng ở bước thiết kế. Thay hàm hash hay tăng độ dài key không sửa được một ranh giới tin cậy bị chọn sai.
+
+## Tài liệu tham khảo và bài liên quan
+
+Các tài liệu sau giải thích những cơ chế được dùng để lập luận trong bài. Thiết kế HMAC trigram minh họa không được các tài liệu này chứng nhận là một scheme an toàn cho mọi dữ liệu.
+
+- [PostgreSQL — Encryption Options](https://www.postgresql.org/docs/18/encryption-options.html): phân biệt mã hóa storage, cột và client-side; lưu ý plaintext/key khi giải mã ở server.
+- [PostgreSQL — pg_trgm](https://www.postgresql.org/docs/18/pgtrgm.html): similarity, GIN/GiST và cách PostgreSQL chia trigram. `pg_trgm` có padding và quy tắc tách từ riêng, **không dùng cùng tokenizer** với demo không padding trong bài.
+- [CipherSweet — Security Properties and Threat Model](https://ciphersweet.paragonie.com/security): giả định về nơi giữ key, leakage của blind index và giới hạn ngoài phạm vi full-text search.
+- [Node.js — Crypto](https://nodejs.org/docs/latest-v22.x/api/crypto.html): API cipher/decipher, AAD, authentication tag và việc xác thực qua `final()`.
+- [OWASP — Cryptographic Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html): lựa chọn cơ chế mã hóa, lưu trữ và quản lý key theo ranh giới bảo vệ.
+
+<Cards>
+  <Card title="Index trên cột nullable" href="/database/02-index-on-nullable-column/" description="Đọc tiếp về cách index phục vụ một đường truy cập cụ thể." />
+  <Card title="Optimistic và pessimistic locking" href="/database/03-optimistic-vs-pessimistic-locking/" description="Bảo vệ version khi cập nhật ciphertext và token cùng nhau." />
+  <Card title="Long-running transaction" href="/database/05-long-running-transaction/" description="Giữ transaction ngắn khi ghi dữ liệu, backfill hoặc gọi dịch vụ key." />
+</Cards>

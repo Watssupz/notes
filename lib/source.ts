@@ -54,6 +54,14 @@ const redisLearn = defineDocs({
   },
   meta: { schema: metaSchema },
 });
+const interviewQues = defineDocs({
+  dir: "content/interview-question",
+  docs: {
+    schema: pageSchema,
+    postprocess: { includeProcessedMarkdown: true },
+  },
+  meta: { schema: metaSchema },
+});
 
 export const sources = {
   docs: loader({
@@ -84,6 +92,11 @@ export const sources = {
   "redis-learn": loader({
     baseUrl: "/redis-learn",
     source: redisLearn.toFumadocsSource(),
+    plugins: [lucideIconsPlugin()],
+  }),
+  "interview-question": loader({
+    baseUrl: "/interview-question",
+    source: interviewQues.toFumadocsSource(),
     plugins: [lucideIconsPlugin()],
   }),
 };

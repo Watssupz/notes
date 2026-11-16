@@ -1,0 +1,228 @@
+---
+title: "Redis và Memcached: chọn cache theo dữ liệu và cách phục hồi"
+description: "Từ cache-aside, atomic operation và eviction đến persistence, high availability, two-level cache và kiểm thử trước khi chọn Redis, Valkey hoặc Memcached."
+---
+
+Giả sử API trang sản phẩm liên tục đọc cùng một dữ liệu từ database. Bạn muốn giữ kết quả trong RAM để lần đọc tiếp theo không phải chạy lại query. Với nhu cầu này, cả Redis lẫn Memcached đều có thể phù hợp. Khác biệt bắt đầu rõ khi cache phải chứa counter, session, bảng xếp hạng hoặc chịu được việc một node biến mất.
+
+Bài này bắt đầu từ cache có thể dựng lại từ database, sau đó mới mở rộng sang dữ liệu có state. Bạn cần biết HTTP request và thao tác đọc/ghi database cơ bản. Các số trong ví dụ là giả định để phân tích, không phải benchmark giữa hai sản phẩm.
+
+## Mục lục
+
+- [Cache là bản sao có thể bỏ đi](#cache-là-bản-sao-có-thể-bỏ-đi)
+- [Hai engine giải quyết những thao tác khác nhau](#hai-engine-giải-quyết-những-thao-tác-khác-nhau)
+- [Atomic operation quan trọng hơn số lượng command](#atomic-operation-quan-trọng-hơn-số-lượng-command)
+  - [Memcached CAS tránh ghi đè dữ liệu vừa thay đổi](#memcached-cas-tránh-ghi-đè-dữ-liệu-vừa-thay-đổi)
+  - [Redis script gộp các bước của rate limiter](#redis-script-gộp-các-bước-của-rate-limiter)
+  - [Session không đồng nghĩa với dữ liệu cache thông thường](#session-không-đồng-nghĩa-với-dữ-liệu-cache-thông-thường)
+- [TTL, invalidation và cache stampede](#ttl-invalidation-và-cache-stampede)
+- [Eviction là quyết định mất dữ liệu nào trước](#eviction-là-quyết-định-mất-dữ-liệu-nào-trước)
+- [Persistence, replication và failover bảo vệ các rủi ro khác nhau](#persistence-replication-và-failover-bảo-vệ-các-rủi-ro-khác-nhau)
+  - [RDB và AOF không biến cache thành dữ liệu không thể mất](#rdb-và-aof-không-biến-cache-thành-dữ-liệu-không-thể-mất)
+  - [Replica giữ bản sao, failover đổi node phục vụ](#replica-giữ-bản-sao-failover-đổi-node-phục-vụ)
+- [Two-level cache chỉ đáng thêm khi network cache đã là bottleneck](#two-level-cache-chỉ-đáng-thêm-khi-network-cache-đã-là-bottleneck)
+- [Redis, Valkey và license phải xét theo version](#redis-valkey-và-license-phải-xét-theo-version)
+- [Chọn engine và chứng minh lựa chọn bằng kiểm thử](#chọn-engine-và-chứng-minh-lựa-chọn-bằng-kiểm-thử)
+- [Tài liệu tham khảo và bài liên quan](#tài-liệu-tham-khảo-và-bài-liên-quan)
+
+## Cache là bản sao có thể bỏ đi
+
+Với sản phẩm `product:42`, database là **source of truth** — nơi quyết định dữ liệu đúng. Cache chỉ giữ một bản sao để đọc nhanh hơn. Cache miss nghĩa là không tìm thấy key; đó không phải lỗi nghiệp vụ nếu ứng dụng vẫn đọc được từ database.
+
+Một thiết kế thường dùng là **cache-aside**: ứng dụng đọc cache trước, chỉ đọc database khi miss rồi ghi kết quả trở lại cache. Sơ đồ dưới đây thể hiện trách nhiệm đó, không phải thời gian đo được của từng chặng.
+
+```d2 title="Cache-aside: ứng dụng sở hữu đường đọc" interactive=false
+direction: right
+api: API
+cache: Redis {
+  icon: /interview-question/redis.svg
+}
+db: PostgreSQL {
+  shape: cylinder
+  icon: /interview-question/postgresql.svg
+}
+api -> cache: "1. GET product:42"
+api -> db: "2. SELECT khi cache miss"
+api -> cache: "3. SET kết quả và TTL"
+```
+
+Nếu Redis mất kết nối, ứng dụng có thể bỏ qua cache. Nhưng database phải chịu được lượng đọc tăng lên. Vì vậy, khả năng phục hồi không nằm riêng ở lựa chọn engine; nó còn nằm ở giới hạn concurrency, tốc độ làm ấm và tải database khi cache lạnh.
+
+Đừng gọi dữ liệu là cache nếu mất nó đồng nghĩa mất tiền hoặc mất đơn hàng. Nếu Redis giữ bản duy nhất của một dữ liệu nghiệp vụ, bạn đang vận hành một database có state. Khi đó phải đánh giá durability, backup, replication và recovery riêng.
+
+## Hai engine giải quyết những thao tác khác nhau
+
+Memcached lưu value như một khối bytes gắn với key. Ứng dụng có thể serialize JSON, HTML hoặc dữ liệu nhị phân vào value; gọi nó là “chỉ lưu string” dễ gây hiểu nhầm. Nó cũng có các thao tác như `add`, counter và CAS, không chỉ `get`/`set`.
+
+Redis hiểu nhiều cấu trúc dữ liệu ở phía server. Ví dụ, Hash cho phép sửa một field mà không cần ứng dụng đọc rồi serialize lại toàn bộ object. Sorted Set giữ member có score để tìm theo thứ tự hoặc khoảng điểm.
+
+| Nhu cầu | Redis | Memcached |
+| --- | --- | --- |
+| Cache response đã serialize | Phù hợp | Phù hợp |
+| Cập nhật có điều kiện | Conditional commands, transaction hoặc script tùy thao tác | `add`, `gets`/`cas` và counter theo protocol |
+| Hash, Set, Sorted Set, Stream | Có primitive tương ứng | Cần biểu diễn và phối hợp ở application hoặc chọn công cụ khác |
+| Khôi phục dữ liệu sau restart | RDB/AOF theo cấu hình | Có warm restart với điều kiện; không tương đương durability của database |
+| Replication và failover | Có giải pháp như replica, Sentinel, Cluster | Không có replication/failover tương đương tích hợp trong server tiêu chuẩn |
+| Phân phối key qua nhiều node | Redis Cluster dùng 16.384 hash slots | Thường do client hoặc proxy định tuyến |
+| Thực thi trên nhiều CPU | Phụ thuộc version, command path và I/O; không suy ra từ một câu “single-threaded” | Worker threads xử lý clients; vẫn cần đo contention và workload |
+
+Không thể suy ra engine nào nhanh hơn từ bảng tính năng. Benchmark phải dùng cùng kích thước value, tỷ lệ hit/miss, network, connection count và cấu hình durability. Throughput một lệnh `GET` không đại diện cho cả request có serialization và database fallback.
+
+## Atomic operation quan trọng hơn số lượng command
+
+### Memcached CAS tránh ghi đè dữ liệu vừa thay đổi
+
+Giả sử hai request cùng đọc một JSON object rồi cùng sửa nó. Nếu cả hai chỉ gọi `set`, request đến sau có thể ghi đè thay đổi của request trước. **CAS**, viết tắt của compare-and-swap, chỉ cho ghi khi version của item vẫn trùng lúc đọc.
+
+Luồng xử lý là đọc bằng `gets`, sửa value rồi `cas` với token đã nhận. Khi CAS thất bại, ứng dụng đọc lại và quyết định retry hoặc trả conflict. Đây là thao tác có điều kiện trên một item, không phải transaction nhiều key.
+
+Với dữ liệu chỉ cần cache nguyên khối, CAS có thể đủ. Không cần chọn Redis chỉ vì ứng dụng có cập nhật cạnh tranh.
+
+### Redis script gộp các bước của rate limiter
+
+Với sliding-window rate limit, mỗi request cần bỏ event cũ, đếm event còn lại rồi thêm event mới nếu chưa vượt ngưỡng. Chạy ba command độc lập có race: hai request đều nhìn thấy còn chỗ và cùng được chấp nhận.
+
+Đoạn Lua minh họa dưới đây chạy các bước trong một lần thực thi ở Redis. `ARGV[1]` là timestamp tính bằng millisecond, `ARGV[2]` là độ dài window, `ARGV[3]` là limit và `ARGV[4]` là request ID duy nhất.
+
+```lua
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local requestId = ARGV[4]
+
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window)
+if redis.call('ZCARD', key) >= limit then
+  return 0
+end
+redis.call('ZADD', key, now, requestId)
+redis.call('PEXPIRE', key, window)
+return 1
+```
+
+Member phải là ID duy nhất, không chỉ là timestamp. Nếu hai request đến trong cùng millisecond và dùng cùng member, một request sẽ thay score của request kia thay vì tạo hai entry.
+
+Script giúp tránh interleaving giữa các command trên node đang xử lý. Nó không giải quyết clock skew, request retry hay mất dữ liệu khi failover. Ví dụ cũng không triển khai dedupe request ID; nếu caller retry cùng request, bạn phải định nghĩa rõ retry có tiêu thụ quota lần nữa hay không. Với limiter phân tán nghiêm ngặt, cần bổ sung hợp đồng thời gian và recovery.
+
+### Session không đồng nghĩa với dữ liệu cache thông thường
+
+Redis Hash có thể giữ `userId`, thời điểm truy cập và trạng thái session. Tuy nhiên, quyền truy cập không nên phụ thuộc vào một bản role cache đã hết hạn cập nhật. Session hết TTL, bị eviction hoặc mất khi failover đều phải dẫn tới hành vi được định nghĩa, chẳng hạn yêu cầu đăng nhập lại.
+
+Mình ưu tiên tách session và cache có thể bỏ đi nếu chúng có policy bộ nhớ khác nhau. Nếu dùng chung instance với `allkeys-lru`, session cũng có thể bị evict; không có ngoại lệ chỉ vì key mang prefix `session:`.
+
+## TTL, invalidation và cache stampede
+
+**TTL** là thời gian sống của một key. TTL 60 giây giới hạn tuổi của entry kể từ lần ghi cache đó, nhưng không tự bảo đảm dữ liệu chỉ cũ tối đa 60 giây so với database. Một reader có thể đọc dữ liệu cũ trước lúc writer commit rồi ghi nó vào cache sau lúc invalidation đã chạy.
+
+Với cache-aside, mặc định thực dụng là ghi database thành công rồi invalidate cache. Sau đó cần chọn cơ chế phù hợp với mức stale được phép: TTL ngắn, invalidation đáng tin cậy, cache theo version hoặc bỏ cache ở đường đọc cần đúng ngay.
+
+**Cache stampede** xảy ra khi nhiều request cùng miss một key và cùng đổ về database. Có hai tình huống khác nhau:
+
+- Nhiều key hết hạn cùng lúc: thêm jitter, tức khoảng ngẫu nhiên vào TTL, để trải thời điểm refresh.
+- Một hot key hết hạn: gộp các request đang cùng load key đó bằng single-flight, hoặc dùng một loader có lease và timeout.
+
+TTL jitter không ngăn được hàng nghìn request cùng miss một hot key. Single-flight trong một process cũng không gộp được loader ở tất cả pods. Khi cache down toàn bộ, vẫn cần concurrency limit và backpressure cho database.
+
+## Eviction là quyết định mất dữ liệu nào trước
+
+**Eviction** là việc engine chủ động loại key để giữ mức dùng bộ nhớ trong giới hạn. Nó khác expiration: expiration dựa trên TTL, eviction dựa trên áp lực tài nguyên và policy.
+
+| Policy Redis | Hành vi | Hệ quả cần chấp nhận |
+| --- | --- | --- |
+| `allkeys-lru` | Chọn key ít dùng gần đây trong toàn bộ keyspace theo thuật toán xấp xỉ | Bất kỳ key nào cũng có thể mất |
+| `volatile-lru` | Chỉ chọn trong các key có TTL | Khi không còn key phù hợp, write cần thêm memory có thể lỗi |
+| `noeviction` | Không tự loại key để nhường bộ nhớ | Command cần thêm memory có thể trả lỗi; application phải xử lý |
+
+`noeviction` không mặc nhiên sai. Nó phù hợp hơn khi việc mất key âm thầm nguy hiểm hơn việc từ chối write. Với pure cache, `allkeys-lru` thường dễ hiểu hơn vì mọi key đều có thể dựng lại.
+
+Ngoài dataset, process còn cần RAM cho replication buffers, clients, allocator và các công việc persistence. Vì vậy `maxmemory` không phải giới hạn RAM tổng của container. Hãy quan sát cả memory của process và giới hạn container khi sizing.
+
+## Persistence, replication và failover bảo vệ các rủi ro khác nhau
+
+### RDB và AOF không biến cache thành dữ liệu không thể mất
+
+RDB tạo snapshot theo cấu hình; khi phục hồi, dữ liệu mới hơn snapshot có thể không còn. AOF lưu thay đổi để replay. Với `appendfsync everysec`, vẫn có cửa sổ mất write khi sự cố xảy ra; không nên biến cấu hình này thành một cam kết RPO tuyệt đối cho mọi kiểu hỏng hóc.
+
+Đây là cú pháp `redis.conf`, không phải YAML:
+
+```text
+save 900 1
+save 300 10
+save 60 10000
+appendonly yes
+appendfsync everysec
+```
+
+Persistence cũng có giá: disk I/O, dung lượng, thời gian load và chi phí khi rewrite/snapshot. Nếu cache có thể rebuild rẻ và database đủ headroom, không bật persistence có thể là lựa chọn hợp lý. Nếu cần giữ dữ liệu, phải thử restore và đo thời gian thực tế.
+
+Memcached có **warm restart** ở những cấu hình hỗ trợ. Nó có thể tái sử dụng item memory sau clean shutdown tương thích, nhưng tài liệu chính thức nói rõ đây không phải crash safety. Không dựa vào tính năng này như một thay thế cho backup hoặc replication.
+
+### Replica giữ bản sao, failover đổi node phục vụ
+
+Replica sao chép dữ liệu từ primary. Failover chọn node thay thế khi primary không còn phục vụ được. Với replication bất đồng bộ, write vừa được primary xác nhận vẫn có thể chưa tới replica được promote.
+
+Sentinel hỗ trợ theo dõi và failover cho Redis không chia shard. Redis Cluster chia keyspace thành hash slots, đồng thời có cơ chế replica/failover theo topology. Cluster không chỉ là “Sentinel nhiều node”; client, multi-key operations và cách vận hành đều có thêm ràng buộc.
+
+Với Memcached, mất một node thường dẫn tới miss cho phần key node đó giữ. Client/proxy quyết định định tuyến lại; database hoặc nguồn gốc phải dựng lại dữ liệu. Cần thử node loss khi đang có tải, không chỉ kiểm tra tổng RAM còn đủ.
+
+## Two-level cache chỉ đáng thêm khi network cache đã là bottleneck
+
+L1 là cache trong process, chẳng hạn Caffeine. L2 là cache dùng chung như Redis. L1 hit không đi qua network, nhưng mỗi process giữ một bản sao riêng cần hết hạn hoặc invalidate.
+
+```d2 title="Hai tầng cache và nơi dữ liệu được giữ" interactive=false
+direction: right
+app: "Application process" {
+  handler: "Request handler"
+  l1: "L1: local cache"
+  handler -> l1: Lookup
+}
+l2: "L2: Redis" {
+  icon: /interview-question/redis.svg
+}
+db: "Database gốc" {shape: cylinder}
+app.handler -> l2: "L1 miss"
+app.handler -> db: "L1 và L2 đều miss"
+```
+
+Redis Pub/Sub có thể thông báo invalidation tới các process đang kết nối. Nhưng subscriber offline sẽ bỏ lỡ message; Pub/Sub không phải durable log. Giữ TTL hoặc cơ chế kiểm tra version để L1 không stale vô hạn khi mất thông báo.
+
+Memcached không có Pub/Sub tích hợp, nhưng điều đó không có nghĩa không thể dùng nó làm L2. Ứng dụng có thể dùng TTL, versioned key hoặc một kênh invalidation riêng. Chọn hai tầng cache khi lợi ích latency/throughput đã được đo đủ để trả thêm chi phí nhất quán.
+
+## Redis, Valkey và license phải xét theo version
+
+Không gắn một nhãn license duy nhất cho mọi Redis release. Redis tới 7.2 dùng BSD-3-Clause; Redis 7.4 chuyển sang lựa chọn RSALv2 hoặc SSPLv1. Redis 8 thêm AGPLv3 thành một lựa chọn, bên cạnh RSALv2 và SSPLv1. Điều kiện sử dụng phụ thuộc version, license bạn chọn và hình thức phân phối/cung cấp dịch vụ.
+
+Valkey phát triển từ Redis 7.2.4 và dùng BSD-3-Clause. Có chung nguồn gốc và protocol không có nghĩa mọi module, command mới, client behavior hay managed-service feature đều tương thích mãi mãi.
+
+Khi chuyển engine, hãy kiểm tra command inventory, Lua scripts, serialization, persistence format, cluster client và failover. Review điều khoản thực tế cùng bộ phận pháp lý khi cần; đừng chọn hoặc loại một engine bằng thông tin license cũ.
+
+## Chọn engine và chứng minh lựa chọn bằng kiểm thử
+
+Nếu ứng dụng chỉ cache response dưới dạng bytes, đã có Memcached vận hành ổn và chịu được cache loss, mình sẽ giữ Memcached. Thêm Redis chỉ để có nhiều tính năng hơn chưa tạo ra giá trị.
+
+Nếu application cần Sorted Set, Hash, script hoặc Stream, Redis hay Valkey đáng cân nhắc hơn việc tự dựng các primitive tương ứng từ nhiều lệnh cache. Tuy nhiên, queue nghiệp vụ cần delivery semantics riêng; có `List` hoặc Pub/Sub không tự tạo thành durable job platform.
+
+Trước rollout, kiểm tra các tình huống sau bằng workload đại diện:
+
+1. Chạy cold cache rồi tăng traffic có kiểm soát; đo database concurrency và request error rate.
+2. Cho một hot key hết hạn; kiểm tra số loader thật sự chạy.
+3. Dừng một node; đo timeout, rerouting và lượng miss thay vì chỉ nhìn cache hit rate tổng.
+4. Đẩy dataset gần giới hạn; xác nhận eviction không làm mất loại state không được phép mất.
+5. Thử stale read trong race giữa update database, invalidation và cache fill.
+6. Nếu dùng persistence/replica, chạy restore và failover drill với dữ liệu demo.
+
+Metrics tối thiểu gồm hit/miss theo cửa sổ thời gian, eviction rate, command latency, network, memory và số request fallback về database. Một hit rate cao vẫn có thể che cache sai dữ liệu; correctness và latency phải được kiểm tra riêng.
+
+## Tài liệu tham khảo và bài liên quan
+
+- [Redis licensing](https://redis.io/legal/licenses/).
+- [Redis persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/).
+- [Redis key eviction](https://redis.io/docs/latest/develop/reference/eviction/).
+- [Memcached warm restart và giới hạn crash safety](https://docs.memcached.org/features/restart/).
+- [Memcached user guide: CAS và các thao tác item](https://docs.memcached.org/userguide/).
+- [Valkey project](https://valkey.io/).
+
+<Cards>
+  <Card title="Scale theo bottleneck" href="/system-design/03-scale-1k-to-50k-users" />
+  <Card title="Xử lý sự cố production" href="/behavioral/01-production-server-down" />
+</Cards>

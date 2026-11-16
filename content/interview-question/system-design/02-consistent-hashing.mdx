@@ -1,0 +1,670 @@
+---
+title: "Consistent hashing: từ cách chia key đến di chuyển dữ liệu an toàn"
+description: "Hiểu hash ring qua ví dụ từng bước, virtual nodes, replication, code Python có kiểm chứng và quy trình đổi shard không làm mất write."
+---
+
+Giả sử bạn có bốn máy lưu hồ sơ người dùng. Mỗi máy sắp hết dung lượng, nên bạn thêm máy thứ năm. Bạn muốn chuyển một phần dữ liệu sang máy mới, nhưng cách chia hiện tại lại khiến phần lớn người dùng đổi máy lưu trữ.
+
+Consistent hashing giải quyết sự xáo trộn đó: giữ phần lớn ánh xạ từ key đến node ổn định khi thêm hoặc bớt node. Phần khó tiếp theo là chuyển dữ liệu thật mà không bỏ sót những thay đổi đang diễn ra. Bài này đi từ phép chia lấy dư đến cả hai phần của bài toán.
+
+<Callout type="info" title="Phạm vi và kiến thức nền">
+Bạn chỉ cần biết key–value và phép chia lấy dư. Node là một thành viên lưu trữ của cluster; shard là một phần dữ liệu đã được chia ra. Để dễ theo dõi, các ví dụ đầu tiên cho mỗi node giữ một shard và chưa có replica. Các vị trí hash nhỏ, dung lượng và traffic trong bài đều là số minh họa, không phải benchmark.
+</Callout>
+
+## Mục lục
+
+- [Bắt đầu từ cách chia key bằng modulo](#bắt-đầu-từ-cách-chia-key-bằng-modulo)
+  - [Hash biến key thành một số ổn định](#hash-biến-key-thành-một-số-ổn-định)
+  - [Thêm một máy làm phần lớn mapping thay đổi](#thêm-một-máy-làm-phần-lớn-mapping-thay-đổi)
+  - [Tính tỷ lệ thay đổi từ bốn lên năm shard](#tính-tỷ-lệ-thay-đổi-từ-bốn-lên-năm-shard)
+- [Hash ring giữ miền hash cố định](#hash-ring-giữ-miền-hash-cố-định)
+  - [Đặt key và node lên cùng một miền số](#đặt-key-và-node-lên-cùng-một-miền-số)
+  - [Tìm owner bằng token kế tiếp](#tìm-owner-bằng-token-kế-tiếp)
+  - [Khoảng sở hữu và các điểm biên](#khoảng-sở-hữu-và-các-điểm-biên)
+- [Thêm và bớt node chỉ đổi các range liên quan](#thêm-và-bớt-node-chỉ-đổi-các-range-liên-quan)
+  - [Thêm node D vào ví dụ](#thêm-node-d-vào-ví-dụ)
+  - [Hiểu đúng con số dữ liệu cần chuyển](#hiểu-đúng-con-số-dữ-liệu-cần-chuyển)
+  - [Remove node khác với khôi phục dữ liệu](#remove-node-khác-với-khôi-phục-dữ-liệu)
+- [Virtual nodes chia ownership thành nhiều phần nhỏ](#virtual-nodes-chia-ownership-thành-nhiều-phần-nhỏ)
+  - [Một token cho mỗi máy có thể rất lệch](#một-token-cho-mỗi-máy-có-thể-rất-lệch)
+  - [Một máy sở hữu nhiều token](#một-máy-sở-hữu-nhiều-token)
+  - [Số vnode và máy có capacity khác nhau](#số-vnode-và-máy-có-capacity-khác-nhau)
+- [Replication là một lớp quyết định khác](#replication-là-một-lớp-quyết-định-khác)
+  - [Chọn các physical node khác nhau](#chọn-các-physical-node-khác-nhau)
+  - [Tách placement khỏi consistency của dữ liệu](#tách-placement-khỏi-consistency-của-dữ-liệu)
+- [Key đều không có nghĩa workload đều](#key-đều-không-có-nghĩa-workload-đều)
+  - [Hot key vẫn tập trung vào một owner](#hot-key-vẫn-tập-trung-vào-một-owner)
+  - [Shard key phải phù hợp với cách truy cập](#shard-key-phải-phù-hợp-với-cách-truy-cập)
+- [Thực hành hash ring bằng Python](#thực-hành-hash-ring-bằng-python)
+  - [Xây một topology snapshot không thay đổi](#xây-một-topology-snapshot-không-thay-đổi)
+  - [Kiểm tra boundary và tính ổn định khi thêm node](#kiểm-tra-boundary-và-tính-ổn-định-khi-thêm-node)
+  - [Giới hạn của chương trình minh họa](#giới-hạn-của-chương-trình-minh-họa)
+- [Topology phải được các router hiểu giống nhau](#topology-phải-được-các-router-hiểu-giống-nhau)
+  - [Tách health check khỏi thay đổi ownership](#tách-health-check-khỏi-thay-đổi-ownership)
+  - [Version của map không tự ngăn writer cũ](#version-của-map-không-tự-ngăn-writer-cũ)
+- [Di chuyển dữ liệu khi hệ thống vẫn có write](#di-chuyển-dữ-liệu-khi-hệ-thống-vẫn-có-write)
+  - [Lập kế hoạch và chuẩn bị đích](#lập-kế-hoạch-và-chuẩn-bị-đích)
+  - [Copy snapshot rồi bắt kịp log](#copy-snapshot-rồi-bắt-kịp-log)
+  - [Chuyển quyền ghi tại một ranh giới rõ ràng](#chuyển-quyền-ghi-tại-một-ranh-giới-rõ-ràng)
+  - [Xử lý stale router và rollback](#xử-lý-stale-router-và-rollback)
+  - [Cache có thể chọn quy trình nhẹ hơn](#cache-có-thể-chọn-quy-trình-nhẹ-hơn)
+- [Theo dõi và kiểm thử trước khi vận hành](#theo-dõi-và-kiểm-thử-trước-khi-vận-hành)
+  - [Đo theo node và range](#đo-theo-node-và-range)
+  - [Thử lỗi tại các ranh giới migration](#thử-lỗi-tại-các-ranh-giới-migration)
+- [So sánh với các cách placement khác](#so-sánh-với-các-cách-placement-khác)
+  - [Fixed slots giữ số partition độc lập với số máy](#fixed-slots-giữ-số-partition-độc-lập-với-số-máy)
+  - [Rendezvous hashing chấm điểm từng node](#rendezvous-hashing-chấm-điểm-từng-node)
+  - [Directory và range partitioning ưu tiên quyền kiểm soát](#directory-và-range-partitioning-ưu-tiên-quyền-kiểm-soát)
+- [Chọn cách chia dữ liệu cho hệ thống của bạn](#chọn-cách-chia-dữ-liệu-cho-hệ-thống-của-bạn)
+- [Tài liệu tham khảo và bài liên quan](#tài-liệu-tham-khảo-và-bài-liên-quan)
+
+## Bắt đầu từ cách chia key bằng modulo
+
+### Hash biến key thành một số ổn định
+
+Bạn muốn mọi request cho `user:42` đến đúng nơi lưu hồ sơ của người đó. Một cách đơn giản là chạy key qua **hash function**, hàm biến dữ liệu đầu vào thành một số, rồi lấy số dư khi chia cho số shard:
+
+```text
+shard_index = H(key) % N
+```
+
+`H` là hàm hash; `N` là số shard. Giả sử `H("user:42") = 13` và có bốn shard mang chỉ số `0, 1, 2, 3`, ta có `13 % 4 = 1`. Request được gửi đến shard 1.
+
+Điều quan trọng là tính ổn định: cùng key và cùng cấu hình phải cho cùng kết quả ở tất cả router. Router ở đây là phần code hoặc service quyết định request đi đến node nào, không nhất thiết là thiết bị mạng.
+
+Hash dùng cho placement nên phân bố các key rộng trên miền số. Nó không nhất thiết phải là hash mật mã. Tuy nhiên, nếu client có thể chủ động chọn key để đánh vào một node, thiết kế còn phải xét khả năng chống đầu vào có chủ đích.
+
+### Thêm một máy làm phần lớn mapping thay đổi
+
+Khi thêm shard 4, bạn đổi `N` từ 4 thành 5. Key không thay đổi, hash không thay đổi, nhưng phép chia lấy dư thay đổi:
+
+| Key | Hash giả định | Với 4 shard | Với 5 shard | Kết quả |
+| --- | ---: | --- | --- | --- |
+| `user:10` | 10 | shard 2 | shard 0 | Đổi owner |
+| `user:42` | 13 | shard 1 | shard 3 | Đổi owner |
+| `user:99` | 3 | shard 3 | shard 3 | Giữ nguyên |
+
+**Owner** là node được mapping chỉ định chịu trách nhiệm cho key. Đổi owner không có nghĩa record đã được chuyển sang node đó.
+
+Nếu ứng dụng bật công thức mới ngay, `user:42` được đọc ở shard 3 trong khi hồ sơ cũ vẫn nằm ở shard 1. Request có thể trả `NOT_FOUND`. Nguy hiểm hơn, một write mới tạo dữ liệu ở shard 3, khiến thông tin của cùng người dùng bị tách ra hai nơi.
+
+Với cache có database phía sau, hậu quả thường là cache miss và tải database tăng. Với storage giữ bản dữ liệu chính, đây là vấn đề correctness — tính đúng đắn của dữ liệu — chứ không chỉ là hiệu năng.
+
+### Tính tỷ lệ thay đổi từ bốn lên năm shard
+
+Không cần thử hàng triệu key để hiểu con số này. Hai phép modulo 4 và modulo 5 cùng lặp lại sau mỗi 20 số, vì 20 là bội chung nhỏ nhất của 4 và 5.
+
+Trong các hash từ `0` đến `19`, chỉ `0, 1, 2, 3` có cùng số dư ở cả hai phép chia. Có bốn trường hợp giữ nguyên trong 20 trường hợp:
+
+```text
+Tỷ lệ giữ nguyên = 4 / 20 = 20%
+Tỷ lệ đổi shard  = 16 / 20 = 80%
+```
+
+Khi hash phân bố đều, tỷ lệ trên cả tập key sẽ gần các giá trị này. Tổng quát, với cách đánh chỉ số node giữ nguyên và tăng từ `N` lên `N + 1`, modulo trực tiếp theo số node làm khoảng `N / (N + 1)` key đổi owner.
+
+Giả sử có 1 TB dữ liệu và các record có kích thước gần nhau. Thêm máy thứ năm chỉ cần máy mới nhận khoảng 200 GB để cân bằng, nhưng modulo có thể khiến khoảng 800 GB đổi nơi lưu. Ta cần một mapping không phụ thuộc trực tiếp vào số máy hiện tại.
+
+## Hash ring giữ miền hash cố định
+
+### Đặt key và node lên cùng một miền số
+
+Consistent hashing dùng một miền hash cố định. Để tính tay, bài này chọn các số nguyên từ `0` đến `999`; sau `999` quay lại `0`. Cách nhìn này được gọi là **hash ring**.
+
+Ta đặt ba node ở các vị trí:
+
+| Node | Token |
+| --- | ---: |
+| A | 100 |
+| B | 400 |
+| C | 700 |
+
+**Token** là một vị trí trên ring. Token của node có thể được tạo bằng cách hash một node ID ổn định, hoặc được một bộ cấp phát gán và lưu lại. Các key cũng được hash vào miền `0..999` đó.
+
+Sơ đồ sau chỉ biểu diễn thứ tự token và điểm quay vòng, không phải các kết nối mạng giữa ba node:
+
+```d2 interactive=false title="Thứ tự token trên miền hash cố định"
+direction: right
+a: "A tại 100"
+b: "B tại 400"
+c: "C tại 700"
+a -> b: "Tăng token"
+b -> c: "Tăng token"
+c -> a: "Qua 999, về 0"
+```
+
+Khi thêm node, miền số vẫn là `0..999`. Ta chỉ chèn thêm token vào danh sách này. Trong triển khai thật, miền hash lớn hơn nhiều để giảm khả năng token trùng và cho phép chia range mịn hơn; không cần tăng miền hash mỗi khi thêm record.
+
+### Tìm owner bằng token kế tiếp
+
+Quy tắc bài này dùng là: tìm node có token nhỏ nhất nhưng **lớn hơn hoặc bằng** hash của key. Nếu không có, chọn token đầu tiên trên ring.
+
+| Hash của key | Token đầu tiên không nhỏ hơn nó | Owner |
+| ---: | ---: | --- |
+| 80 | 100 | A |
+| 100 | 100 | A |
+| 250 | 400 | B |
+| 650 | 700 | C |
+| 900 | Không có; quay về 100 | A |
+
+Ví dụ `250` nằm sau A tại `100` nhưng trước B tại `400`, nên B sở hữu key. Không phải chọn node gần nhất theo khoảng cách tuyệt đối: A gần `250` bằng B, nhưng quy tắc vẫn là đi tới token kế tiếp theo một chiều đã chọn.
+
+Không cần cho request chạy qua A rồi B. Router giữ danh sách token đã sắp xếp, tìm đúng owner rồi gửi request trực tiếp. Hình chiếc vòng mô tả cách tính, không bắt buộc cách truyền request.
+
+### Khoảng sở hữu và các điểm biên
+
+Theo quy tắc trên, mỗi token sở hữu khoảng **sau token trước đó đến chính nó**. Viết `(100, 400]` nghĩa là không lấy `100` nhưng có lấy `400`.
+
+| Owner | Range trong ví dụ | Số vị trí trên miền 1.000 số |
+| --- | --- | ---: |
+| A | `(700, 999]` và `[0, 100]` | 400 |
+| B | `(100, 400]` | 300 |
+| C | `(400, 700]` | 300 |
+
+A có hai đoạn khi viết trên trục số thông thường. Trên ring, đó là một khoảng liên tục đi qua điểm quay vòng, thường viết gọn là `(700, 100]`.
+
+Lookup, scan dữ liệu và migration phải thống nhất quy tắc biên này. Nếu lookup gán hash `400` cho B nhưng công cụ copy dùng range không chứa `400`, bạn có thể bỏ sót dữ liệu đúng tại token. Các test cần bao gồm token trùng chính xác, `0`, `999` và trường hợp quay vòng.
+
+## Thêm và bớt node chỉ đổi các range liên quan
+
+### Thêm node D vào ví dụ
+
+Chèn D tại token `600`, đồng thời giữ nguyên các token của A, B và C. Chỉ range trước đây thuộc C bị tách:
+
+| Range | Trước khi thêm D | Sau khi thêm D |
+| --- | --- | --- |
+| `(700, 100]` qua điểm quay vòng | A | A |
+| `(100, 400]` | B | B |
+| `(400, 600]` | C | D |
+| `(600, 700]` | C | C |
+
+Key có hash `500` chuyển từ C sang D. Key có hash `650` vẫn thuộc C, còn hash `250` vẫn thuộc B. Các node cũ không trao đổi key với nhau chỉ vì D xuất hiện.
+
+Đây là tính chất cần giữ khi xây ring: **key đổi owner khi thêm D thì owner mới phải là D**. Nếu một key chuyển từ A sang B trong thao tác chỉ thêm D, hãy kiểm tra xem bạn có vô tình tạo lại token của các node cũ hay không.
+
+Tính chất này áp dụng cho việc chèn token mới mà giữ nguyên token cũ. Nếu thuật toán cân bằng còn di chuyển token cũ, hoặc bạn đồng thời thay hash function, phạm vi remap có thể rộng hơn.
+
+### Hiểu đúng con số dữ liệu cần chuyển
+
+Trong ví dụ `0..999`, D nhận các hash từ `401` đến `600`, tức 200 trong 1.000 vị trí. Với hash key phân bố đều, khoảng 20% key đổi owner.
+
+Con số 20% này là kết quả của **vị trí token cụ thể**, không phải quy tắc “thêm một node luôn chuyển 20%”. Nếu D nằm tại `410` thay vì `600`, nó chỉ nhận 10 vị trí từ `401` đến `410`.
+
+Với `N` node cùng capacity, mục tiêu cân bằng sau khi thêm một node là mỗi node giữ khoảng `1 / (N + 1)` dữ liệu. Vì node mới ban đầu trống, nó phải nhận lượng dữ liệu tương ứng. Từ bốn lên năm node, mục tiêu đó là khoảng 20%:
+
+| Cách chia | Tỷ lệ key đổi owner khi tăng 4 lên 5 node |
+| --- | --- |
+| Modulo trực tiếp theo số node | Khoảng 80% nếu hash phân bố đều |
+| Ring có phân bố ownership đủ cân bằng | Gần phần node mới cần nhận, khoảng 20% |
+
+Đừng đồng nhất tỷ lệ key với tỷ lệ bytes. Nếu những key chuyển đi chứa object lớn hơn trung bình, lượng bytes có thể cao hơn 20%. Replication, retry và dữ liệu phát sinh trong lúc copy còn làm tổng lưu lượng migration khác lượng dữ liệu primary phải đổi owner.
+
+### Remove node khác với khôi phục dữ liệu
+
+Nếu bỏ D khỏi ring trên, range `(400, 600]` lại thuộc C. Các key ngoài range đó không cần đổi primary owner.
+
+Nhưng nếu D đã hỏng ổ đĩa và là nơi duy nhất chứa record, C không tự có các record đó. Consistent hashing chỉ tính **nơi nên chứa dữ liệu**, không tái tạo dữ liệu đã mất.
+
+Một lần remove có kế hoạch cho phép chuyển data trước khi tắt D. Một sự cố đột ngột đòi hỏi replica, backup hoặc nguồn dữ liệu khác để phục hồi. Hai tình huống cần quy trình khác nhau dù cuối cùng có thể tạo ra cùng một ring.
+
+## Virtual nodes chia ownership thành nhiều phần nhỏ
+
+### Một token cho mỗi máy có thể rất lệch
+
+Đổi ví dụ thành `A = 100`, `B = 180`, `C = 900`. Theo cùng quy tắc, A sở hữu 20% miền hash, B chỉ 8%, còn C sở hữu 72%.
+
+Ngay cả khi key hash rất đều, C vẫn nhận gần ba phần tư số key. Hash đều chỉ rải key đều trên miền số; nó không tự rải token của node thành các khoảng bằng nhau.
+
+Bạn có thể đặt token cách đều khi tạo cluster. Tuy nhiên, thêm một node vào giữa một range chỉ chia range đó, không tự chia lại các range khác. Với cluster nhỏ, vừa giữ token cũ vừa đạt cân bằng tốt sau mỗi lần tăng một máy là điều khó.
+
+### Một máy sở hữu nhiều token
+
+**Virtual node**, thường viết là **vnode**, cho một physical node xuất hiện tại nhiều vị trí trên ring. Đây chỉ là các đơn vị ownership logic, không phải VM, container hay process mới.
+
+Ví dụ A có các token sinh từ `A#0`, `A#1`, `A#2`. B và C cũng có các bộ token tương tự. Các token được rải xen kẽ thay vì gom toàn bộ token của A vào một đoạn.
+
+Sơ đồ dưới tách hai việc: key chọn token, sau đó token chỉ ra physical node. Hai token của A vẫn trỏ về cùng một máy:
+
+```d2 interactive=false title="Nhiều vnode không tạo thêm physical node"
+direction: down
+key: "Hash của key: 250"
+a0: "A#0 tại 100"
+b0: "B#0 tại 400"
+a1: "A#1 tại 700"
+a: "Physical node A" {shape: cylinder}
+b: "Physical node B" {shape: cylinder}
+key -> b0: "Token kế tiếp"
+a0 -> a: "Thuộc A"
+a1 -> a: "Thuộc A"
+b0 -> b: "Thuộc B"
+```
+
+Khi một physical node sở hữu nhiều range nhỏ ở nhiều vị trí, tổng ownership bớt phụ thuộc vào một khoảng ngẫu nhiên lớn. Khi thêm D với nhiều token, D cũng có thể nhận các phần nhỏ từ nhiều node cũ thay vì chỉ lấy dữ liệu từ một hàng xóm.
+
+Điều này giúp phân tán công việc copy, nhưng không làm bandwidth trở nên miễn phí. Nếu migrator mở quá nhiều luồng cùng lúc, tất cả source node vẫn có thể bị chậm.
+
+### Số vnode và máy có capacity khác nhau
+
+Nhiều vnode hơn thường giảm độ lệch của ownership ngẫu nhiên. Đổi lại, token map lớn hơn và số range phải stream, repair, backup hoặc theo dõi cũng tăng.
+
+Không có một con số vnode mặc định đúng cho mọi hệ thống. Bạn nên thử nhiều cấu hình trên kích thước cluster dự kiến, đo độ lệch bytes giữa các node và thời gian phục hồi khi một máy mất. Nếu dùng database có sẵn, ưu tiên token allocator và khuyến nghị đúng phiên bản của database đó.
+
+Với node có capacity lớn hơn, một cách làm là cấp nhiều token hơn hoặc giao nhiều range hơn theo weight. Nhưng máy có disk gấp đôi chưa chắc chịu được gấp đôi request nếu CPU và network không đổi. Weight cần phản ánh giới hạn mà workload thực sự chạm tới.
+
+Ngoài ra, giữ nguyên token của một node qua restart là cần thiết để tránh remap vô tình. Dùng IP hoặc tên pod tạm thời làm node ID có thể khiến một lần restart bị hiểu thành remove node cũ rồi add node mới.
+
+## Replication là một lớp quyết định khác
+
+### Chọn các physical node khác nhau
+
+Phần trước chỉ tìm một owner. **Replication** tạo thêm các bản copy để hệ thống còn dữ liệu khi một node hỏng. Replication factor `3` thường có nghĩa là tổng cộng ba bản copy, không phải một bản chính cộng thêm ba bản nữa.
+
+Một policy đơn giản là bắt đầu ở token sở hữu key rồi đi tiếp trên ring, chọn cho đến khi có đủ ba physical node khác nhau. Giả sử thứ tự token gặp được là:
+
+| Thứ tự | Token | Physical node | Xử lý khi chọn replica |
+| ---: | --- | --- | --- |
+| 1 | `A#2` | A | Chọn A |
+| 2 | `A#7` | A | Bỏ qua vì đã chọn A |
+| 3 | `C#1` | C | Chọn C |
+| 4 | `B#4` | B | Chọn B |
+
+Hai vnode của A không tạo hai bản copy chịu lỗi độc lập. Nếu A hỏng, cả hai cùng mất.
+
+Policy thực tế còn cần xét **failure domain**, nhóm hạ tầng có thể hỏng cùng lúc, chẳng hạn rack hoặc availability zone (AZ). Ba máy ở cùng AZ vẫn có thể mất kết nối đồng thời. Nếu yêu cầu sống sót khi một AZ lỗi, placement phải đảm bảo đủ bản copy nằm ngoài AZ đó.
+
+### Tách placement khỏi consistency của dữ liệu
+
+Placement quyết định các node chứa key. Nó chưa quyết định node nào được ghi, một write cần bao nhiêu xác nhận hoặc hai write đồng thời được hòa giải thế nào.
+
+Chẳng hạn một thiết kế dùng primary nhận mọi write, sau đó replicate sang các node khác. Một thiết kế khác cho nhiều replica nhận write và dùng quy tắc xử lý xung đột. Hash ring có thể được dùng trong cả hai; ring không tự chọn mô hình consistency cho bạn.
+
+Từ “consistent” trong consistent hashing nói về độ ổn định của mapping khi tập node thay đổi. Nó **không có nghĩa là strong consistency**, tức mọi lần đọc luôn quan sát dữ liệu theo một thứ tự ghi mạnh đã cam kết.
+
+Cũng cần đo thay đổi replica set riêng với thay đổi primary owner. Thêm node có thể làm bản copy thứ hai hoặc thứ ba đổi chỗ dù primary của key vẫn giữ nguyên. Vì vậy, con số remap primary không đủ để ước lượng toàn bộ công việc replication.
+
+## Key đều không có nghĩa workload đều
+
+### Hot key vẫn tập trung vào một owner
+
+Giả sử một triệu key được chia đều cho các node, nhưng riêng `product:flash-sale` nhận một nửa số request. Key đó vẫn có một owner theo ring, nên node giữ nó có thể quá tải trong khi các node khác còn rảnh.
+
+Thêm vnode không chia một key thành nhiều phần. Nó chỉ thay đổi cách gom các range vào physical node.
+
+Nếu bottleneck là hot read, bạn có thể cache bản dữ liệu đó ở nhiều nơi hoặc phân tải đọc qua replica khi mức stale cho phép. Với cache miss đồng loạt, **request coalescing** gom các lần tải cùng key đang diễn ra thành một lần gọi backend, tránh tất cả request cùng đánh vào database.
+
+Nếu bottleneck là write lên một counter, có thể chia counter thành nhiều bucket rồi cộng khi đọc. Cách này đổi data model và tăng công việc đọc; nó không phù hợp nếu ứng dụng bắt buộc cập nhật một giá trị duy nhất theo thứ tự chặt chẽ. Hãy chọn biện pháp theo loại request đang gây nóng, thay vì tăng số vnode theo phản xạ.
+
+### Shard key phải phù hợp với cách truy cập
+
+**Shard key** là phần dữ liệu được dùng để quyết định một record thuộc shard nào. Nếu chọn `country` làm shard key và phần lớn người dùng thuộc cùng một quốc gia, hash tốt vẫn đưa toàn bộ nhóm đó đến cùng một nơi.
+
+Ngược lại, nếu phần lớn transaction chỉ thao tác trên một người dùng, `user_id` có thể giữ các record liên quan gần nhau. Đổi sang hash từng record ID có thể chia dữ liệu đều hơn nhưng khiến một transaction phải chạm nhiều shard.
+
+Hashing cũng không giữ thứ tự nghiệp vụ. Các đơn hàng tạo trong cùng một ngày có thể rải trên nhiều node. Query theo khoảng thời gian sẽ cần một index khác, một hệ thống phục vụ truy vấn riêng hoặc gửi query đến nhiều shard, gọi là **fan-out**.
+
+Vì vậy, hãy chọn ranh giới dữ liệu từ access pattern và transaction trước. Sau đó mới chọn cách ánh xạ ranh giới đó vào các node.
+
+## Thực hành hash ring bằng Python
+
+### Xây một topology snapshot không thay đổi
+
+Chương trình sau chỉ cần Python 3.10+ và standard library. Lưu khối code đầu tiên vào `consistent_hashing.py`, rồi nối khối kiểm tra ở phần kế tiếp vào cuối cùng file.
+
+Ví dụ dùng SHA-256 để tạo số ổn định giữa các lần chạy. Không dùng `hash()` mặc định của Python cho string vì kết quả mặc định có thể khác giữa các process. Hàm demo lấy 64 bit đầu của digest; đây là một lựa chọn minh họa, không phải cấu hình cho mọi database.
+
+```python
+from bisect import bisect_left
+from hashlib import sha256
+from typing import NamedTuple
+
+
+HASH_SPACE = 1 << 64
+
+
+def hash64(value: str) -> int:
+    digest = sha256(value.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
+class Ring(NamedTuple):
+    tokens: tuple[int, ...]
+    owners: tuple[str, ...]
+
+    @classmethod
+    def from_points(cls, points):
+        ordered = sorted(points)
+        if not ordered:
+            raise ValueError("ring must not be empty")
+        tokens = tuple(token for token, _ in ordered)
+        if any(token < 0 or token >= HASH_SPACE for token in tokens):
+            raise ValueError("token outside hash space")
+        if len(set(tokens)) != len(tokens):
+            raise ValueError("duplicate token")
+        owners = tuple(owner for _, owner in ordered)
+        return cls(tokens, owners)
+
+    @classmethod
+    def build(cls, node_ids, vnodes=128):
+        nodes = tuple(node_ids)
+        if vnodes <= 0:
+            raise ValueError("vnodes must be positive")
+        if len(set(nodes)) != len(nodes):
+            raise ValueError("duplicate node ID")
+        return cls.from_points(
+            (hash64(f"node:{node}#{index}"), node)
+            for node in nodes
+            for index in range(vnodes)
+        )
+
+    def owner_at(self, token):
+        if not 0 <= token < HASH_SPACE:
+            raise ValueError("token outside hash space")
+        index = bisect_left(self.tokens, token)
+        if index == len(self.tokens):
+            index = 0
+        return self.owners[index]
+
+    def owner_of(self, key):
+        return self.owner_at(hash64(key))
+```
+
+`tokens` là tuple đã sort; `owners` là tuple song song chứa node ID tại từng vị trí. `bisect_left` tìm phần tử đầu tiên không nhỏ hơn token của key. Nếu vị trí tìm được bằng chiều dài danh sách, code quay về phần tử `0`.
+
+Với tổng cộng `V` token, lookup dùng binary search có độ phức tạp `O(log V)`. Bộ nhớ cho map là `O(V)`; không cần giữ danh sách tất cả key để route request. Thời gian hash còn phụ thuộc độ dài key, không nằm trong chi phí binary search này.
+
+Khi thêm hoặc remove node, ví dụ xây một `Ring` mới thay vì sửa từng token của ring đang được lookup. Điều này giúp một request dùng trọn một snapshot. Production vẫn cần cách công bố snapshot an toàn theo mô hình concurrency của runtime và quy trình đồng thuận ownership riêng.
+
+### Kiểm tra boundary và tính ổn định khi thêm node
+
+Phần kiểm tra đầu tiên dùng token gán tay để khớp ví dụ trong bài. Phần tiếp theo sinh 20.000 key, thêm D, rồi kiểm tra rằng không có key nào chuyển từ một node cũ sang một node cũ khác.
+
+```python
+# Append to consistent_hashing.py.
+toy = Ring.from_points([(100, "A"), (400, "B"), (700, "C")])
+assert toy.owner_at(0) == "A"
+assert toy.owner_at(100) == "A"
+assert toy.owner_at(101) == "B"
+assert toy.owner_at(400) == "B"
+assert toy.owner_at(401) == "C"
+assert toy.owner_at(700) == "C"
+assert toy.owner_at(999) == "A"
+
+expanded = Ring.from_points([
+    (100, "A"), (400, "B"), (600, "D"), (700, "C")
+])
+for token in range(1000):
+    changed = toy.owner_at(token) != expanded.owner_at(token)
+    assert changed == (400 < token <= 600)
+
+old = Ring.build(["A", "B", "C"])
+new = Ring.build(["A", "B", "C", "D"])
+reordered = Ring.build(["C", "A", "B"])
+keys = [f"user:{index}" for index in range(20_000)]
+moved = 0
+for key in keys:
+    before = old.owner_of(key)
+    after = new.owner_of(key)
+    assert before == reordered.owner_of(key)
+    if before != after:
+        moved += 1
+        assert after == "D"
+    # Removing D must not remap keys that were owned by A, B or C.
+    if after != "D":
+        assert before == after
+
+assert 0 < moved < len(keys)
+print("Boundary and remapping checks passed")
+print(f"Keys moved to D: {moved}/{len(keys)} ({moved / len(keys):.2%})")
+```
+
+Chạy file đã ghép bằng `python3 consistent_hashing.py`. Với đúng chương trình trên, kết quả là:
+
+```text
+Boundary and remapping checks passed
+Keys moved to D: 4640/20000 (23.20%)
+```
+
+Dòng đầu xác nhận các assertion qua. Dòng thứ hai là kết quả mô phỏng trên đúng tập key và token của demo, không phải phép đo tốc độ hay tỷ lệ bảo đảm cho cluster khác.
+
+Ở phần mô phỏng này ta tăng **ba lên bốn** node, nên tỷ lệ mục tiêu gần 25%, không phải 20% của bài toán bốn lên năm. Kết quả 23,20% không mâu thuẫn với mục tiêu đó: token được hash có độ lệch, và tập key hữu hạn cũng có dao động. Chương trình không assert tỷ lệ phải đúng bằng 25%. Property cần giữ chính xác là mọi key đổi owner đều chuyển sang D.
+
+Test `reordered` còn kiểm tra rằng thứ tự liệt kê các node không làm thay đổi ring. Trong hệ thống nhiều router, hai instance nhận cùng tập node theo hai thứ tự khác nhau vẫn phải tạo ra cùng mapping.
+
+### Giới hạn của chương trình minh họa
+
+Chương trình chỉ mô phỏng mapping, không tạo server hay copy record. `128` vnode là giá trị demo, không phải khuyến nghị production.
+
+Hàm `from_points` từ chối token trùng thay vì âm thầm ghi đè. Token 64 bit làm collision ít có khả năng hơn miền `0..999`, nhưng không biến xác suất thành bằng không. Production cần policy xử lý collision xác định và giống nhau ở mọi router.
+
+Code cũng chưa chọn replica, weight, failure domain hay ownership epoch. Nó chưa đo phân bố bytes và QPS. Bạn có thể dùng chương trình để học lookup và kiểm tra remapping, nhưng không nên dùng riêng nó như một storage cluster hoàn chỉnh.
+
+## Topology phải được các router hiểu giống nhau
+
+### Tách health check khỏi thay đổi ownership
+
+**Topology** là thông tin về node và token assignment của cluster. Giả sử R1 biết ring có A, B, C, còn R2 đã thấy thêm D. Cùng một key có thể được route khác nhau dù hai router dùng cùng code.
+
+Một tình huống khác là R1 timeout khi gọi B và tự xóa B khỏi ring. R2 vẫn gọi B bình thường. Chỉ một lỗi mạng cục bộ đã tạo hai cách hiểu ownership khác nhau.
+
+Với cache có thể rebuild, một số thiết kế chấp nhận thay đổi tạm thời đó để tránh node lỗi. Với dữ liệu bền vững, không nên biến health check của từng client thành quyền tự chuyển owner. Health check là một tín hiệu để hệ thống quyết định failover, không phải bằng chứng rằng dữ liệu đã sẵn sàng ở nơi khác.
+
+Sơ đồ dưới mô tả một thiết kế có bộ điều phối topology. Đây là một lựa chọn thiết kế, không phải yêu cầu mọi hệ thống phải có một service trung tâm duy nhất:
+
+```d2 interactive=false title="Router và migrator dùng cùng topology có version"
+direction: down
+control: "Topology authority\nMap v41 và kế hoạch v42"
+r1: "Router R1"
+r2: "Router R2"
+mover: "Migrator"
+data: "Data nodes A, B, C, D" {shape: cylinder}
+control -> r1: "Map đang active"
+control -> r2: "Map đang active"
+control -> mover: "Range và trạng thái chuyển"
+r1 -> data: "Request"
+r2 -> data: "Request"
+mover -> data: "Copy / verify"
+```
+
+Một hệ thống khác có thể dùng metadata phân tán và gossip để lan truyền thông tin. Dù dùng cơ chế nào, cần xác định rõ ai được thay ownership, trạng thái nào được công bố là active, và request dùng map cũ được xử lý ra sao.
+
+### Version của map không tự ngăn writer cũ
+
+Gắn nhãn `v41` và `v42` giúp router nhận ra map mới hơn. Nó không tự khiến node cũ ngừng nhận write. Một node bị mất liên lạc với control plane vẫn có thể tiếp tục phục vụ client cũ.
+
+Đó là chỗ cần **fencing**: cơ chế làm mất hiệu lực quyền ghi cũ tại chính nơi commit write. Một quyền ghi có thể được biểu diễn bằng `(range, owner_id, epoch)`, trong đó epoch là số thế hệ của ownership, tăng sau mỗi lần chuyển quyền.
+
+Điều kiện chấp nhận không phải đơn giản là “request có epoch càng lớn càng tốt”. Storage phải kiểm tra request khớp quyền hiện đang active của đúng range và đúng owner. Việc kiểm tra quyền và commit dữ liệu phải thuộc cùng một ranh giới bảo đảm tính đúng đắn; kiểm tra trước rồi ghi sau mà không có ràng buộc có thể tạo race.
+
+Nếu hệ thống không thể bảo đảm thu hồi quyền ghi cũ, không được coi việc publish map mới là một handoff an toàn cho dữ liệu cần single writer. Hãy dùng cơ chế resharding sẵn có của storage hoặc bổ sung protocol điều phối đủ mạnh.
+
+## Di chuyển dữ liệu khi hệ thống vẫn có write
+
+### Lập kế hoạch và chuẩn bị đích
+
+Giả sử D cần nhận range `(400, 600]` từ C, và yêu cầu là một thời điểm chỉ có một node được quyền ghi range này. Đây là **một quy trình minh họa** dùng snapshot, change log và một khoảng chặn write ngắn lúc chuyển quyền; không phải lời hứa zero downtime cho mọi database.
+
+Trước tiên, đo lượng bytes phải chuyển và bandwidth có thể dành cho migration mà không vi phạm mục tiêu latency của request. Với 200 GB và giới hạn copy 50 MB/s, thời gian truyền lý tưởng theo đơn vị thập phân là:
+
+```text
+200.000 MB / 50 MB/s = 4.000 giây ≈ 67 phút
+```
+
+Đây mới là cận dưới cho truyền bytes. Scan, index, retry, verification và write mới có thể làm thời gian dài hơn. Source node cũng cần đủ dung lượng giữ log trong suốt quá trình.
+
+D được chuẩn bị ở trạng thái nhận dữ liệu nhưng chưa nhận request như owner. Kế hoạch map mới có thể đã tồn tại, nhưng map đang active vẫn route range này tới C. Cần phân biệt “node đã tham gia cluster” với “node đã sẵn sàng phục vụ range”.
+
+### Copy snapshot rồi bắt kịp log
+
+Nếu chỉ scan và copy từng record, bạn có thể copy `balance = 10`, rồi C nhận write đổi thành `balance = 20`. D vẫn giữ `10` dù quá trình scan đã kết thúc.
+
+Một hướng giải quyết là **snapshot**, ảnh dữ liệu nhất quán tại một mốc, kết hợp **change log**, luồng các thay đổi sau mốc đó. CDC, viết tắt của change data capture, là một cơ chế thu các thay đổi để chuyển chúng sang nơi khác.
+
+Protocol snapshot và log phải gắn với nhau để không có khoảng hở: mọi thay đổi hoặc đã nằm trong snapshot, hoặc có thể replay từ log. Trong ví dụ, snapshot gắn với mốc log `L0` và D áp dụng các thay đổi tiếp theo theo đúng thứ tự cần thiết.
+
+D không chỉ nhận insert và update. Delete, TTL và các thay đổi liên quan đến transaction cũng phải được biểu diễn đúng theo semantics của nguồn. Nếu bỏ qua delete, record đã xóa ở C có thể xuất hiện trở lại ở D.
+
+Copy nên có checkpoint để tiếp tục sau lỗi. Replay cần tránh áp dụng lặp tác dụng của một sự kiện, chẳng hạn dùng event ID hoặc phiên bản record để nhận ra sự kiện đã xử lý. Không được để một batch snapshot cũ ghi đè một update mới mà D vừa replay.
+
+### Chuyển quyền ghi tại một ranh giới rõ ràng
+
+Khi D gần bắt kịp C, vẫn có thể có write mới xuất hiện ngay sau lần kiểm tra lag. “Lag vừa bằng 0” chưa phải bằng chứng rằng C sẽ không nhận thêm write.
+
+Quy trình dưới đóng khoảng hở đó bằng cách chặn write của riêng range đang chuyển. Các range khác có thể tiếp tục phục vụ:
+
+1. Đưa range ở C vào trạng thái handoff, ngừng nhận write mới cho range và xử lý xong các write đang chạy.
+2. Chốt vị trí cuối `L1` chứa toàn bộ write đã được xác nhận thành công ở C.
+3. D replay đến `L1`, rồi kiểm tra dữ liệu tại cùng ranh giới đó. Count và checksum phải so trên cùng phiên bản dữ liệu, không phải hai trạng thái vẫn đang thay đổi độc lập.
+4. Thu hồi bền vững quyền ghi của C và cấp epoch mới cho D bằng cơ chế điều phối có thể phục hồi sau crash. Không có thời điểm cả hai được commit write như owner.
+5. Khi D và các replica bắt buộc đã sẵn sàng theo yêu cầu durability, kích hoạt D rồi publish routing mới. Router cũ phải nhận redirect hoặc lỗi yêu cầu refresh, không được tiếp tục ghi vào bản copy cũ.
+
+Sequence sau nhấn mạnh mốc `L1` và việc thu hồi quyền cũ trước khi D nhận write:
+
+```d2 interactive=false title="Handoff một range bằng snapshot, log và fencing"
+shape: sequence_diagram
+router: "Router"
+c: "C: owner cũ"
+d: "D: đích"
+control: "Ownership authority"
+router -> c: "Write khi đang copy"
+c -> d: "Snapshot tại L0"
+c -> d: "Replay thay đổi sau L0"
+control -> c: "Chặn write range; drain request đang chạy"
+c -> control: "Đã chốt L1"
+c -> d: "Replay đến L1 và verify"
+d -> control: "Đã áp dụng L1; đủ điều kiện phục vụ"
+control -> c: "Thu hồi quyền ghi cũ bền vững"
+control -> d: "Kích hoạt quyền ghi epoch mới"
+control -> router: "Publish map mới"
+router -> d: "Write với quyền mới"
+```
+
+Khoảng chặn write không nhất thiết dài bằng thời gian copy. Copy diễn ra trước đó; phần chặn chỉ nên dành cho drain, catch-up cuối và handoff. Tuy nhiên, thời gian thực tế phải đo, và client cần policy timeout/retry phù hợp.
+
+Nếu client timeout ở ranh giới này, client có thể không biết write đã commit hay chưa. Các thao tác có tác dụng không lặp được, như trừ tiền, cần idempotency key hoặc cơ chế tương đương để retry không tạo giao dịch thứ hai.
+
+<Callout type="warn" title="Hai lần gọi write không tạo một transaction">
+Gửi cùng write đến C và D từ application có thể thành công ở một bên nhưng thất bại ở bên kia. Dual-write chỉ là một phần của giải pháp nếu đi kèm cách lưu tác vụ chưa hoàn tất, retry, ordering và reconciliation — đối soát để sửa sai lệch. Không thay snapshot + log bằng hai network call rồi mặc định rằng dữ liệu đã đồng bộ.
+</Callout>
+
+### Xử lý stale router và rollback
+
+Sau cutover, một router chưa refresh vẫn gửi request đến C. C phải biết range không còn thuộc quyền ghi của mình ngay cả khi request mang map cũ. Có thể trả thông tin owner mới để client refresh, hoặc proxy request theo một protocol đã thiết kế; tuyệt đối không âm thầm commit vào bản dữ liệu cũ.
+
+Read cũng cần semantics rõ ràng. Đọc bản copy cũ ở C sau khi D đã nhận write có thể trả dữ liệu stale. Với yêu cầu read-after-write, việc vẫn giữ file cũ trên C không có nghĩa C còn được phục vụ read từ các file đó.
+
+Trước cutover, hủy migration thường có thể giữ C làm owner vì C vẫn có mọi write. Sau cutover, D đã có write mới mà C chưa chắc có. Muốn quay lại C, bạn phải đồng bộ các write mới về C và thực hiện một lần handoff ngược có fencing, không chỉ đổi map về `v41`.
+
+Bản copy cũ có ích cho đối chiếu và phục hồi, nhưng **bản copy được giữ lại không đồng nghĩa với đích rollback đã cập nhật**. Chỉ cleanup khi đã kiểm tra dữ liệu, các router đã hội tụ về topology hợp lệ và kế hoạch phục hồi không còn phụ thuộc bản copy đó.
+
+Một thiết kế read fallback cũng cần cẩn thận: nếu D trả `NOT_FOUND` vì record đã bị xóa, đọc lại C có thể làm record cũ xuất hiện trở lại. Không dùng “miss ở D thì đọc C” như một quy tắc chung; cần hiểu trạng thái migration và phiên bản hoặc dấu xóa của record.
+
+### Cache có thể chọn quy trình nhẹ hơn
+
+Nếu dữ liệu trên ring chỉ là cache và có nguồn chính đầy đủ phía sau, bạn có thể không cần copy toàn bộ cache. Key đổi owner sẽ miss rồi được tải lại từ nguồn chính. Consistent hashing khi đó giúp giảm lượng cache phải làm nóng lại.
+
+Đổi lại, database cần chịu được tải miss tăng tạm thời. Dùng giới hạn concurrency khi refill, request coalescing và theo dõi hit rate để tránh biến một lần thêm cache node thành đợt quá tải database.
+
+Cache chứa write chưa được lưu bền vững ở nguồn chính không còn là trường hợp đơn giản này. Hãy xác định dữ liệu có thể tái tạo hay không trước khi chọn bỏ qua migration.
+
+## Theo dõi và kiểm thử trước khi vận hành
+
+### Đo theo node và range
+
+Average của cả cluster có thể che một node gần hết disk. Ít nhất cần quan sát ba loại phân bố: phần hash space sở hữu, bytes thực tế và traffic thực tế.
+
+| Nhóm đo | Metric cần nhìn | Giúp phát hiện |
+| --- | --- | --- |
+| Ownership | Tỷ lệ hash space, số range/token mỗi node | Token assignment lệch |
+| Dữ liệu | Bytes, số record, item lớn, disk còn trống | Node đầy dù key count có vẻ đều |
+| Request | QPS, CPU, p95/p99 latency, timeout theo node/range | Hot key, hot range, quá tải khi copy |
+| Migration | Bytes còn lại, tốc độ copy, log lag, checkpoint và retry | Migration đứng, không bắt kịp write |
+| Correctness | Checksum mismatch, stale-epoch rejection, redirect và fallback | Copy sai, router cũ hoặc fencing lỗi |
+| Recovery | Replica thiếu, repair backlog, thời gian phục hồi | Cluster chưa chịu được lỗi tiếp theo |
+
+`p99 latency` là ngưỡng mà 99% request có thời gian không vượt quá nó; phần 1% còn lại chậm hơn. Nó giúp nhìn tác động của migration lên các request chậm, thay vì chỉ nhìn thời gian trung bình.
+
+Giới hạn bandwidth copy thôi chưa đủ nếu replay hoặc tạo index vẫn dùng hết CPU và I/O. Hãy throttle theo bottleneck thực tế, đồng thời dành tài nguyên cho request và cho tình huống một node khác lỗi giữa chừng.
+
+### Thử lỗi tại các ranh giới migration
+
+Code mapping cần test determinism, boundary, collision policy và remapping. Protocol storage cần thêm các test mà một ring thuần túy không thể thực hiện:
+
+- Restart D giữa lúc copy, tiếp tục từ checkpoint mà không mất hoặc nhân đôi tác dụng của write.
+- Update và delete một key sau snapshot, xác nhận D có trạng thái đúng tại mốc cutover.
+- Giữ router ở map cũ sau cutover, xác nhận C không commit write bằng quyền cũ.
+- Làm authority crash giữa lúc thu hồi C và kích hoạt D, xác nhận phục hồi không tạo hai writer.
+- Làm mất kết nối C với authority nhưng giữ kết nối C với client, kiểm tra fencing vẫn bảo vệ quyền ghi.
+- Làm D lỗi sau khi đã nhận write mới, kiểm tra đường phục hồi không dùng nhầm bản copy cũ ở C.
+- Tăng tốc độ write vượt tốc độ replay, xác nhận migration dừng hoặc trì hoãn cutover thay vì công bố dữ liệu chưa sẵn sàng.
+
+Tiêu chí thành công phải là invariant cụ thể: ví dụ “không mất write đã được xác nhận” và “không có hai owner cùng commit write cho một range”. Chỉ đo rằng request cuối cùng trả `200` không chứng minh được hai điều này.
+
+## So sánh với các cách placement khác
+
+### Fixed slots giữ số partition độc lập với số máy
+
+Không dùng ring vẫn có thể tách key khỏi số máy vật lý. Chọn một số logical slot cố định `S`, rồi tính:
+
+```text
+slot = H(key) % S
+owner = slot_to_node[slot]
+```
+
+Khi thêm máy, `S` không đổi. Ta chỉ chuyển ownership của một số slot trong bảng. Phép modulo không phải vấn đề; vấn đề ban đầu là dùng số physical node đang thay đổi làm divisor.
+
+Redis Cluster là ví dụ dùng **16.384 hash slots**. Công thức cơ bản dựa trên CRC16 của key, có quy tắc hash tag để một số key cùng slot. Đây không phải successor-token ring cổ điển, dù cũng hướng tới việc đổi một phần ownership khi reshard.
+
+Fixed slots giúp dễ liệt kê và quản lý đơn vị migration. Đổi lại, độ mịn của slot và cách cân bằng slot phải phù hợp với dữ liệu; một slot rất nóng vẫn cần cách xử lý riêng. Chuyển bảng slot cũng không tự chuyển dữ liệu: Redis có protocol routing và migration cụ thể của nó.
+
+### Rendezvous hashing chấm điểm từng node
+
+**Rendezvous hashing**, còn gọi là highest random weight hashing, tính điểm ổn định cho từng cặp `(key, node_id)` rồi chọn node có điểm cao nhất.
+
+Khi thêm D, điểm của A, B và C không đổi. Key chỉ chuyển sang D nếu D có điểm cao hơn owner cũ. Nhờ vậy, nó cũng giữ được phần lớn mapping ổn định mà không cần token ring hay vnode.
+
+Bản đơn giản tính điểm cho tất cả `N` node mỗi lần lookup, nên chi phí là `O(N)`. Ring với danh sách token đã sort dùng `O(log V)` cho bước tìm token. Không nên chỉ so hai biểu thức này để kết luận: số node, chi phí hash, caching và implementation cụ thể đều ảnh hưởng tốc độ thực tế.
+
+Rendezvous đáng cân nhắc khi tập node vừa phải và bạn muốn logic chọn owner gọn. Nếu cần weight, chọn một biến thể weighted đã được nghiên cứu thay vì tùy tiện nhân điểm hash với capacity.
+
+### Directory và range partitioning ưu tiên quyền kiểm soát
+
+**Directory-based sharding** giữ một bảng ánh xạ tường minh, ví dụ `tenant_id → shard`. Bạn dễ đưa riêng một tenant lớn sang máy khác hoặc giữ tenant trong region bắt buộc. Đổi lại, directory phải được lưu bền vững, cache và cập nhật nhất quán; nó trở thành một phần quan trọng của routing.
+
+**Range partitioning** chia theo khoảng giá trị nghiệp vụ, ví dụ đơn hàng theo thời gian hoặc account ID. Cách này giữ được locality cho query theo range, nhưng range mới nhất có thể nóng và cần split hoặc rebalance riêng.
+
+| Cách placement | Điểm mạnh thường gặp | Chi phí cần tính |
+| --- | --- | --- |
+| Token ring với vnode | Remap cục bộ, chia ownership thành nhiều range | Token map, allocator và vận hành range |
+| Fixed slots | Đơn vị chuyển rõ ràng, key-to-slot ổn định | Chọn độ mịn slot, quản lý slot map |
+| Rendezvous | Không cần ring, thêm node giữ điểm cũ | Tính điểm nhiều node ở bản đơn giản |
+| Directory | Kiểm soát tenant, locality và ngoại lệ | Metadata tường minh và tính sẵn sàng của directory |
+| Range partitioning | Query theo khoảng, dữ liệu liên quan gần nhau | Hot range, split và cân bằng theo workload |
+
+Các hệ thống thực tế có thể kết hợp nhiều lớp, chẳng hạn hash key vào logical partition rồi dùng directory gán partition cho node. Đừng ép mọi thiết kế vào một tên thuật toán duy nhất.
+
+## Chọn cách chia dữ liệu cho hệ thống của bạn
+
+Nếu đang dùng database hoặc cache cluster có sẵn, mình ưu tiên protocol placement và resharding chính thức của nó. Thêm một vòng hash tự viết ở application có thể tạo hai lớp routing chồng nhau và làm failover khó kiểm soát hơn.
+
+Nếu bạn đang thiết kế lớp phân phối key–value riêng, ring hoặc rendezvous là lựa chọn đáng xét khi request chủ yếu tìm theo key và tập node thay đổi. Fixed slots thường thuận tiện khi bạn muốn từng đơn vị migration có ID rõ ràng. Directory phù hợp hơn nếu placement theo tenant hoặc region là yêu cầu chính.
+
+Trước khi triển khai, hãy ghi rõ năm quyết định:
+
+1. Key dùng để route là gì, và các record cần transaction cùng nhau có bị tách không?
+2. Đơn vị ownership là key, token range hay logical slot?
+3. Nguồn nào quyết định topology active, và router cũ phải làm gì?
+4. Khi chuyển owner, cơ chế nào giữ mọi write đã được xác nhận và thu hồi quyền ghi cũ?
+5. Khi một node lỗi, dữ liệu còn ở đâu, và cluster còn đủ capacity phục vụ không?
+
+Nếu chưa chứng minh một máy đã chạm giới hạn, hãy đo và tối ưu bottleneck trước khi sharding. Nếu chỉ một key nóng, xử lý hot key trước. Consistent hashing hữu ích nhất khi bạn thực sự cần phân phối dữ liệu theo key qua nhiều node và muốn giới hạn xáo trộn mỗi lần đổi cluster.
+
+## Tài liệu tham khảo và bài liên quan
+
+- [Apache Cassandra — Dynamo architecture](https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html): token ring, vnode, trade-off của nhiều token và lựa chọn replica theo topology. Cassandra có semantics ghi riêng; quy trình single-writer minh họa trong bài không phải mô tả triển khai Cassandra.
+- [OpenStack Swift — Building a Consistent Hashing Ring](https://docs.openstack.org/swift/latest/ring_background.html): dẫn dắt từ modulo đến phân phối dữ liệu ổn định. Đây là tài liệu lịch sử với ví dụ Python 2; dùng để hiểu nguyên lý, không sao chép làm code Python hiện hành.
+- [Redis Cluster specification](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/): hash slots, hash tags, redirect và migration của Redis Cluster.
+
+<Cards>
+  <Card title="Redis và Memcached" href="/caching/01-redis-vs-memcached/" description="Đặt bài toán phân phối key vào ngữ cảnh cache." />
+  <Card title="Scale từ 1.000 lên 50.000 users" href="/system-design/03-scale-1k-to-50k-users/" description="Xác định bottleneck và thứ tự thay đổi trước khi sharding." />
+</Cards>

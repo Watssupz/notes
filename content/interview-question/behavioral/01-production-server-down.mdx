@@ -1,0 +1,753 @@
+---
+title: "Xử lý sự cố production: từ cảnh báo đến khôi phục an toàn"
+description: "Hướng dẫn điều phối incident, khoanh vùng lỗi theo đường đi của request, chẩn đoán Linux và Kubernetes, chọn biện pháp khôi phục, kiểm chứng dữ liệu và phòng ngừa tái diễn."
+---
+
+<Callout type="info" title="Phạm vi và cách dùng">
+Bài này dành cho backend engineer và người trực on-call — người được phân công tiếp nhận cảnh báo ngoài giờ hoặc trong ca trực. Bạn cần hiểu HTTP, process và cách đọc log cơ bản. Đọc lần đầu theo thứ tự; khi đang có sự cố, dùng checklist cuối bài và runbook riêng của dịch vụ. Mọi tên hệ thống, mốc giờ và số liệu trong tình huống đều là giả định, không phải một incident đã xảy ra.
+</Callout>
+
+## Mục lục
+
+- [Bắt đầu từ ảnh hưởng tới người dùng](#bắt-đầu-từ-ảnh-hưởng-tới-người-dùng)
+  - [Server down không chỉ là máy chủ tắt](#server-down-không-chỉ-là-máy-chủ-tắt)
+  - [Khôi phục dịch vụ và tìm nguyên nhân là hai việc khác nhau](#khôi-phục-dịch-vụ-và-tìm-nguyên-nhân-là-hai-việc-khác-nhau)
+- [Nắm đường đi của một request](#nắm-đường-đi-của-một-request)
+  - [Tách lớp bên ngoài và lớp bên trong](#tách-lớp-bên-ngoài-và-lớp-bên-trong)
+  - [Đọc tín hiệu theo traffic, lỗi, độ trễ và mức bão hòa](#đọc-tín-hiệu-theo-traffic-lỗi-độ-trễ-và-mức-bão-hòa)
+- [Thiết lập cách làm việc ngay khi nhận cảnh báo](#thiết-lập-cách-làm-việc-ngay-khi-nhận-cảnh-báo)
+  - [Xác nhận sự cố và xác định phạm vi](#xác-nhận-sự-cố-và-xác-định-phạm-vi)
+  - [Phân vai và kiểm soát thay đổi](#phân-vai-và-kiểm-soát-thay-đổi)
+  - [Ghi timeline và bảo vệ bằng chứng](#ghi-timeline-và-bảo-vệ-bằng-chứng)
+- [Khoanh vùng bằng giả thuyết có thể kiểm tra](#khoanh-vùng-bằng-giả-thuyết-có-thể-kiểm-tra)
+  - [So sánh nhóm lỗi với nhóm còn hoạt động](#so-sánh-nhóm-lỗi-với-nhóm-còn-hoạt-động)
+  - [Mỗi phép thử phải giúp ra quyết định](#mỗi-phép-thử-phải-giúp-ra-quyết-định)
+- [Chẩn đoán từ bên ngoài hệ thống](#chẩn-đoán-từ-bên-ngoài-hệ-thống)
+  - [Phân biệt DNS, kết nối và TLS](#phân-biệt-dns-kết-nối-và-tls)
+  - [Đọc HTTP status cùng nơi phát sinh lỗi](#đọc-http-status-cùng-nơi-phát-sinh-lỗi)
+- [Chẩn đoán trên Linux và máy ảo](#chẩn-đoán-trên-linux-và-máy-ảo)
+  - [Process và cổng lắng nghe](#process-và-cổng-lắng-nghe)
+  - [CPU, memory và giới hạn tài nguyên](#cpu-memory-và-giới-hạn-tài-nguyên)
+  - [Disk, inode và I/O](#disk-inode-và-io)
+- [Chẩn đoán ứng dụng trên Kubernetes](#chẩn-đoán-ứng-dụng-trên-kubernetes)
+  - [Xác nhận đúng cluster trước khi đọc trạng thái](#xác-nhận-đúng-cluster-trước-khi-đọc-trạng-thái)
+  - [Đọc trạng thái container và log trước lần restart](#đọc-trạng-thái-container-và-log-trước-lần-restart)
+  - [Phân biệt readiness, liveness và startup](#phân-biệt-readiness-liveness-và-startup)
+  - [Kiểm tra Service và đường tới Pod](#kiểm-tra-service-và-đường-tới-pod)
+- [Điều tra database và dependency](#điều-tra-database-và-dependency)
+  - [Connection pool cạn không đồng nghĩa database thiếu connection](#connection-pool-cạn-không-đồng-nghĩa-database-thiếu-connection)
+  - [Query chậm, lock và transaction dài](#query-chậm-lock-và-transaction-dài)
+  - [Cache, queue và dịch vụ bên ngoài](#cache-queue-và-dịch-vụ-bên-ngoài)
+- [Chọn biện pháp giảm ảnh hưởng](#chọn-biện-pháp-giảm-ảnh-hưởng)
+  - [Rollback code và cấu hình](#rollback-code-và-cấu-hình)
+  - [Cô lập instance và restart có kiểm soát](#cô-lập-instance-và-restart-có-kiểm-soát)
+  - [Giảm tải trước khi tăng tài nguyên](#giảm-tải-trước-khi-tăng-tài-nguyên)
+  - [Failover và bảo vệ tính đúng đắn của dữ liệu](#failover-và-bảo-vệ-tính-đúng-đắn-của-dữ-liệu)
+- [Ngăn sự cố lan rộng bởi timeout và retry](#ngăn-sự-cố-lan-rộng-bởi-timeout-và-retry)
+- [Kiểm chứng phục hồi trước khi đóng incident](#kiểm-chứng-phục-hồi-trước-khi-đóng-incident)
+  - [Kiểm tra hành trình nghiệp vụ thay vì chỉ health check](#kiểm-tra-hành-trình-nghiệp-vụ-thay-vì-chỉ-health-check)
+  - [Xử lý backlog và kết quả chưa rõ](#xử-lý-backlog-và-kết-quả-chưa-rõ)
+  - [Quan sát ổn định và gỡ biện pháp tạm thời](#quan-sát-ổn-định-và-gỡ-biện-pháp-tạm-thời)
+- [Giao tiếp và escalation trong suốt incident](#giao-tiếp-và-escalation-trong-suốt-incident)
+- [Đi qua một tình huống hoàn chỉnh](#đi-qua-một-tình-huống-hoàn-chỉnh)
+- [Postmortem và cải tiến sau sự cố](#postmortem-và-cải-tiến-sau-sự-cố)
+- [Checklist tra nhanh](#checklist-tra-nhanh)
+- [Tài liệu tham khảo và bài đọc tiếp](#tài-liệu-tham-khảo-và-bài-đọc-tiếp)
+
+## Bắt đầu từ ảnh hưởng tới người dùng
+
+Bạn nhận cảnh báo API trả nhiều lỗi. Dashboard vẫn báo máy chủ còn sống, CPU không cao và process chưa dừng. Trong khi đó, người dùng không đặt được hàng.
+
+Ở thời điểm này, điều cần xác định không phải chỉ là máy nào hỏng. Bạn cần biết chức năng nào đang mất, bao nhiêu người bị ảnh hưởng và hành động nào có thể giảm thiệt hại mà không làm sai dữ liệu. Một hệ thống trả HTTP 200 nhưng ghi nhận thanh toán trùng vẫn chưa phải một hệ thống khỏe.
+
+Bài này dùng một dịch vụ đặt hàng làm ví dụ. Dịch vụ nhận request qua load balancer, ghi vào database và gọi một dịch vụ thanh toán. Phần chẩn đoán Linux áp dụng cho máy ảo hoặc host chạy ứng dụng; phần Kubernetes là nhánh triển khai khác, không phải danh sách lệnh bắt buộc chạy trong mọi incident.
+
+### Server down không chỉ là máy chủ tắt
+
+Trong trao đổi hằng ngày, “server down” thường gom nhiều trạng thái khác nhau:
+
+| Trạng thái | Người dùng thấy | Điểm cần phân biệt |
+| --- | --- | --- |
+| Host không truy cập được | Kết nối thất bại hoặc timeout | Host chết, lỗi mạng và mất quyền truy cập quản trị là các khả năng khác nhau |
+| Process dừng | Connection refused hoặc lỗi từ proxy | Máy vẫn sống nhưng không có ứng dụng nhận kết nối ở cổng cần dùng |
+| Process chạy nhưng không tiến triển | Request treo hoặc rất chậm | Có thể đang chờ lock, chờ dependency hoặc cạn worker |
+| Chỉ một phần hệ thống lỗi | Một endpoint, tenant hoặc region thất bại | Không nên khởi động lại toàn bộ hệ thống để sửa một phạm vi hẹp |
+| Kết quả nghiệp vụ sai | HTTP có thể vẫn thành công | Cần kiểm tra dữ liệu, không chỉ availability |
+
+Availability là khả năng cung cấp được dịch vụ mà người dùng cần. Một endpoint sống không chứng minh toàn bộ dịch vụ còn sử dụng được. Vì vậy, hãy mô tả incident bằng tác động cụ thể: “tạo đơn hàng thất bại tại region A”, thay vì chỉ ghi “server lỗi”.
+
+### Khôi phục dịch vụ và tìm nguyên nhân là hai việc khác nhau
+
+Mitigation là biện pháp giảm ảnh hưởng đang diễn ra. Resolution là xử lý để dịch vụ thoát khỏi trạng thái sự cố theo tiêu chí của đội. Root cause analysis là điều tra cơ chế gây lỗi và những điều kiện khiến lỗi lan rộng hoặc khó phát hiện.
+
+Ví dụ, tắt một tính năng mới có thể làm API hoạt động trở lại. Đây là mitigation tốt dù bạn chưa biết chính xác dòng code nào làm cạn connection pool. Đợi phân tích xong mọi chi tiết trước khi tắt tính năng sẽ kéo dài thời gian người dùng chịu lỗi.
+
+Mặc định nên ưu tiên **biện pháp có bằng chứng hỗ trợ, phạm vi nhỏ và có thể đảo ngược**. Song song, giữ lại đủ log, trạng thái và timeline để tiếp tục điều tra sau khi dịch vụ ổn định.
+
+<Callout type="warn" title="Ngoại lệ cần dừng thao tác thông thường">
+Nếu có dấu hiệu ghi sai dữ liệu, lộ thông tin hoặc máy bị xâm nhập, đừng chỉ cố đưa traffic trở lại. Báo ngay người phụ trách dữ liệu hoặc security theo quy trình của đội. Có thể phải tạm dừng luồng ghi hoặc cô lập workload để tránh thiệt hại tiếp diễn. Không tự xóa log, restart hàng loạt hay restore đè dữ liệu để thử sửa.
+</Callout>
+
+## Nắm đường đi của một request
+
+Để khoanh vùng nhanh, cần một bản đồ đủ đơn giản về những gì request phải đi qua. Sơ đồ dưới mô tả đường xử lý logic, không phải trace đo thời gian. DNS được kiểm tra trước khi client kết nối; nó không phải proxy chuyển tiếp HTTP request.
+
+```d2 title="Các ranh giới cần kiểm tra trên đường đi của request" interactive=false
+direction: down
+client: "Client"
+dns: "DNS resolver"
+edge: "Load balancer / reverse proxy"
+api: "Ứng dụng đặt hàng"
+db: "Database" {shape: cylinder}
+payment: "Dịch vụ thanh toán"
+client -> dns: "Tra cứu địa chỉ"
+client -> edge: "Kết nối và HTTPS"
+edge -> api: "Chuyển tiếp request"
+api -> db: "Đọc / ghi dữ liệu"
+api -> payment: "Gọi thanh toán"
+```
+
+Mỗi mũi tên là một ranh giới có thể thất bại độc lập. Client có thể không phân giải được tên miền dù API khỏe. API có thể nhận request nhưng hết thời gian chờ database. Dịch vụ thanh toán có thể xử lý xong trong khi API không nhận được response.
+
+Điểm cuối này đặc biệt quan trọng: request thất bại trong mắt client không luôn đồng nghĩa thao tác chưa xảy ra. Khi xử lý luồng ghi, cần giữ khả năng đối soát kết quả trước khi cho retry.
+
+### Tách lớp bên ngoài và lớp bên trong
+
+Bắt đầu từ một phép thử bên ngoài có cùng đường đi với người dùng. Sau đó so sánh với quan sát tại load balancer và ứng dụng.
+
+Nếu truy cập public thất bại nhưng kiểm tra nội bộ thành công, hãy ưu tiên lớp DNS, TLS, proxy hoặc routing. Nếu cả hai đều thất bại tại cùng endpoint, chuyển trọng tâm vào ứng dụng và dependency. Nếu chỉ một máy nội bộ gọi được, bạn còn phải xem khác biệt mạng hoặc cấu hình giữa các nguồn gọi.
+
+Đây là cách chia nhỏ phạm vi, không phải kết luận tuyệt đối. Một request nội bộ có thể bỏ qua authentication, cache hoặc rule theo hostname. Mỗi lần so sánh phải ghi rõ phần nào của đường đi đã bị bỏ qua.
+
+### Đọc tín hiệu theo traffic, lỗi, độ trễ và mức bão hòa
+
+Bốn nhóm tín hiệu sau giúp bạn không bị lệ thuộc vào một biểu đồ CPU:
+
+| Nhóm | Cần nhìn | Cách diễn giải ban đầu |
+| --- | --- | --- |
+| Traffic | Request đến edge, request vào app, số thao tác nghiệp vụ thành công | Traffic vào app giảm có thể do lỗi phía trước, không nhất thiết do ít người dùng |
+| Errors | Tỷ lệ lỗi và số lỗi tuyệt đối theo endpoint, version, region | Tỷ lệ lỗi giảm khi traffic về gần 0 không chứng minh đã hồi phục |
+| Latency | p50, p95, p99 và tỷ lệ timeout | p99 là ngưỡng mà khoảng 99% mẫu trong cửa sổ đo không vượt quá; phải biết đang đo nhóm request nào |
+| Saturation | Hàng đợi, worker bận, pool chờ, CPU throttling, I/O chờ | Tài nguyên chạm giới hạn có thể nằm ngoài CPU hoặc RAM tổng của máy |
+
+Ví dụ, CPU thấp nhưng thời gian chờ lấy database connection tăng cho thấy request có thể đang đứng đợi. Thêm CPU lúc đó không giải quyết được nút thắt.
+
+Luôn xem cả latency của request thành công và lỗi. Nếu các request chậm đã timeout và bị loại khỏi biểu đồ thành công, p95 thành công có thể trông tốt lên trong lúc trải nghiệm thực tế tệ hơn.
+
+## Thiết lập cách làm việc ngay khi nhận cảnh báo
+
+Mục tiêu ban đầu là có chung một bức tranh, không phải làm thật nhiều thao tác. Những mốc thời gian trong runbook của từng đội có thể khác nhau; không có quy tắc mọi incident phải được chẩn đoán trong một số phút cố định.
+
+### Xác nhận sự cố và xác định phạm vi
+
+1. Acknowledge cảnh báo để đội biết đã có người tiếp nhận. Ghi thời điểm nhận theo timezone thống nhất.
+2. Đối chiếu bằng một nguồn độc lập: synthetic check, lỗi từ edge, phản ánh người dùng hoặc một request kiểm tra có kiểm soát. Synthetic check là phép thử tự động mô phỏng một hành vi sử dụng.
+3. Xác định endpoint hoặc hành trình nghiệp vụ bị lỗi. Phân tách theo region, tenant, version và nhóm client nếu dữ liệu cho phép.
+4. Xem thời điểm bắt đầu triệu chứng, không chỉ thời điểm alert phát ra. Cảnh báo thường có độ trễ do cửa sổ tổng hợp và điều kiện kích hoạt.
+5. Kiểm tra thay đổi gần đó: deploy, feature flag, secret, certificate, network rule, migration, batch job hoặc traffic đột biến.
+
+Severity là mức nghiêm trọng dùng để quyết định cách huy động người và giao tiếp. Tên SEV1, SEV2 không có ý nghĩa thống nhất giữa mọi công ty. Hãy dùng định nghĩa nội bộ, dựa trên ảnh hưởng nghiệp vụ và rủi ro dữ liệu; không phân mức chỉ theo số máy bị lỗi.
+
+Không chờ tìm ra root cause mới gọi hỗ trợ. Sự cố ảnh hưởng người dùng trên diện rộng, vượt quyền truy cập của bạn hoặc có rủi ro dữ liệu đều là lý do escalation sớm.
+
+### Phân vai và kiểm soát thay đổi
+
+Khi nhiều người cùng vào xử lý, một người nên giữ vai trò Incident Commander, thường viết tắt là IC. IC duy trì bức tranh tổng thể, ưu tiên hướng xử lý và điều phối người. Người trực tiếp thao tác kỹ thuật không nên đồng thời phải trả lời mọi câu hỏi từ các bên.
+
+| Vai trò | Trách nhiệm |
+| --- | --- |
+| IC | Xác định ưu tiên, phân việc, thống nhất thay đổi và điều kiện đóng incident |
+| Người phụ trách kỹ thuật | Điều tra, đề xuất và thực hiện thao tác trong phạm vi được phân công |
+| Người giao tiếp | Cập nhật cho support, stakeholder hoặc status page theo chính sách |
+| Người ghi chép | Ghi timeline, kết quả thử nghiệm và trạng thái hiện tại |
+
+Đội nhỏ có thể kiêm nhiệm. Điều cần giữ là ai đang quyết định và ai đang thay đổi hệ thống phải rõ ràng.
+
+Tạm dừng những deploy không liên quan. Trước một thay đổi, thông báo đối tượng tác động, kết quả mong đợi, tín hiệu cần quan sát và cách quay lại trạng thái trước đó. Nếu hai người cùng đổi pool size và rollback version, rất khó biết hành động nào có tác dụng.
+
+Có thể điều tra nhiều nhánh song song. Nhưng với các thay đổi tác động cùng thành phần, nên thực hiện lần lượt hoặc phối hợp thành một kế hoạch rõ ràng.
+
+### Ghi timeline và bảo vệ bằng chứng
+
+Một timeline hữu ích phân biệt **quan sát**, **giả thuyết** và **hành động**. “Sau deploy tỷ lệ lỗi tăng” là quan sát. “Deploy gây lỗi” vẫn là giả thuyết cho tới khi có thêm bằng chứng.
+
+Mẫu ghi chép minh họa:
+
+```text
+Incident: INC-DEMO-001
+Timezone: UTC
+Ảnh hưởng đã xác nhận: tạo đơn hàng tại region A bị timeout
+IC: người đang được phân công
+
+09:02 — Quan sát: edge báo tăng 504 ở POST /orders.
+09:04 — Quan sát: nhóm version mới có thời gian chờ pool cao hơn nhóm cũ.
+09:05 — Giả thuyết: version mới giữ connection trong lúc gọi payment.
+09:07 — Hành động: tắt feature flag liên quan theo kế hoạch đã duyệt.
+09:10 — Quan sát: pool wait giảm; vẫn đang kiểm tra kết quả thanh toán.
+
+Chưa biết: có bao nhiêu request timeout nhưng đã được payment xử lý.
+Cập nhật tiếp theo: 09:20 UTC.
+```
+
+Trước restart hoặc thay instance, cố gắng giữ lại release ID, cấu hình liên quan đã che dữ liệu nhạy cảm, trạng thái container, log sát thời điểm lỗi và metric trong cửa sổ incident. Không lấy full dump hoặc bật debug diện rộng nếu thao tác đó có thể làm hệ thống quá tải hơn.
+
+Evidence cũng có thể chứa dữ liệu riêng tư. Không dán token, cookie, chuỗi kết nối, payload thanh toán hay thông tin khách hàng vào kênh chat công khai. Ghi request ID và dùng kho log có kiểm soát truy cập để tra cứu chi tiết.
+
+## Khoanh vùng bằng giả thuyết có thể kiểm tra
+
+Đọc liên tục hàng nghìn dòng log mà không có giả thuyết thường khiến bạn chỉ thấy thêm triệu chứng. Cách hiệu quả hơn là chọn một khả năng, tìm phép thử phân biệt nó với khả năng khác, rồi cập nhật hướng điều tra.
+
+### So sánh nhóm lỗi với nhóm còn hoạt động
+
+Một nhóm đối chứng còn khỏe rất có giá trị. Chẳng hạn, nếu cùng một database nhưng chỉ version mới bị chờ pool, khác biệt ở version đáng ưu tiên hơn giả thuyết toàn bộ database bị hỏng.
+
+Các trục so sánh thường dùng:
+
+- Version mới và version cũ trong cùng điều kiện traffic gần tương đương.
+- Một endpoint có ghi dữ liệu và một endpoint chỉ đọc.
+- Tenant bị lỗi và tenant không bị lỗi.
+- Một Pod hoặc node lỗi và các instance còn khỏe.
+- Trước và sau một thay đổi có timestamp xác định.
+
+Nhóm đối chứng không tự loại bỏ mọi yếu tố khác. Version mới có thể nhận nhóm khách hàng khác hoặc chạy trên node riêng. Kiểm tra những khác biệt này trước khi suy ra quan hệ nhân quả.
+
+### Mỗi phép thử phải giúp ra quyết định
+
+Dùng một bảng ngắn để giữ hướng điều tra:
+
+| Giả thuyết | Tín hiệu cần tìm | Kết quả dẫn tới hành động |
+| --- | --- | --- |
+| DNS trỏ sai | Địa chỉ trả về khác cấu hình đã duyệt; gọi qua IP đúng có kiểm soát thành công | Sửa record hoặc rollback thay đổi DNS theo runbook |
+| Một nhóm instance lỗi | Lỗi tập trung theo instance/version trong khi nhóm khác còn khỏe | Cô lập nhóm lỗi nếu phần còn lại đủ capacity |
+| Pool bị giữ quá lâu | Pool wait tăng; connection checkout dài; request đang chờ dependency | Giảm nguồn giữ connection, không vội tăng pool |
+| Dependency chậm | Trace và metric phía dependency cùng cho thấy độ trễ tăng | Giảm concurrency, tạm tắt tính năng phụ thuộc hoặc escalation cho owner |
+| Tải tăng vượt năng lực | Arrival rate tăng, hàng đợi dài, throughput thành công không tăng tương ứng | Giảm tải và kiểm tra khả năng scale an toàn |
+
+Trace là bản ghi các chặng xử lý của một request qua nhiều thành phần. Một trace mẫu giúp giải thích một request, nhưng chưa đủ đại diện cho toàn bộ incident. Đối chiếu nhiều mẫu với metric tổng hợp.
+
+Đặt điểm đánh giá lại cho từng hướng điều tra. Nếu không tìm được tín hiệu dự đoán, ghi kết quả và chuyển hướng thay vì tiếp tục bảo vệ giả thuyết ban đầu.
+
+## Chẩn đoán từ bên ngoài hệ thống
+
+Các ví dụ sau dùng domain `api.example.com` và IP thuộc dải dành cho tài liệu. Thay bằng endpoint được phép kiểm tra. Không chạy load test, gọi thanh toán thật hoặc tạo dữ liệu hàng loạt để xác nhận production đang lỗi.
+
+### Phân biệt DNS, kết nối và TLS
+
+DNS chuyển tên miền thành địa chỉ. Kết nối TCP cần tới được đúng địa chỉ và cổng. TLS xác thực phía server và bảo vệ kết nối HTTPS. Lỗi ở một bước phía trước có thể khiến ứng dụng không nhận được request nào.
+
+Từ máy kiểm tra có công cụ tương ứng:
+
+```bash
+dig +short api.example.com A
+dig +short api.example.com AAAA
+```
+
+Kiểm tra cả IPv4 và IPv6 nếu hệ thống công bố cả hai. Một địa chỉ sai có thể chỉ làm lỗi một nhóm người dùng. Kết quả từ máy của bạn cũng không đại diện cho mọi resolver; cần đối chiếu resolver bị ảnh hưởng và record tại nguồn quản lý DNS.
+
+Một phép thử HTTPS có giới hạn thời gian:
+
+```bash
+curl --silent --show-error \
+  --connect-timeout 3 --max-time 10 \
+  --output /dev/null \
+  --write-out 'http=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s first_byte=%{time_starttransfer}s total=%{time_total}s\n' \
+  https://api.example.com/health/ready
+```
+
+`/health/ready` là tên endpoint minh họa, không phải chuẩn bắt buộc. Các giá trị thời gian này được tính từ lúc bắt đầu phép thử, không phải thời lượng độc lập để cộng lại. Khi không thiết lập được HTTP response, mã hiển thị có thể là `000`; đó không phải HTTP status do server trả.
+
+Lệnh trên không dùng `--fail`, nên HTTP 500 vẫn có thể đi kèm exit code 0 của curl. Đọc đồng thời thông báo lỗi kết nối, HTTP status và timing; đừng chỉ nhìn shell báo lệnh thành công.
+
+Khi cần tách DNS khỏi đường HTTPS, có thể thử một IP đích đã được owner xác nhận:
+
+```bash
+curl --silent --show-error \
+  --connect-timeout 3 --max-time 10 \
+  --resolve api.example.com:443:192.0.2.10 \
+  https://api.example.com/health/ready
+```
+
+`--resolve` thay kết quả phân giải cho cặp hostname và port nhưng vẫn dùng hostname trong URL cho TLS và HTTP. IP có thể là địa chỉ edge hoặc origin tùy phép thử; hãy ghi rõ đang bỏ qua phần nào. Kết quả thành công qua IP không chứng minh mọi lớp đã khỏe.
+
+Không dùng `-k` để coi lỗi TLS là đã xử lý. Bỏ kiểm tra certificate chỉ che mất lỗi người dùng đang gặp. Với TLS, kiểm tra hostname trong certificate, thời hạn, certificate chain và thời gian trên máy; xử lý bằng cấu hình/certificate đúng.
+
+### Đọc HTTP status cùng nơi phát sinh lỗi
+
+Một status code là điểm bắt đầu điều tra, không phải bản chẩn đoán:
+
+| Tín hiệu | Hướng kiểm tra |
+| --- | --- |
+| Connection refused | Có listener ở cổng đích không; có thiết bị chủ động từ chối không |
+| Connect timeout | Routing, firewall, địa chỉ đích, listener quá tải hoặc đường mạng |
+| 401 hoặc 403 | Authentication, authorization, WAF hoặc policy mới; không mặc định process đã chết |
+| 429 | Rate limit hoặc quota đang được áp dụng ở lớp nào |
+| 500 | Lỗi do thành phần trả response ghi nhận; dùng log/trace để tìm bên phát sinh |
+| 502 | Gateway gặp vấn đề với response từ upstream; xem kết nối, reset và log proxy |
+| 503 | Dịch vụ tạm không phục vụ; có thể hết backend sẵn sàng, quá tải hoặc maintenance |
+| 504 | Gateway hết thời gian chờ upstream; chưa xác định được upstream chậm ở đâu |
+
+Với lỗi từ proxy, đối chiếu access log của proxy với log ứng dụng bằng request ID, thời điểm và upstream được chọn. Nếu app đã nhận request, tìm chặng cuối cùng còn có bằng chứng tiến triển. Nếu không thấy log, kiểm tra cả khả năng log bị trễ hoặc bị sampling trước khi kết luận request chưa tới app.
+
+## Chẩn đoán trên Linux và máy ảo
+
+Chỉ chạy nhánh này trên đúng host và với quyền được cấp. Các lệnh dưới dành cho Linux có systemd và những tiện ích được nêu; image tối giản hoặc managed service có thể không cung cấp chúng. Không cài thêm gói hoặc SSH vòng qua chính sách truy cập chỉ để làm theo ví dụ.
+
+### Process và cổng lắng nghe
+
+Giả sử service có tên `orders-api.service` và cổng ứng dụng là `8080`:
+
+```bash
+systemctl status orders-api.service --no-pager
+journalctl -u orders-api.service --since '15 minutes ago' --no-pager -n 200
+ss -lntp 'sport = :8080'
+```
+
+`systemctl` cho biết trạng thái service theo systemd. `journalctl` đọc log service trong cửa sổ gần đây. `ss` kiểm tra socket đang lắng nghe; thông tin process có thể bị giới hạn theo quyền.
+
+Nếu service báo active nhưng không có listener đúng cổng, kiểm tra cấu hình bind và tiến trình con. Nếu chỉ bind vào loopback, proxy ở máy khác sẽ không truy cập được. Nếu có listener mà request vẫn treo, chuyển sang tiến triển bên trong ứng dụng: worker, event loop, lock và dependency.
+
+SSH không vào được cũng chưa chứng minh host đã tắt. Có thể đường truy cập quản trị, bastion hoặc identity provider đang lỗi. Đối chiếu monitoring của host, console của nền tảng và trạng thái ứng dụng từ đường độc lập trước khi reboot.
+
+### CPU, memory và giới hạn tài nguyên
+
+Một snapshot giúp định hướng, nhưng nên xem xu hướng quanh thời điểm lỗi:
+
+```bash
+uptime
+vmstat 1 5
+free -h
+```
+
+Trong `vmstat`, mẫu đầu thường phản ánh trung bình từ lúc boot; các mẫu sau mới tương ứng từng khoảng lấy mẫu. Nếu có sysstat, có thể dùng `pidstat -p "$PID" 1 5` để xem đúng process. Biến `PID` phải được chọn từ process cần điều tra, không lấy tùy một process có tên gần giống.
+
+Load average trong `uptime` không phải phần trăm CPU. Nó còn liên quan tới task đang chờ chạy hoặc trong trạng thái chờ không ngắt được, thường gặp khi chờ I/O. Load cao với CPU không cao là lý do kiểm tra I/O và trạng thái task, không phải lý do tự động thêm CPU.
+
+Ở memory, xem lượng available và mức swap hoạt động, không chỉ cột free. Linux dùng RAM cho cache là bình thường. Ngược lại, container có thể chạm memory limit dù host vẫn còn RAM.
+
+Nếu process bị kill, tìm bằng chứng từ kernel/runtime và trạng thái container. Exit code 137 thường tương ứng bị kết thúc bằng SIGKILL, nhưng không tự chứng minh OOM — tình trạng thiếu bộ nhớ khiến hệ thống phải hủy process. Cần đối chiếu reason `OOMKilled`, log kernel hoặc metric giới hạn bộ nhớ.
+
+CPU trung bình của cả máy cũng có thể che một core bị dùng hết hoặc container bị throttling, tức bị giới hạn thời gian sử dụng CPU theo quota. Kiểm tra metric theo process/container và giới hạn thực tế trước khi tăng tài nguyên.
+
+### Disk, inode và I/O
+
+Khi ứng dụng không ghi được log hoặc database báo lỗi ghi, kiểm tra cả dung lượng và inode:
+
+```bash
+df -h / /var/log
+df -i / /var/log
+```
+
+Inode là cấu trúc filesystem dùng để quản lý một file. Nhiều file nhỏ có thể dùng hết inode khi dung lượng byte vẫn còn. Thay path bằng mount chứa dữ liệu thực tế; hai path trong ví dụ có thể nằm cùng một filesystem.
+
+Nếu có sysstat, `iostat -xz 1 3` giúp quan sát độ trễ và hoạt động I/O. Không dùng riêng `%util` để kết luận mọi loại storage đã đạt giới hạn; đối chiếu với latency, hàng đợi và metric của volume/provider.
+
+Không chạy quét toàn bộ filesystem, nén log khổng lồ hoặc xóa hàng loạt ngay khi storage đang quá tải. Nếu nghi file đã xóa nhưng process vẫn giữ mở, người có quyền phù hợp có thể kiểm tra bằng `lsof +L1`. Xóa tên file không đảm bảo dung lượng được trả ngay khi file descriptor còn mở.
+
+Biện pháp giải phóng dung lượng phải theo retention và runbook. Không xóa file dữ liệu database, WAL hoặc binlog — các log phục vụ tính bền vững và phục hồi dữ liệu — để làm `df` đẹp trở lại. Nếu filesystem chuyển read-only hoặc có lỗi phần cứng, escalation cho owner storage trước khi cố ghi tiếp.
+
+## Chẩn đoán ứng dụng trên Kubernetes
+
+Trong Kubernetes, đơn vị bạn nhìn thấy thường là Pod, nhưng nguyên nhân có thể nằm ở container, node, rollout, Service hoặc dependency chung. Đừng coi “xóa Pod để nó lên lại” là bước chẩn đoán mặc định.
+
+### Xác nhận đúng cluster trước khi đọc trạng thái
+
+Các lệnh trong phần này chạy ở máy quản trị có `kubectl` và quyền đọc cluster, không chạy bên trong Pod. Trước tiên, đối chiếu context với cluster mà bạn được giao xử lý:
+
+```bash
+kubectl config current-context
+kubectl config get-contexts
+```
+
+Sau khi xác nhận, đặt biến trong chính shell sẽ dùng để điều tra. Giá trị dưới là minh họa và phải thay theo môi trường thực:
+
+```bash
+CTX='production-context'
+NS='production'
+```
+
+Các bước tiếp theo truyền `--context` và namespace rõ ràng để giảm nguy cơ dùng nhầm mặc định. Label `app=orders-api` cũng là giả định của bài; kiểm tra label thật nếu truy vấn không có kết quả.
+
+### Đọc trạng thái container và log trước lần restart
+
+Phiên lệnh dưới chỉ đọc trạng thái. Nó không truy vấn cluster trong trang tài liệu và không hiển thị output giả làm kết quả thật. Mục “kỳ vọng” mô tả điều bạn cần tìm, không bảo đảm hệ thống sẽ trả đúng trạng thái đó.
+
+Sau bước liệt kê, chọn một Pod bị ảnh hưởng và container ứng dụng tương ứng. Gán `POD` và `CONTAINER` trong shell, chẳng hạn `POD='orders-api-demo'` và `CONTAINER='orders-api'`, rồi mới chạy các bước sau. Không copy tên minh họa như tên tài nguyên có thật.
+
+```terminal-session
+title: Khoanh vùng Pod lỗi bằng các lệnh chỉ đọc
+context:
+  kind: local
+  label: Máy quản trị có kubectl; CTX và NS đã được xác nhận
+steps:
+  - id: list-pods
+    title: Liệt kê Pod và node đang chạy
+    command: kubectl --context "$CTX" -n "$NS" get pods -l app=orders-api -o wide
+    expected: So sánh Ready, restart count, tuổi Pod và node giữa nhóm lỗi với nhóm còn khỏe.
+  - id: describe-pod
+    title: Đọc trạng thái và Events của Pod đã chọn
+    command: kubectl --context "$CTX" -n "$NS" describe pod "$POD"
+    expected: Xem State, Last State, Reason, exit code, thời điểm và Events; không chỉ lọc một dòng lỗi.
+  - id: current-log
+    title: Đọc log container hiện tại
+    command: kubectl --context "$CTX" -n "$NS" logs "$POD" -c "$CONTAINER" --since=15m --tail=200 --timestamps
+    expected: Đối chiếu thời điểm lỗi, request ID và lỗi dependency; mở rộng cửa sổ có kiểm soát nếu cần.
+  - id: previous-log
+    title: Đọc log lần chạy trước của container
+    command: kubectl --context "$CTX" -n "$NS" logs "$POD" -c "$CONTAINER" --previous --tail=200 --timestamps
+    warning: Chỉ có ý nghĩa khi container đã restart và log lần trước còn được lưu. Không có log không chứng minh lần chạy trước không lỗi.
+    expected: Tìm dấu hiệu trước khi container kết thúc và đối chiếu với Last State.
+```
+
+Cần đọc trạng thái theo cơ chế cụ thể:
+
+| Trạng thái hoặc tín hiệu | Ý nghĩa ban đầu | Bước tiếp theo |
+| --- | --- | --- |
+| `Pending` | Pod chưa được triển khai xong để chạy container | Đọc Events về scheduling, resource request, volume hoặc kéo image |
+| `ImagePullBackOff` | Kéo image thất bại và đang chờ thử lại | Kiểm tra tên/tag, registry, quyền truy cập và lỗi mạng |
+| `CrashLoopBackOff` | Container liên tục kết thúc và bị áp dụng khoảng chờ restart | Đọc Last State và log lần chạy trước; trạng thái này không phải root cause |
+| `Running`, chưa `Ready` | Container đang chạy nhưng chưa đáp ứng điều kiện phục vụ | Kiểm tra probe, startup, readiness gate và dependency |
+| `OOMKilled` trong trạng thái kết thúc | Có bằng chứng container bị hủy do thiếu bộ nhớ | So sánh limit, mức dùng, tải và node; chưa kết luận ngay là memory leak |
+| Restart count tăng | Container đã bị restart | Phân biệt app crash, OOM, probe kill và thay đổi hạ tầng |
+
+Nếu có Metrics Server và quyền tương ứng, `kubectl --context "$CTX" -n "$NS" top pods -l app=orders-api` cho snapshot CPU/memory gần hiện tại. Nó không thay thế lịch sử metric và có thể bỏ lỡ spike trước khi restart.
+
+Events có thời gian lưu hữu hạn. Log `--previous` cũng không phải kho lịch sử đầy đủ của mọi lần restart hay Pod đã bị thay thế. Với incident kéo dài, cần dùng hệ thống log/metric tập trung và lưu timestamp, Pod UID, node, version để đối chiếu.
+
+### Phân biệt readiness, liveness và startup
+
+Ba loại probe giải quyết ba vấn đề khác nhau:
+
+- **Readiness:** Pod có sẵn sàng nhận traffic hay không. Readiness thất bại không tự restart container; Pod không còn được coi là backend sẵn sàng cho traffic thông thường qua Service.
+- **Liveness:** container còn có thể tiếp tục chạy hữu ích hay đã mắc kẹt đến mức cần restart. Thất bại đủ ngưỡng sẽ khiến kubelet restart container theo cấu hình.
+- **Startup:** cho ứng dụng thời gian khởi tạo. Khi startup probe được cấu hình, liveness và readiness chưa bắt đầu cho tới khi startup thành công.
+
+Nếu database dùng chung chậm và liveness của mọi Pod cũng kiểm tra database, cả fleet có thể restart đồng loạt. Restart không sửa database, lại tạo thêm tải khởi động và kết nối mới.
+
+Mặc định nên để liveness kiểm tra khả năng sống của chính ứng dụng, không dùng nó như phép kiểm tra tổng hợp mọi dependency. Readiness cũng cần thiết kế cẩn thận: loại mọi Pod khỏi Service khi một tính năng phụ lỗi có thể biến suy giảm cục bộ thành outage toàn bộ. Chỉ thay probe trong incident khi đã hiểu rủi ro và có kế hoạch quan sát, không đơn giản nới ngưỡng tới khi hết alert.
+
+### Kiểm tra Service và đường tới Pod
+
+Nếu Pod Ready nhưng traffic qua Service vẫn lỗi, kiểm tra đối tượng định tuyến. Ví dụ dịch vụ có tên `orders-api`:
+
+```bash
+kubectl --context "$CTX" -n "$NS" get service orders-api -o yaml
+kubectl --context "$CTX" -n "$NS" get endpointslices \
+  -l kubernetes.io/service-name=orders-api -o wide
+```
+
+Service dùng selector để tìm các Pod phù hợp. EndpointSlice ghi nhận địa chỉ endpoint và trạng thái liên quan. Đối chiếu selector, port/targetPort, địa chỉ backend và readiness thay vì chỉ đếm số Pod đang Running.
+
+Sau đó kiểm tra log của Ingress controller hoặc gateway đang dùng, NetworkPolicy và node nếu lỗi tập trung theo đường mạng. `kubectl port-forward` có thể hữu ích trong một phép thử được cho phép, nhưng nó bỏ qua nhiều lớp của đường truy cập thực. Port-forward thành công không chứng minh DNS, load balancer và Ingress đã khỏe.
+
+## Điều tra database và dependency
+
+Khi ứng dụng vẫn chạy nhưng request treo, phần chờ thường nằm ngoài CPU đang thực thi code. Database và dịch vụ bên ngoài cần được kiểm tra từ cả phía caller lẫn phía owner.
+
+### Connection pool cạn không đồng nghĩa database thiếu connection
+
+Connection pool là tập kết nối được ứng dụng giữ để tái sử dụng. Khi mọi connection đang bận, request mới phải chờ một connection được trả về. Log “timeout acquiring connection” chứng minh bước chờ này thất bại, nhưng chưa cho biết vì sao connection bị giữ.
+
+Một tình huống minh họa: pool có 20 connection. Nếu mỗi request giữ một connection trong 2 giây, pool chỉ cho phép khoảng 10 lượt sử dụng hoàn tất mỗi giây trong điều kiện giả định đơn giản. Nếu thời gian giữ tăng lên 10 giây, khả năng đó giảm còn khoảng 2 lượt mỗi giây dù database chưa dùng hết CPU.
+
+Đây không phải công thức sizing production: nó bỏ qua biến động thời gian, nhiều thao tác mỗi request và các giới hạn khác. Nó chỉ cho thấy tại sao **thời gian giữ connection** quan trọng ngang với số connection.
+
+Kiểm tra cùng lúc:
+
+- Số connection active, idle và số request đang chờ ở từng instance.
+- Thời gian chờ checkout và thời gian connection được giữ trước khi trả.
+- Query đang chạy, transaction mở và lock wait ở database.
+- Số instance nhân với pool tối đa, so với ngân sách connection của database.
+- Trace xem ứng dụng có giữ connection trong lúc gọi network hoặc chờ xử lý khác không.
+
+Không tăng pool theo phản xạ. Nếu database đã quá tải, nhiều connection hơn có thể tạo thêm cạnh tranh và làm query chậm hơn. Nếu app giữ connection vì chờ payment, tăng pool chỉ cho phép nhiều request cùng mắc kẹt.
+
+### Query chậm, lock và transaction dài
+
+Query duration là thời gian một câu lệnh thực thi. Transaction duration là thời gian từ khi bắt đầu transaction tới khi kết thúc. Lock wait là thời gian chờ quyền truy cập tài nguyên đang bị transaction khác giữ. Ba đại lượng liên quan nhưng không thay thế nhau.
+
+Ví dụ, ứng dụng cập nhật một order rồi gọi payment trước khi commit. Query cập nhật có thể chạy rất nhanh, nhưng transaction vẫn mở trong suốt thời gian chờ payment. Request khác chạm cùng dữ liệu có thể phải chờ lock, còn connection không được trả về pool.
+
+Nhờ owner database kiểm tra session, transaction lâu nhất và chuỗi blocking theo công cụ của hệ quản trị đang dùng. Không chạy `EXPLAIN ANALYZE` tùy tiện trên query đắt hoặc câu ghi: công cụ này thực thi câu lệnh để lấy số liệu. Ngay cả một truy vấn chẩn đoán cũng có thể tăng tải nếu quét quá nhiều dữ liệu.
+
+Việc cancel query hoặc terminate session phải đi qua người hiểu tác động. Rollback một transaction lớn có thể mất thời gian và tạo thêm I/O. Với thao tác nghiệp vụ, còn cần biết client có retry và kết quả nào đã được commit.
+
+### Cache, queue và dịch vụ bên ngoài
+
+Cache lỗi có thể làm traffic dồn vào database. Không nên flush toàn bộ cache chỉ để loại trừ giả thuyết: mất cache đồng loạt có thể tạo cache stampede, tức nhiều request cùng tính lại hoặc đọc lại một dữ liệu đắt.
+
+Với queue, nhìn cả tốc độ producer, tốc độ consumer, backlog và tuổi message cũ nhất. Backlog là lượng việc chưa xử lý. Queue không rỗng có thể bình thường; tuổi message tăng liên tục mới cho thấy người dùng phải chờ ngày càng lâu. Retry và dead-letter queue — nơi giữ message xử lý thất bại theo chính sách — cũng cần được tính vào phạm vi ảnh hưởng.
+
+Với payment hoặc dịch vụ bên ngoài, phân biệt lỗi trả về nhanh, connect timeout và chờ response quá lâu. Đối chiếu request ID với owner/provider. Một response timeout chỉ nói rằng caller chưa có kết quả trong thời gian cho phép; không chứng minh phía bên kia chưa thực hiện giao dịch.
+
+## Chọn biện pháp giảm ảnh hưởng
+
+Sau khi có phạm vi và giả thuyết đủ mạnh, chọn hành động theo rủi ro. Không nhất thiết phải biết toàn bộ root cause, nhưng phải biết hành động có thể gây thêm hại ở đâu.
+
+| Biện pháp | Phù hợp khi | Rủi ro cần kiểm tra |
+| --- | --- | --- |
+| Tắt feature flag | Tính năng mới gắn rõ với lỗi và có thể tách khỏi luồng chính | Flag có thực sự ngừng công việc lỗi hay chỉ ẩn giao diện |
+| Rollback | Version/cấu hình mới tương quan mạnh với lỗi | Tương thích schema, dữ liệu mới và sự khác biệt cấu hình |
+| Cô lập instance | Lỗi tập trung ở một nhóm nhỏ | Capacity còn lại và request đang xử lý |
+| Restart giới hạn | Cần giải phóng trạng thái mắc kẹt tạm thời | Mất bằng chứng, cold start, công việc dang dở và lỗi quay lại |
+| Giảm tải hoặc tắt chức năng phụ | Hệ thống vượt giới hạn hoặc dependency đang yếu | Ưu tiên nghiệp vụ, thông báo cho người dùng và tính đúng đắn của fallback |
+| Scale out | Nút thắt nằm ở app và downstream còn năng lực | Connection, cache warm-up, quota và khả năng cấp thêm node |
+| Failover | Thành phần chính không phục hồi đủ nhanh, có đích chuyển đã chuẩn bị | Dữ liệu chưa đồng bộ, hai bên cùng ghi và năng lực đích |
+
+Với mỗi hành động, ghi rõ người thực hiện, phạm vi, tín hiệu mong đợi và điều kiện dừng. Nếu kết quả trái dự đoán, dừng mở rộng thay đổi và đánh giá lại. Đừng tiếp tục rollout một biện pháp chỉ vì đã bắt đầu.
+
+### Rollback code và cấu hình
+
+Nếu lỗi chỉ xuất hiện ở version mới, rollback thường an toàn hơn viết một hotfix chưa được kiểm chứng trong lúc áp lực cao. Nhưng “quay lại binary cũ” không luôn đồng nghĩa quay lại trạng thái tương thích.
+
+Trước rollback, kiểm tra:
+
+1. Version cũ có đọc và ghi được schema hiện tại không.
+2. Migration đã đổi/xóa dữ liệu hoặc đổi ý nghĩa field chưa.
+3. Config, secret, feature flag có thay cùng release không.
+4. Có thay đổi ở consumer, event schema hoặc dịch vụ khác phụ thuộc version mới không.
+5. Artifact cũ và quy trình rollout có còn sẵn, đã được kiểm chứng không.
+
+Ví dụ, app cũ cần một cột vừa bị migration xóa thì rollback app sẽ tạo lỗi mới. Trong trường hợp đó, cần kế hoạch tương thích với owner database, không tự chạy down migration.
+
+Thực hiện qua deployment controller và pipeline đang sở hữu workload. Rollback thủ công trong cluster có thể bị GitOps hoặc hệ thống reconcile ghi đè. Vì mỗi nền tảng có cơ chế khác nhau, runbook thực tế phải chỉ rõ lệnh hoặc thao tác được phê duyệt; không có một lệnh rollback dùng an toàn cho mọi hệ thống.
+
+### Cô lập instance và restart có kiểm soát
+
+Nếu chỉ một instance lỗi, đưa nó ra khỏi luồng nhận request mới trước khi restart khi nền tảng hỗ trợ. Drain là quá trình ngừng nhận việc mới và cho công việc đang chạy cơ hội hoàn tất trong giới hạn thời gian.
+
+Kiểm tra capacity còn lại trước khi drain. Loại một nửa số instance trong lúc tải đã cao có thể làm nửa còn lại sập theo. Với queue consumer, còn phải hiểu cơ chế acknowledgment và redelivery để biết message dang dở có được xử lý lại không.
+
+Restart một instance sau khi giữ bằng chứng có thể là mitigation hợp lý cho deadlock hoặc memory tăng không kiểm soát. Nó không phải bằng chứng root cause đã được sửa. Ghi nhận thời gian lỗi tái xuất hiện và kiểm tra metric trong thời gian khởi động lại.
+
+Không restart tất cả instance cùng lúc. Cold start, cache rỗng và nhiều kết nối mới có thể làm dependency bị dồn tải. Mở rộng từng đợt nhỏ theo tiêu chí quan sát đã thống nhất.
+
+### Giảm tải trước khi tăng tài nguyên
+
+Khi database đã yếu, thêm app instance có thể làm tình hình tệ hơn. Giả sử 10 instance, mỗi instance có pool tối đa 30 connection. Scale lên 20 instance có thể nâng tổng nhu cầu tối đa từ 300 lên 600 connection nếu không có giới hạn khác.
+
+Trước scale, xác định tài nguyên nào chạm giới hạn. Nếu app bị giới hạn CPU trong khi database còn dư năng lực, scale out có thể đúng. Nếu mọi request đang chờ cùng một payment API, cần giảm concurrency hoặc bỏ bớt luồng phụ thuộc thay vì tạo thêm caller.
+
+Những cách giảm tải có thể cân nhắc theo thiết kế sẵn:
+
+- Tạm dừng batch job hoặc tác vụ nền không khẩn cấp.
+- Rate limit theo client hoặc chức năng để bảo vệ luồng quan trọng.
+- Giới hạn số request đồng thời tới dependency yếu.
+- Load shedding: từ chối sớm một phần việc khi không còn đủ năng lực xử lý.
+- Graceful degradation: giảm chức năng nhưng giữ phần cốt lõi còn đúng, như tạm ẩn gợi ý sản phẩm.
+
+Không dùng dữ liệu cache cũ cho kiểm tra số dư hoặc tồn kho chỉ để trả nhanh nếu điều đó vi phạm nghiệp vụ. “Giảm chức năng” phải có contract rõ; không được biến lỗi thành response thành công giả.
+
+### Failover và bảo vệ tính đúng đắn của dữ liệu
+
+Failover là chuyển vai trò hoặc traffic sang hệ thống dự phòng. Nó chỉ an toàn khi đích chuyển đã được chuẩn bị về capacity, cấu hình, dữ liệu và quy trình vận hành.
+
+Với database, cần biết RPO và RTO. RPO mô tả mức mất dữ liệu tối đa có thể chấp nhận; RTO mô tả mục tiêu thời gian khôi phục. Đây là mục tiêu đã thỏa thuận, không phải lời đảm bảo một replica bất kỳ sẽ đáp ứng được.
+
+Trước khi promote replica hoặc chuyển region, xác nhận mức đồng bộ và cách ngăn phía cũ tiếp tục nhận ghi. Fencing là cơ chế cô lập phía cũ để tránh hai bên cùng hoạt động như primary. Nếu không có cơ chế này, network partition có thể dẫn tới split-brain: hai phía cùng cho rằng mình được phép ghi.
+
+Không chỉ xem replication lag theo giây rồi mặc định dữ liệu đã đủ. Cách xác nhận vị trí dữ liệu được sao chép phụ thuộc engine và kiểu replication. Phải dùng runbook của hệ thống, có owner dữ liệu tham gia và ghi rõ mức rủi ro đã được chấp nhận.
+
+Restore từ backup là một quy trình phục hồi khác với failover. Backup giúp lấy lại dữ liệu theo điểm khôi phục, nhưng có thể cần replay log và đối soát giao dịch sau thời điểm đó. Không restore đè production trong một thử nghiệm chẩn đoán.
+
+## Ngăn sự cố lan rộng bởi timeout và retry
+
+Một dependency chậm có thể làm nhiều tầng cùng quá tải. Request chờ lâu giữ worker và connection; caller timeout rồi retry; request cũ có thể vẫn còn chạy. Đây là cascading failure: lỗi ở một phần làm phần khác yếu đi, rồi quay lại tăng áp lực lên phần ban đầu.
+
+Sơ đồ sau mô tả vòng khuếch đại này. Nó không khẳng định mọi timeout đều có retry hoặc mọi request đã timeout đều tiếp tục chạy; đó là những hành vi phải kiểm tra trong implementation.
+
+```d2 title="Vòng khuếch đại khi retry không được kiểm soát" interactive=false
+direction: down
+slow: "Dependency xử lý chậm"
+held: "Request giữ tài nguyên lâu"
+wait: "Hàng đợi và timeout tăng"
+retry: "Caller retry tạo thêm tải"
+slow -> held: "Response về muộn"
+held -> wait: "Ít chỗ cho request mới"
+wait -> retry: "Nếu policy cho phép"
+retry -> slow: "Thêm công việc tới dependency"
+```
+
+Ví dụ minh họa, ba tầng caller đều cho phép tối đa ba lần gọi xuống tầng tiếp theo, tính cả lần đầu. Một thao tác ở tầng ngoài có thể khuếch đại thành tới 27 lần gọi ở tầng cuối nếu mọi nhánh đều retry. Đây là số học của giả định, không phải mức khuếch đại đo được của hệ thống trong bài.
+
+Biện pháp bảo vệ phải phối hợp với nhau:
+
+- **Deadline:** giới hạn tổng thời gian caller còn chấp nhận cho một thao tác. Thời gian cho dependency phải chừa chỗ cho các bước còn lại và trả response.
+- **Timeout:** giới hạn một giai đoạn như connect, chờ pool hoặc chờ response. Không tăng mọi timeout chỉ để giảm số lỗi trên dashboard.
+- **Retry budget:** giới hạn lượng công việc retry để nó không chiếm hết capacity.
+- **Backoff và jitter:** tăng khoảng chờ giữa các lần thử và thêm độ ngẫu nhiên để tránh caller cùng retry một nhịp.
+- **Circuit breaker:** tạm chặn lời gọi khi dependency đang thất bại, rồi cho thử lại có kiểm soát.
+- **Bulkhead:** chia ngân sách worker hoặc connection theo dependency để một bên chậm không chiếm hết tài nguyên của luồng khác.
+
+Tăng timeout có thể làm tỷ lệ lỗi trước mắt giảm nhưng số request đang giữ tài nguyên tăng. Mặc định hãy nhìn throughput thành công, số request đang chờ và khả năng hủy công việc ở downstream trước khi sửa timeout.
+
+Với thao tác ghi, chỉ retry khi contract cho phép và có cách chống lặp. Idempotency key là khóa đại diện cho một thao tác nghiệp vụ để các lần gửi lại không tạo thêm tác dụng. Nó phải được bên xử lý hỗ trợ, lưu và kiểm tra đúng; chỉ thêm một header tự đặt không tạo ra tính idempotent.
+
+## Kiểm chứng phục hồi trước khi đóng incident
+
+Một biểu đồ hết đỏ chưa đủ. Bạn cần xác nhận đường đi thật của request, kết quả nghiệp vụ và lượng việc tồn đọng đều đang trở lại trạng thái có kiểm soát.
+
+### Kiểm tra hành trình nghiệp vụ thay vì chỉ health check
+
+Với dịch vụ đặt hàng, quy trình kiểm tra có thể gồm đăng nhập, xem sản phẩm, tạo đơn và kiểm tra trạng thái sau thanh toán. Chỉ dùng tài khoản, dữ liệu và cơ chế giao dịch kiểm thử đã được phê duyệt; không tự tạo charge thật để thử.
+
+Đối chiếu ít nhất ba góc nhìn:
+
+1. Từ bên ngoài: đường truy cập như người dùng đã hoạt động chưa.
+2. Từ hệ thống: error, latency, throughput thành công và saturation có trở lại mức chấp nhận được dưới traffic thực không.
+3. Từ dữ liệu: order và payment có trạng thái nhất quán không; có bản ghi thiếu hoặc tác dụng trùng không.
+
+Kiểm tra các lát cắt đã lỗi trước đó. Một region hồi phục không chứng minh region còn lại đã hồi phục. Một request từ máy engineer thành công cũng không xác nhận mọi nhóm client đã thoát lỗi DNS hoặc TLS.
+
+### Xử lý backlog và kết quả chưa rõ
+
+Khi traffic mới đã tốt, công việc cũ có thể vẫn gây ảnh hưởng. Kiểm tra queue chính, retry queue, dead-letter queue và các job bị tạm dừng. Ước lượng tốc độ xử lý ròng: consumer phải xử lý nhanh hơn lượng việc mới đến thì backlog mới giảm.
+
+Không mở tối đa consumer chỉ để xóa backlog thật nhanh. Việc này có thể lại dồn tải vào database hoặc provider vừa hồi phục. Tăng tốc theo từng mức và quan sát downstream.
+
+Với payment timeout, lập tập giao dịch có kết quả chưa rõ. Đối soát theo order ID, idempotency key và định danh giao dịch của provider. Dùng API tra cứu hoặc webhook theo contract để xác định kết quả trước khi quyết định retry, hoàn tiền hay chuyển xử lý thủ công.
+
+Nếu order chưa cập nhật nhưng payment đã thành công, gửi lại yêu cầu thanh toán là hành động nguy hiểm. Cần sửa trạng thái bằng workflow phục hồi có kiểm soát, giữ audit trail và phân biệt rõ khôi phục trạng thái với thực hiện thêm một giao dịch.
+
+### Quan sát ổn định và gỡ biện pháp tạm thời
+
+Chọn cửa sổ quan sát đủ bao phủ cơ chế gây lỗi: chu kỳ tải, thời gian connection bị giữ, cache hết hạn hoặc batch job. Một lỗi memory tăng dần không thể được xác nhận đã hết chỉ bằng vài request sau restart.
+
+Ghi rõ tiêu chí đóng incident, chẳng hạn luồng nghiệp vụ quan trọng đã đạt mức chấp nhận, tải đang được phục vụ ổn định và các kết quả chưa rõ đã có owner/kế hoạch xử lý. Không cần đợi mọi action item dài hạn hoàn tất, nhưng phần rủi ro còn lại phải được bàn giao rõ.
+
+Theo dõi các thay đổi tạm thời: feature đang tắt, rate limit mới, instance bị cô lập, job dừng hoặc quyền truy cập khẩn cấp. Mỗi mục cần owner, điều kiện gỡ và cách kiểm chứng. Không bật lại đồng loạt ngay sau khi thông báo hồi phục.
+
+## Giao tiếp và escalation trong suốt incident
+
+Một bản cập nhật tốt nói rõ điều đã biết, điều đang làm và thời điểm cập nhật tiếp. Không hứa giờ sửa xong khi chưa có bằng chứng. Cũng không cần đưa mọi suy đoán kỹ thuật lên status page.
+
+Mẫu thông báo giả định cho bên liên quan:
+
+```text
+[09:10 UTC] Đang xử lý lỗi tạo đơn hàng tại region A.
+Đã xác nhận: một phần request tạo đơn bị timeout.
+Đang làm: tắt luồng xử lý mới và kiểm chứng khả năng tạo đơn.
+Chưa xác nhận: số giao dịch thanh toán có kết quả chưa rõ.
+Hướng dẫn cho support: không yêu cầu khách thanh toán lại trước khi tra trạng thái.
+Cập nhật tiếp theo: 09:20 UTC, kể cả khi chưa có kết luận mới.
+```
+
+Thông báo nội bộ có thể chứa link dashboard và incident document. Thông báo công khai phải theo chính sách, không lộ kiến trúc nhạy cảm, dữ liệu khách hàng hay kết luận chưa kiểm chứng về mất dữ liệu.
+
+Escalation sớm khi có một trong các điều kiện sau:
+
+- Ảnh hưởng vượt phạm vi dịch vụ hoặc quyền hạn của người đang xử lý.
+- Có khả năng mất/sai dữ liệu, giao dịch trùng hoặc dấu hiệu security incident.
+- Biện pháp kế tiếp có rủi ro cao như failover, migration hoặc can thiệp session database.
+- Hướng điều tra không tạo thêm bằng chứng, hoặc người trực đã quá tải.
+- Nền tảng/provider cần xử lý ở phần mà đội không có quyền quan sát.
+
+Khi gọi hỗ trợ, gửi một gói thông tin gọn: ảnh hưởng, thời điểm bắt đầu, phạm vi, thay đổi gần nhất, bằng chứng chính, việc đã thử và kết quả. “Đã restart nhưng vẫn lỗi” không đủ nếu thiếu instance, thời điểm và metric trước/sau.
+
+Nếu phải đổi ca, bàn giao trực tiếp và nhận xác nhận từ người tiếp quản. Nêu rõ giả thuyết hiện tại, thao tác đang chạy, việc bị cấm làm và thời điểm cần cập nhật tiếp. Thông báo lại ai đang giữ vai trò IC.
+
+## Đi qua một tình huống hoàn chỉnh
+
+Giả sử dịch vụ đặt hàng có hai nhóm version trong một đợt rollout. Version mới bổ sung việc gọi payment trong cùng transaction ghi order. Toàn bộ tình huống và mốc giờ dưới đây chỉ để minh họa cách suy luận.
+
+**09:02 — Xác nhận ảnh hưởng.** Edge ghi nhận nhiều 504 ở thao tác tạo đơn. Trang xem sản phẩm vẫn hoạt động. Người trực mở incident, mời owner dịch vụ và nhờ một người điều phối. Rollout cùng các thay đổi không liên quan được tạm dừng.
+
+Điểm quyết định ở đây là giữ phạm vi “luồng tạo đơn”, chưa gọi toàn hệ thống là đã sập. Điều này giúp tránh restart các thành phần không liên quan.
+
+**09:04 — So sánh nhóm lỗi.** Version mới có pool wait và thời gian giữ connection tăng rõ. Version cũ chưa có cùng mức lỗi. Database CPU không cao, nhưng số transaction mở lâu tăng. Các tín hiệu này khiến giả thuyết “thiếu CPU ứng dụng” kém thuyết phục hơn “connection bị giữ khi chờ việc khác”.
+
+Nhóm kiểm tra phân bố traffic và node để tránh nhầm khác biệt version với khác biệt hạ tầng. Một số trace cho thấy network call tới payment xảy ra trước khi transaction kết thúc. Owner payment xác nhận độ trễ đang tăng, nhưng chưa có bằng chứng payment đã ngừng xử lý hoàn toàn.
+
+**09:07 — Chọn mitigation.** Đội xác nhận feature flag có thể đưa code về luồng cũ đã biết, không thay schema và không tạo thêm yêu cầu thanh toán cho giao dịch đang chạy. Sau khi thống nhất điều kiện quan sát và cách bật lại, người phụ trách tắt flag.
+
+Nếu flag chỉ ẩn nút trên frontend mà backend vẫn chạy luồng mới, biện pháp này không đủ. Nếu version cũ không tương thích dữ liệu hiện tại, rollback cũng không được coi là phương án mặc định. Quyết định dựa trên cơ chế thật, không dựa trên tên của biện pháp.
+
+**09:10 — Đánh giá kết quả.** Pool wait giảm, throughput tạo đơn thành công tăng và 504 giảm dưới traffic thực. Đội chưa đóng incident vì còn những request đã timeout mà payment có thể đã xử lý.
+
+Việc không tăng pool đã tránh mở rộng số transaction cùng mắc kẹt. Việc không restart hàng loạt cũng giữ được phần lớn trạng thái và log phục vụ điều tra.
+
+**Sau mitigation — Phục hồi nghiệp vụ.** Đội lập danh sách giao dịch trong cửa sổ lỗi, đối soát với provider và cập nhật trạng thái theo workflow đã duyệt. Support được hướng dẫn không yêu cầu khách thanh toán lại chỉ vì frontend báo timeout. Backlog được xử lý dần dưới giới hạn của downstream.
+
+**Sau quan sát — Bàn giao phần còn lại.** Incident chỉ được đóng khi các tiêu chí phục hồi đã đạt và phần giao dịch cần xử lý tiếp có owner rõ. Feature vẫn tắt cho tới khi thiết kế mới được kiểm chứng.
+
+Bản sửa dài hạn cần thu hẹp transaction, nhưng không thể chỉ chuyển network call ra ngoài rồi coi như xong. Khi database và payment không nằm trong cùng một transaction, phải thiết kế các trạng thái trung gian, idempotency và reconciliation — quá trình đối soát để đưa trạng thái hai bên về nhất quán. Đó là công việc sau incident, có test cho cả trường hợp timeout và response bị mất.
+
+## Postmortem và cải tiến sau sự cố
+
+Postmortem là bản phân tích sau incident nhằm giải thích điều đã xảy ra và cải thiện hệ thống. “Blameless” nghĩa là không quy trách nhiệm cá nhân cho những quyết định được đưa ra với thông tin và công cụ lúc đó. Nó không có nghĩa bỏ qua trách nhiệm sửa hệ thống.
+
+Không dừng ở “developer viết sai code” hoặc “traffic tăng”. Một phân tích hữu ích đi qua chuỗi điều kiện:
+
+| Lớp phân tích | Ví dụ từ tình huống giả định |
+| --- | --- |
+| Trigger | Bật luồng mới trong rollout khi payment đang chậm |
+| Cơ chế gây lỗi | Transaction giữ connection trong lúc chờ network |
+| Điều kiện khuếch đại | Request mới tiếp tục vào, pool cạn, caller retry |
+| Lỗ hổng phát hiện | Health check không phản ánh khả năng tạo đơn |
+| Lỗ hổng kiểm thử | Chưa thử dependency chậm và kết quả payment chưa rõ |
+| Yếu tố kéo dài phục hồi | Thiếu workflow đối soát các thao tác timeout |
+
+Bản postmortem nên có ảnh hưởng đã xác minh, timeline, cách phát hiện, biện pháp đã thử, cơ chế lỗi, điều đã làm tốt và action item. Số liệu chưa đo được phải ghi là chưa biết; không suy ra số người bị ảnh hưởng từ số log lỗi nếu một người có thể tạo nhiều request.
+
+Action item phải có owner và cách kiểm chứng. “Tăng monitoring” là quá mơ hồ. “Thêm metric thời gian chờ pool, kiểm tra alert trong bài diễn tập dependency chậm” cho biết cần làm gì và làm sao biết đã xong.
+
+Ưu tiên một tập thay đổi có thể hoàn thành và tác động trực tiếp:
+
+- Thu hẹp transaction boundary và kiểm thử luồng phục hồi dữ liệu.
+- Thêm deadline, retry budget và giới hạn concurrency theo dependency.
+- Thiết kế probe không kích hoạt restart dây chuyền.
+- Cải thiện canary và điều kiện dừng rollout theo metric nghiệp vụ.
+- Diễn tập rollback/failover trong môi trường an toàn, kể cả bước bàn giao và giao tiếp.
+- Kiểm chứng restore từ backup thay vì chỉ xác nhận backup job báo thành công.
+
+SLO, tức mục tiêu mức dịch vụ, giúp đội quyết định độ tin cậy nào cần bảo vệ. Ví dụ, một SLO về tỷ lệ tạo đơn thành công hữu ích hơn việc chỉ đặt mục tiêu mọi máy luôn có CPU thấp. Định nghĩa “thành công” phải phản ánh kết quả nghiệp vụ và cách đo đã thống nhất.
+
+## Checklist tra nhanh
+
+Checklist này không thay runbook của dịch vụ. Nếu một bước đòi hỏi quyền hoặc kiến thức ngoài phạm vi, dừng và gọi owner thay vì thử lệnh trên production.
+
+**Tiếp nhận và giới hạn ảnh hưởng**
+
+- [ ] Đã acknowledge, ghi thời điểm và xác nhận bằng nguồn độc lập.
+- [ ] Biết luồng nghiệp vụ, region, tenant hoặc version bị ảnh hưởng.
+- [ ] Đã kiểm tra rủi ro dữ liệu/security và escalation khi cần.
+- [ ] Có IC hoặc người điều phối rõ; mọi người dùng chung kênh và timeline.
+- [ ] Đã tạm dừng thay đổi không liên quan.
+
+**Khoanh vùng và giữ bằng chứng**
+
+- [ ] Biết request thất bại trước ứng dụng, trong ứng dụng hay ở dependency.
+- [ ] Đã xem traffic, lỗi, latency và saturation cùng nhau.
+- [ ] Có giả thuyết, phép thử phân biệt và nhóm đối chứng nếu có thể.
+- [ ] Đã ghi release/config, trạng thái và log liên quan trước restart.
+- [ ] Không thu thập hoặc chia sẻ credentials/dữ liệu riêng tư ngoài nơi được phép.
+
+**Mitigation**
+
+- [ ] Biết đối tượng thay đổi, kết quả mong đợi, điều kiện dừng và cách quay lại.
+- [ ] Rollback đã kiểm tra tương thích schema/config nếu được chọn.
+- [ ] Cô lập/restart đã xem capacity còn lại và công việc đang xử lý.
+- [ ] Scale đã kiểm tra ngân sách downstream; retry được kiểm soát.
+- [ ] Failover hoặc can thiệp dữ liệu có owner và runbook tương ứng.
+
+**Kiểm chứng và bàn giao**
+
+- [ ] Hành trình nghiệp vụ thực đã được kiểm tra bằng cơ chế an toàn.
+- [ ] Tín hiệu phục hồi giữ được dưới traffic thật và ở các nhóm từng bị lỗi.
+- [ ] Backlog, retry và giao dịch chưa rõ kết quả có kế hoạch xử lý.
+- [ ] Đã cập nhật stakeholder, ghi rủi ro còn lại và owner theo dõi.
+- [ ] Biện pháp tạm thời có điều kiện gỡ; postmortem và action item được lên lịch.
+
+## Tài liệu tham khảo và bài đọc tiếp
+
+Các tài liệu chính thức dưới đây giải thích cơ chế và nguyên tắc được dùng trong bài. Lệnh và quy trình can thiệp vẫn phải khớp version, quyền hạn và runbook của hệ thống bạn vận hành.
+
+- [Google SRE — Managing Incidents](https://sre.google/sre-book/managing-incidents/): phân vai, điều phối, timeline và bàn giao incident.
+- [Google SRE — Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/): overload, retry và cách lỗi lan giữa các thành phần.
+- [Kubernetes — Configure Liveness, Readiness and Startup Probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-probes/): hành vi probe và rủi ro cấu hình sai.
+- [Kubernetes — kubectl logs](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_logs/): chọn container, đọc log lần chạy trước và giới hạn output.
+- [curl — Manual](https://curl.se/docs/manpage.html): ý nghĩa của timeout, `--resolve`, `--write-out` và xử lý HTTP error.
+
+<Cards>
+  <Card title="Long-running transaction" href="/database/05-long-running-transaction/" description="Đi sâu vào thời gian giữ connection, lock và transaction boundary." />
+  <Card title="SSL và TLS" href="/security/02-ssl-tls/" description="Phân biệt thiết lập kết nối, xác thực certificate và mã hóa đường truyền." />
+</Cards>

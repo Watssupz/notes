@@ -1,0 +1,524 @@
+---
+title: "Độ phức tạp thuật toán: Big O, thời gian và bộ nhớ"
+description: "Học cách xác định kích thước đầu vào, đếm công việc, phân tích vòng lặp và đệ quy, rồi lựa chọn thuật toán theo time và space complexity."
+---
+
+Một đoạn code kiểm tra dữ liệu trùng có thể chạy ổn với 100 phần tử, nhưng trở nên quá chậm khi mảng có một triệu phần tử. Trước khi đổi máy hoặc tối ưu từng dòng, bạn cần nhìn vào cách lượng công việc tăng theo dữ liệu. So sánh mọi cặp phần tử và duyệt mảng một lần là hai cách giải cùng bài toán, nhưng chúng tăng chi phí rất khác nhau.
+
+Bài này đi từ việc đếm những thao tác cụ thể đến cách dùng Big O để mô tả tốc độ tăng trưởng. Sau đó, bạn sẽ áp dụng cùng một cách suy luận cho vòng lặp, binary search, đệ quy và bộ nhớ. Các ví dụ dùng JavaScript, nhưng cách phân tích áp dụng được cho những ngôn ngữ khác.
+
+<Callout type="info" title="Kiến thức cần có">
+Bạn chỉ cần đọc được hàm, mảng, vòng lặp và lời gọi đệ quy. Các con số trong bảng là số thao tác của mô hình minh họa, không phải kết quả benchmark hay thời gian chạy đo được.
+</Callout>
+
+## Mục lục
+
+- [Từ code đến mô hình chi phí](#từ-code-đến-mô-hình-chi-phí)
+  - [Xác định kích thước đầu vào](#xác-định-kích-thước-đầu-vào)
+  - [Chọn thao tác để đếm](#chọn-thao-tác-để-đếm)
+- [Big O và các ký hiệu tăng trưởng](#big-o-và-các-ký-hiệu-tăng-trưởng)
+  - [Cận trên và cận chặt](#cận-trên-và-cận-chặt)
+  - [Bỏ hệ số và số hạng nhỏ](#bỏ-hệ-số-và-số-hạng-nhỏ)
+- [Best case, worst case và average case](#best-case-worst-case-và-average-case)
+- [Các mức tăng trưởng thường gặp](#các-mức-tăng-trưởng-thường-gặp)
+- [Phân tích vòng lặp bằng tổng số lần chạy](#phân-tích-vòng-lặp-bằng-tổng-số-lần-chạy)
+  - [Các đoạn nối tiếp và hai đầu vào độc lập](#các-đoạn-nối-tiếp-và-hai-đầu-vào-độc-lập)
+  - [Vòng lặp tam giác](#vòng-lặp-tam-giác)
+  - [Vòng lặp giảm một nửa](#vòng-lặp-giảm-một-nửa)
+  - [Hai con trỏ không quay lại](#hai-con-trỏ-không-quay-lại)
+- [Binary search và chi phí chuẩn bị](#binary-search-và-chi-phí-chuẩn-bị)
+- [Đệ quy: đếm cả cây lời gọi](#đệ-quy-đếm-cả-cây-lời-gọi)
+  - [Chia đôi nhưng xử lý cả hai nửa](#chia-đôi-nhưng-xử-lý-cả-hai-nửa)
+  - [Lặp lại cùng một bài toán con](#lặp-lại-cùng-một-bài-toán-con)
+- [Amortized cost khác average case](#amortized-cost-khác-average-case)
+- [Space complexity và bộ nhớ sống đồng thời](#space-complexity-và-bộ-nhớ-sống-đồng-thời)
+  - [Input, output và auxiliary space](#input-output-và-auxiliary-space)
+  - [Call stack và bản sao dữ liệu](#call-stack-và-bản-sao-dữ-liệu)
+- [Một bài toán hoàn chỉnh: phát hiện phần tử trùng](#một-bài-toán-hoàn-chỉnh-phát-hiện-phần-tử-trùng)
+- [Kiểm chứng bằng bộ đếm thay vì đoán](#kiểm-chứng-bằng-bộ-đếm-thay-vì-đoán)
+- [Quy trình phân tích để dùng lại](#quy-trình-phân-tích-để-dùng-lại)
+
+## Từ code đến mô hình chi phí
+
+Giả sử bạn cần cộng các số trong một mảng:
+
+```javascript
+function sum(values) {
+  let total = 0;
+  for (let i = 0; i < values.length; i++) {
+    total += values[i];
+  }
+  return total;
+}
+```
+
+Mảng có 10 phần tử thì dòng cộng chạy 10 lần. Mảng có 1.000 phần tử thì dòng đó chạy 1.000 lần. Đặt `n = values.length`, bạn có thể viết số phép cộng là `A(n) = n`.
+
+**Time complexity mô tả lượng công việc tăng thế nào khi đầu vào lớn lên.** Nó không trực tiếp cho biết hàm mất bao nhiêu mili giây. Cùng một thuật toán vẫn có thời gian thực khác nhau trên hai máy, hai runtime hoặc hai cách bố trí dữ liệu trong bộ nhớ.
+
+### Xác định kích thước đầu vào
+
+Trong ví dụ trên, `n` là số phần tử. Với một hàm nhận hai mảng, bạn có thể cần `n` và `m` riêng biệt. Với đồ thị, thường dùng `V` cho số đỉnh và `E` cho số cạnh.
+
+| Đầu vào | Đại lượng nên nêu rõ |
+| --- | --- |
+| Một mảng | `n`: số phần tử |
+| Hai chuỗi | `n`, `m`: độ dài từng chuỗi |
+| Ma trận | `r`, `c`: số hàng và số cột |
+| Đồ thị dạng adjacency list | `V`, `E`: số đỉnh và số cạnh |
+| Số nguyên có độ dài tùy ý | `b`: số bit biểu diễn số đó |
+
+Đừng mặc định giá trị của một số chính là kích thước đầu vào. Số `1.000.000` chỉ cần khoảng 20 bit để biểu diễn. Một vòng lặp chạy từ 1 đến giá trị đó là tuyến tính theo **giá trị**, nhưng không tuyến tính theo **số bit** của đầu vào.
+
+### Chọn thao tác để đếm
+
+Với hàm `sum`, đếm phép cộng đủ để nhận ra tốc độ tăng trưởng. Nếu đếm thêm truy cập mảng, tăng biến và kiểm tra điều kiện, bạn sẽ nhận một biểu thức dạng `an + b`. Các hệ số thay đổi, nhưng số lần xử lý mỗi phần tử vẫn tỷ lệ với `n`.
+
+Trong bài này, mình dùng mô hình đơn giản: truy cập một phần tử mảng theo index, gán biến, cộng và so sánh số có kích thước cố định đều có chi phí hằng số. Mảng được giả định là mảng thông thường, không có getter hay proxy chạy thêm code khi truy cập.
+
+Giả định này cần được thay khi dữ liệu thay đổi. So sánh hai chuỗi dài có thể phải đọc nhiều ký tự. Cộng hai số nguyên tùy ý lớn phải xử lý nhiều bit. Khi phân tích code xử lý chuỗi hoặc `BigInt`, bạn cần tính cả những độ dài đó, không coi mọi toán tử là một thao tác hằng số.
+
+## Big O và các ký hiệu tăng trưởng
+
+### Cận trên và cận chặt
+
+Nếu lượng công việc là `T(n) = 3n + 7`, thì với `n >= 7` ta có:
+
+```text
+3n <= T(n) <= 4n
+```
+
+Từ một ngưỡng trở đi, `T(n)` bị kẹp giữa hai bội số cố định của `n`. Đây là cách nói chính xác rằng nó tăng tuyến tính.
+
+Ba ký hiệu thường dùng mô tả các kiểu giới hạn khác nhau:
+
+| Ký hiệu | Ý nghĩa | Với `T(n) = 3n + 7` |
+| --- | --- | --- |
+| `O(f(n))` | Cận trên: từ một ngưỡng trở đi, `T(n) <= c × f(n)` với một hằng số dương `c` | `T(n)` thuộc `O(n)` |
+| `Ω(f(n))` | Cận dưới: từ một ngưỡng trở đi, `T(n) >= c × f(n)` với một hằng số dương `c` | `T(n)` thuộc `Ω(n)` |
+| `Θ(f(n))` | Cận chặt: có cả cận trên và cận dưới cùng bậc | `T(n)` thuộc `Θ(n)` |
+
+Trong các định nghĩa này, hằng số và ngưỡng không được phụ thuộc vào `n`. Phân tích như vậy gọi là **phân tích tiệm cận**: tập trung vào xu hướng khi kích thước đầu vào đủ lớn.
+
+Về toán học, `3n + 7` cũng thuộc `O(n²)`. Cận trên đó đúng nhưng quá rộng, giống như nói một chuyến đi 5 km dài không quá 1.000 km. Khi mô tả một thuật toán, hãy tìm cận chặt nhất bạn chứng minh được. Bài này dùng `Θ` khi đã xác định được đúng bậc tăng trưởng; `O` dùng khi chỉ cần một bảo đảm cận trên.
+
+### Bỏ hệ số và số hạng nhỏ
+
+Nếu một thuật toán làm `2n² + 5n + 20` thao tác, số hạng `n²` quyết định bậc tăng trưởng. Khi `n` tăng gấp đôi, phần bậc hai tăng gấp bốn, còn phần tuyến tính chỉ tăng gấp đôi. Vì thế tổng có độ phức tạp `Θ(n²)`.
+
+Các phép rút gọn thường gặp:
+
+```text
+7n + 100           thuộc Θ(n)
+3n² + n           thuộc Θ(n²)
+n log₂(n) + n     thuộc Θ(n log n)
+50                thuộc Θ(1)
+```
+
+Bỏ hệ số **không có nghĩa hệ số không quan trọng trong thực tế**. Một cách làm `100n` thao tác có thể chậm hơn cách làm `n²` thao tác khi `n` nhỏ. Big O giúp chọn hướng tăng trưởng phù hợp; benchmark giúp chọn implementation phù hợp với dữ liệu và môi trường cụ thể.
+
+## Best case, worst case và average case
+
+Cùng kích thước mảng, vị trí phần tử cần tìm có thể làm số thao tác thay đổi:
+
+```javascript
+function indexOf(values, target) {
+  for (let i = 0; i < values.length; i++) {
+    if (values[i] === target) return i;
+  }
+  return -1;
+}
+```
+
+Nếu `target` nằm ở đầu mảng không rỗng, hàm chỉ cần một lần so sánh. Nếu nó nằm cuối hoặc không tồn tại, hàm cần `n` lần so sánh.
+
+- **Best case:** trường hợp ít công việc nhất trong các đầu vào cùng kích thước. Ở đây là `Θ(1)`.
+- **Worst case:** trường hợp nhiều công việc nhất trong các đầu vào cùng kích thước. Ở đây là `Θ(n)`.
+- **Average case:** chi phí kỳ vọng theo một mô hình xác suất được nêu rõ.
+
+Ví dụ, giả sử phần tử chắc chắn tồn tại và có xác suất bằng nhau ở mỗi vị trí. Số lần so sánh trung bình là `(1 + 2 + ... + n) / n = (n + 1) / 2`, nên average case vẫn là `Θ(n)`.
+
+Nếu không có giả định về phân bố dữ liệu, bạn chưa có cơ sở để kết luận average case. Khi không nói gì thêm, các phân tích vòng lặp trong bài sẽ xét worst case.
+
+<Callout type="warn" title="Big O không đồng nghĩa với worst case">
+Big O là ký hiệu cận trên, còn worst case là cách chọn trường hợp đầu vào. Bạn có thể mô tả cả best case lẫn worst case bằng Big O. Tương tự, `Ω` không tự động có nghĩa là best case.
+</Callout>
+
+## Các mức tăng trưởng thường gặp
+
+Bảng dưới thay trực tiếp `n = 8` và `n = 16` vào từng hàm. Đây là so sánh toán học, không khẳng định mọi thuật toán cùng bậc đều chạy đúng số thao tác trong bảng.
+
+| Bậc tăng trưởng | Tên thường gọi | `n = 8` | `n = 16` | Ví dụ điển hình |
+| --- | --- | ---: | ---: | --- |
+| `1` | Constant | 1 | 1 | Đọc một index hợp lệ |
+| `log₂ n` | Logarithmic | 3 | 4 | Thu hẹp khoảng tìm kiếm còn một nửa mỗi lượt |
+| `n` | Linear | 8 | 16 | Duyệt toàn bộ mảng một lần |
+| `n log₂ n` | Linearithmic | 24 | 64 | Merge sort với bước merge tuyến tính |
+| `n²` | Quadratic | 64 | 256 | Duyệt mọi cặp có thứ tự |
+| `2ⁿ` | Exponential | 256 | 65.536 | Liệt kê các tập con, chỉ tính số tập |
+| `n!` | Factorial | 40.320 | 20.922.789.888.000 | Liệt kê các hoán vị, chỉ tính số hoán vị |
+
+Logarithm xuất hiện khi bạn liên tục chia dữ liệu cho một hệ số cố định. Với `n = 1.024`, chia đôi 10 lần thì còn 1. Đổi cơ số log chỉ làm thay đổi một hệ số hằng, nên thường viết `O(log n)` thay vì ghi cơ số.
+
+Với một triệu phần tử, so sánh mỗi cặp khác nhau đã cần `n(n - 1) / 2`, tức gần 500 tỷ phép so sánh trong worst case. Đây là lý do nên xem xét thuật toán trước khi cố giảm vài phép gán.
+
+Một giới hạn khác đến từ kích thước kết quả. Có `2ⁿ` tập con của một tập `n` phần tử, nhưng nếu bạn tạo một mảng riêng cho từng tập con, tổng số phần tử phải ghi là `n × 2ⁿ⁻¹` với `n >= 1`. Khi đó việc ghi đầy đủ output đã tốn `Θ(n × 2ⁿ)` công việc. Chỉ đếm số kết quả chưa chắc đã đếm đủ chi phí tạo kết quả.
+
+## Phân tích vòng lặp bằng tổng số lần chạy
+
+Cách đáng tin cậy nhất là chọn một thao tác trong thân vòng lặp và đếm tổng số lần nó được thực hiện. Nhìn số lượng từ khóa `for` thôi chưa đủ.
+
+### Các đoạn nối tiếp và hai đầu vào độc lập
+
+Hai vòng lặp chạy lần lượt thì chi phí cộng lại:
+
+```javascript
+function sumBoth(left, right) {
+  let total = 0;
+  for (const value of left) total += value;
+  for (const value of right) total += value;
+  return total;
+}
+```
+
+Đặt `n = left.length`, `m = right.length`. Hàm làm `n + m` phép cộng, nên time là `Θ(n + m)` và auxiliary space là `Θ(1)` — phần bộ nhớ phụ ngoài input và output, sẽ được giải thích kỹ ở phần sau.
+
+Nếu hai vòng lặp lồng nhau và vòng trong luôn chạy hết `right`, mỗi phần tử của `left` đi với `m` phần tử của `right`. Tổng là `n × m`, nên time là `Θ(nm)` khi cả hai mảng không rỗng. Không nên rút thành `Θ(n²)` trừ khi đã biết quan hệ giữa `m` và `n`. Tính cả trường hợp mảng rỗng và chi phí điều khiển vòng ngoài, có thể ghi `Θ(1 + n + nm)` cho kiểu lặp đó.
+
+### Vòng lặp tam giác
+
+Để kiểm tra mỗi cặp index đúng một lần, vòng trong thường bắt đầu từ `i + 1`. Walkthrough dưới đây tách các bước đếm; nó không tự thực thi code.
+
+```code-walkthrough
+title: Đếm các cặp index khác nhau
+language: javascript
+snapshots:
+  - id: pairs
+    title: countPairs.js
+    code: |-
+      function countPairs(values) {
+        let count = 0;
+        for (let i = 0; i < values.length; i++) {
+          for (let j = i + 1; j < values.length; j++) {
+            count++;
+          }
+        }
+        return count;
+      }
+steps:
+  - id: outer
+    snapshot: pairs
+    title: Cố định index đầu tiên
+    description: Vòng ngoài chọn i từ 0 đến n - 1. Chưa thể nhân n với n vì số lượt của vòng trong phụ thuộc vào i.
+    ranges: [[3, 3]]
+  - id: inner
+    snapshot: pairs
+    title: Đếm những index còn lại
+    description: Với mỗi i, j chạy n - i - 1 lần. Khi n bằng 5, các lượt tương ứng là 4, 3, 2, 1 và 0.
+    ranges: [[4, 5]]
+  - id: total
+    snapshot: pairs
+    title: Cộng toàn bộ lượt chạy
+    description: count tăng tổng cộng n(n - 1)/2 lần. Cộng cả điều khiển vòng lặp, time vẫn là Θ(n²), còn bộ nhớ phụ là Θ(1).
+    ranges: [[3, 8]]
+```
+
+Tổng số lần tăng `count` là:
+
+```text
+(n - 1) + (n - 2) + ... + 1 + 0 = n(n - 1) / 2
+```
+
+Vòng trong ngắn dần, nhưng tổng vẫn chứa số hạng bậc hai. Việc chỉ xét nửa số cặp giảm hệ số, không đổi bậc tăng trưởng.
+
+### Vòng lặp giảm một nửa
+
+Một vòng lặp đơn như dưới đây chỉ có `Θ(log n)` lượt với số nguyên dương `n`:
+
+```javascript
+function halvingRounds(n) {
+  let rounds = 0;
+  for (let size = n; size > 1; size = Math.floor(size / 2)) {
+    rounds++;
+  }
+  return rounds;
+}
+```
+
+Với `n = 16`, các giá trị `size` đi vào thân vòng lặp là 16, 8, 4, 2. Sau 4 lượt, `size` bằng 1 và vòng lặp dừng.
+
+Nhưng thêm một vòng lặp bên trong không tự động biến nó thành `Θ(n log n)`:
+
+```javascript
+function shrinkingWork(n) {
+  let work = 0;
+  for (let size = n; size >= 1; size = Math.floor(size / 2)) {
+    for (let j = 0; j < size; j++) {
+      work++;
+    }
+  }
+  return work;
+}
+```
+
+Lần này số lượt của vòng trong là `n`, rồi khoảng `n/2`, rồi `n/4`. Với `n = 16`, tổng là `16 + 8 + 4 + 2 + 1 = 31`. Với mọi số nguyên dương `n`, tổng ít nhất là `n` và nhỏ hơn `2n`, nên time là `Θ(n)`.
+
+Ngược lại, nếu vòng trong luôn chạy `n` lần ở mỗi lượt chia đôi, tổng mới là `Θ(n log n)`. Điều quyết định là **tổng công việc qua các lượt**, không phải độ sâu lồng vòng lặp.
+
+### Hai con trỏ không quay lại
+
+Hai vòng lặp lồng nhau vẫn có thể chỉ duyệt mảng tuyến tính:
+
+```javascript
+// values đã tăng dần; trả về số giá trị phân biệt.
+function countDistinctSorted(values) {
+  let groups = 0;
+  let i = 0;
+  while (i < values.length) {
+    const current = values[i];
+    while (i < values.length && values[i] === current) {
+      i++;
+    }
+    groups++;
+  }
+  return groups;
+}
+```
+
+Biến `i` không được đặt lại khi bắt đầu một nhóm mới. Tổng cộng nó chỉ tăng từ 0 đến `n`, nên phần duyệt có time `Θ(n)` và auxiliary space `Θ(1)`. Phân tích này giả định các giá trị so sánh bằng nhau theo cách thông thường, chẳng hạn các số hữu hạn; `NaN` sẽ phá điều kiện tiến của ví dụ này.
+
+Đây cũng là cách suy luận cho nhiều thuật toán two pointers: đếm tổng số lần mỗi con trỏ tiến, thay vì nhân số lượt theo hình thức của code. Chi phí sắp xếp input, nếu cần, phải tính riêng.
+
+## Binary search và chi phí chuẩn bị
+
+Khi mảng đã sắp tăng dần, một phép so sánh ở giữa có thể loại bỏ gần nửa vùng còn lại:
+
+```javascript
+// values tăng dần, chứa các số hữu hạn.
+function binarySearch(values, target) {
+  let left = 0;
+  let right = values.length - 1;
+  while (left <= right) {
+    const mid = left + Math.floor((right - left) / 2);
+    if (values[mid] === target) return mid;
+    if (values[mid] < target) {
+      left = mid + 1;
+    } else {
+      right = mid - 1;
+    }
+  }
+  return -1;
+}
+```
+
+Sau `k` lượt, số ứng viên còn lại xấp xỉ `n / 2ᵏ`. Để thu hẹp xuống cỡ một phần tử, cần khoảng `log₂ n` lượt. Do đó worst-case time là `Θ(log n)` với `n` đủ lớn, best case là `Θ(1)`, và auxiliary space là `Θ(1)`.
+
+Phần `Θ(log n)` này chỉ tính **tìm kiếm trên dữ liệu đã sắp xếp**, với truy cập index hằng số. Nếu mảng chưa có thứ tự và bạn chọn một thuật toán sort `Θ(n log n)` trước, tổng cho một lần tìm là `Θ(n log n)`, không phải `Θ(log n)`.
+
+Mặc định, mình chọn linear search cho một lần tìm trên mảng chưa sắp xếp. Nếu có nhiều lần tìm trên dữ liệu ít thay đổi, chi phí sort có thể được dùng chung: với `q` lần tìm, cận trên tổng là `O(n log n + q log n)`, thay vì `O(qn)` khi duyệt lại từng lần. Việc tìm index theo thứ tự ban đầu hoặc cập nhật dữ liệu có thể đòi hỏi một cấu trúc khác; cần chốt yêu cầu trước khi chọn cách tiền xử lý.
+
+## Đệ quy: đếm cả cây lời gọi
+
+Một hàm có độ sâu đệ quy `log n` chưa chắc có time `log n`. Độ sâu cho biết số lời gọi nối tiếp trên một nhánh. Time phải tính công việc của **tất cả lời gọi**.
+
+### Chia đôi nhưng xử lý cả hai nửa
+
+Merge sort chia mảng thành hai nửa, sắp xếp cả hai, rồi merge — trộn hai dãy đã sắp thành một dãy có thứ tự. Sơ đồ sau minh họa các bài toán con với `n = 4`; cạnh biểu thị việc chia, không biểu thị các nhánh chạy song song.
+
+```d2 interactive=false title="Merge sort: chia bài toán 4 phần tử thành các bài toán con"
+direction: down
+root: "4 phần tử"
+left_half: "2 phần tử bên trái"
+right_half: "2 phần tử bên phải"
+a: "1 phần tử A"
+b: "1 phần tử B"
+c: "1 phần tử C"
+d: "1 phần tử D"
+root -> left_half: Chia
+root -> right_half: Chia
+left_half -> a
+left_half -> b
+right_half -> c
+right_half -> d
+```
+
+Bước merge diễn ra khi các lời gọi con trả về. Ở tầng hai bài toán kích thước 2, tổng lượng dữ liệu cần merge là 4 phần tử. Ở tầng gốc, merge lại xử lý 4 phần tử. Số bài toán tăng khi đi xuống, nhưng kích thước mỗi bài toán giảm tương ứng.
+
+Với `n` là lũy thừa của 2 để dễ tính, ta có công thức truy hồi — chi phí của bài toán lớn viết theo chi phí các bài toán nhỏ:
+
+```text
+T(n) = 2T(n/2) + Θ(n)
+T(1) = Θ(1)
+```
+
+Có `log₂ n` tầng merge, mỗi tầng có tổng công việc `Θ(n)`. Các lá cộng thêm `Θ(n)`, nên tổng time là `Θ(n log n)`. Làm tròn kích thước hai nửa khi `n` không phải lũy thừa của 2 không thay đổi kết luận này.
+
+So với binary search, điểm khác biệt nằm ở số nhánh cần xử lý: binary search đi tiếp một nửa, merge sort xử lý cả hai nửa. Đừng chỉ thấy “chia đôi” rồi kết luận `O(log n)`.
+
+### Lặp lại cùng một bài toán con
+
+Fibonacci đệ quy trực tiếp tạo hai lời gọi mới ở phần lớn các node:
+
+```javascript
+// n là số nguyên không âm; ví dụ để phân tích cây lời gọi.
+function fib(n) {
+  if (n < 2) return n;
+  return fib(n - 1) + fib(n - 2);
+}
+```
+
+Để tính `fib(5)`, nhánh `fib(4)` cần `fib(3)`, trong khi nhánh còn lại của gốc cũng gọi `fib(3)`. Những bài toán giống nhau bị tính lại. Khi `n` tăng, lượng công việc không chỉ tăng thêm một lời gọi.
+
+Công thức chi phí là `T(n) = T(n - 1) + T(n - 2) + Θ(1)`. Cận trên dễ dùng là `O(2ⁿ)`; cận chặt là `Θ(φⁿ)`, với `φ = (1 + √5) / 2`, xấp xỉ 1,618. Không nên gọi `Θ(2ⁿ)` là cận chặt của implementation này.
+
+Nếu dùng **memoization** — lưu kết quả của mỗi `fib(k)` để dùng lại — chỉ có `n + 1` trạng thái khác nhau. Trong mô hình phép cộng và tra cứu hằng số, time giảm còn `Θ(n)`. Memo và call stack đều có thể cần `Θ(n)` bộ nhớ. Bản lặp chỉ giữ hai giá trị gần nhất giảm bộ nhớ phụ xuống `Θ(1)` trong cùng mô hình đó.
+
+<Callout type="warn" title="Mô hình số học có giới hạn">
+JavaScript `Number` không biểu diễn chính xác mọi số nguyên lớn. Ví dụ Fibonacci ở đây dùng để phân tích lời gọi, không phải implementation cho kết quả chính xác với mọi `n`. Đổi sang `BigInt` giúp giữ tính chính xác, nhưng chi phí phép cộng và bộ nhớ của mỗi số tăng theo số bit; không còn được coi chúng là hằng số.
+</Callout>
+
+## Amortized cost khác average case
+
+Giả sử một dynamic array có capacity tăng gấp đôi mỗi khi đầy. Phần lớn lần thêm cuối chỉ ghi một phần tử. Nhưng khi hết chỗ, một lần thêm phải cấp vùng lớn hơn và chép lại các phần tử cũ.
+
+Một lần thêm riêng lẻ có thể tốn `Θ(k)` khi đang có `k` phần tử. Tuy nhiên, bắt đầu từ capacity 1, tổng số phần tử phải chép trong `n` lần thêm bị chặn bởi:
+
+```text
+1 + 2 + 4 + ... + 2^k < 2n
+```
+
+Cộng thêm `n` lần ghi phần tử mới, cả chuỗi thao tác có tổng time `Θ(n)`. Vì thế chi phí **amortized** của một lần thêm là `Θ(1)`: lấy tổng chi phí của chuỗi chia cho số thao tác, với bảo đảm cho mọi chuỗi hợp lệ trong mô hình tăng capacity này.
+
+Đây không phải average case. Phân tích trên không cần giả định input ngẫu nhiên hay sự kiện resize hiếm theo xác suất. Nó chỉ dựa vào quy tắc tăng capacity. Một lần thêm vẫn có thể bị chậm do resize, nên bảo đảm amortized không phải bảo đảm latency cho từng thao tác.
+
+Ví dụ này là mô hình dynamic array tăng gấp đôi, không phải cam kết rằng mọi JavaScript engine triển khai `Array.prototype.push` đúng theo quy tắc đó. Khi cần giới hạn latency, hãy kiểm tra implementation và đo trên runtime mục tiêu.
+
+## Space complexity và bộ nhớ sống đồng thời
+
+Time đếm công việc qua cả quá trình; space đếm lượng bộ nhớ cần tồn tại **đồng thời ở thời điểm cao nhất**. Một hàm có thể cấp phát nhiều lần mà vẫn có peak memory thấp hơn tổng lượng đã cấp phát.
+
+### Input, output và auxiliary space
+
+Ba phần cần phân biệt là input đã nhận, output phải tạo và auxiliary space — bộ nhớ tạm để chạy thuật toán. Nhiều tài liệu nói “space `O(1)`” nhưng ngầm chỉ tính auxiliary space, không tính input. Hãy ghi rõ quy ước khi kết luận.
+
+Hàm `sum` ở đầu bài chỉ giữ một vài biến, nên auxiliary space là `Θ(1)` trong mô hình số kích thước cố định. Mảng input vẫn chứa `n` phần tử; hàm không làm nó biến mất.
+
+Một hàm tạo prefix sums — mảng tổng từ đầu đến từng vị trí — phải giữ `n` phần tử kết quả:
+
+```javascript
+function prefixSums(values) {
+  const result = new Array(values.length);
+  let total = 0;
+  for (let i = 0; i < values.length; i++) {
+    total += values[i];
+    result[i] = total;
+  }
+  return result;
+}
+```
+
+Time là `Θ(n)`. Output space là `Θ(n)`, còn auxiliary space ngoài output là `Θ(1)`. Nếu tính toàn bộ bộ nhớ mới do hàm tạo ra, space là `Θ(n)`. Hai cách báo cáo đều có ích khi bạn nói rõ đang tính phần nào.
+
+### Call stack và bản sao dữ liệu
+
+Mỗi lời gọi đệ quy chưa hoàn tất thường cần một stack frame để giữ trạng thái. Một hàm đi từ `n` xuống `n - 1`, rồi xuống tiếp đến 0 có thể giữ `Θ(n)` frame cùng lúc, dù mỗi frame chỉ có vài biến.
+
+Ngược lại, một cây lời gọi có rất nhiều node chưa chắc cần giữ tất cả node cùng lúc. Fibonacci trực tiếp ở trên có time exponential nhưng độ sâu lớn nhất chỉ là `Θ(n)`. Với cách thực thi depth-first thông thường, auxiliary space cho call stack là `Θ(n)`, không phải `Θ(2ⁿ)`.
+
+Với merge sort kiểu mảng thông dụng, dùng chung một buffer cho merge sẽ cần `Θ(n)` buffer và `Θ(log n)` stack. Tổng auxiliary space là `Θ(n)`. Các implementation merge sort khác có thể có chi phí khác, nên luôn gắn kết luận với cách cài đặt.
+
+Một bẫy thường gặp là thêm bản sao dữ liệu mà không tính chi phí. Nếu mỗi bước binary search dùng `slice()` để tạo nửa mảng mới, riêng lượt đầu đã có thể chép khoảng `n/2` phần tử. Trong mô hình sao chép thông thường, tổng lượng chép qua các lượt là `Θ(n)`, không còn time `Θ(log n)` như bản dùng hai index. Các bản sao cũng có thể chiếm `Θ(n)` bộ nhớ phụ.
+
+Mặc định, mình dùng khoảng index cho thuật toán chỉ cần đọc từng vùng của mảng. Cách đó tránh cấp phát không cần thiết. Đừng giả định runtime sẽ tối ưu bỏ các bản sao hoặc các frame đệ quy nếu chưa có bảo đảm cụ thể.
+
+## Một bài toán hoàn chỉnh: phát hiện phần tử trùng
+
+Giả sử input là mảng số hữu hạn, không có `NaN`, và yêu cầu chỉ là trả về có phần tử trùng hay không. Bạn không được thay đổi input.
+
+Cách trực tiếp so sánh mỗi phần tử với các phần tử đứng sau:
+
+```javascript
+function hasDuplicatePairs(values) {
+  for (let i = 0; i < values.length; i++) {
+    for (let j = i + 1; j < values.length; j++) {
+      if (values[i] === values[j]) return true;
+    }
+  }
+  return false;
+}
+```
+
+Nếu mảng không có phần tử trùng, hàm phải xét đủ `n(n - 1) / 2` cặp: worst-case time `Θ(n²)`, auxiliary space `Θ(1)`. Nếu hai phần tử đầu đã bằng nhau, hàm có thể dừng ngay. Không nên dùng trường hợp dừng sớm đó để mô tả khả năng xử lý mọi input lớn.
+
+Một lựa chọn khác là ghi nhớ các giá trị đã gặp:
+
+```javascript
+function hasDuplicateSet(values) {
+  const seen = new Set();
+  for (const value of values) {
+    if (seen.has(value)) return true;
+    seen.add(value);
+  }
+  return false;
+}
+```
+
+Mỗi lượt kiểm tra `value` đã xuất hiện chưa, rồi mới thêm vào `seen`. Với input `[4, 7, 4]`, hai lượt đầu thêm 4 và 7; lượt thứ ba phát hiện 4 đã có và trả về `true`.
+
+Trong mô hình hash set có chi phí kỳ vọng `O(1)` cho tra cứu và thêm, cả hàm có expected time `Θ(n)` khi không có phần tử trùng. Đổi lại, nó giữ tối đa `n` giá trị nên worst-case auxiliary space là `Θ(n)`. Kết luận tuyến tính này phụ thuộc vào mô hình hash set; JavaScript `Set` không có cam kết ngôn ngữ rằng mọi thao tác luôn là worst-case `O(1)`.
+
+| Cách làm | Time khi phải kiểm tra hết | Auxiliary space | Đổi input |
+| --- | --- | --- | --- |
+| So sánh từng cặp | `Θ(n²)` | `Θ(1)` | Không |
+| Dùng hash set | Expected `Θ(n)` theo giả định trên | `Θ(n)` | Không |
+| Sort bản sao rồi xét hai phần tử kề nhau | `Θ(n log n)` nếu dùng sort có cận đó | `Θ(n)` cho bản sao, cộng bộ nhớ của sort | Không |
+
+Đừng gắn hàng cuối với mọi lời gọi `.sort()` rồi mặc định có cùng bảo đảm time/space; chi phí cụ thể còn phụ thuộc thuật toán sort và comparator. Nếu được phép sửa input, bạn có thể bỏ bản sao, nhưng bộ nhớ làm việc của sort vẫn cần được tính.
+
+Với yêu cầu trên, mình chọn `Set` làm mặc định khi bộ nhớ cho phép. Cách so sánh từng cặp vẫn hợp lý cho input nhỏ hoặc khi không thể dùng thêm bộ nhớ. Nếu dữ liệu đã sắp xếp, chỉ cần duyệt các cặp kề nhau với time `Θ(n)` và auxiliary space `Θ(1)`, không cần dựng thêm `Set`.
+
+## Kiểm chứng bằng bộ đếm thay vì đoán
+
+Đo thời gian bằng đồng hồ có thể bị nhiễu bởi JIT, garbage collection và tải của máy. Để kiểm tra lập luận về số lượt chạy, trước hết hãy đếm đúng thao tác bạn đang phân tích.
+
+Sau khi đặt các hàm `countPairs`, `halvingRounds` và `shrinkingWork` ở trên vào cùng một file JavaScript, bạn có thể chạy đoạn sau bằng Node.js:
+
+```javascript
+for (const n of [8, 16, 32]) {
+  const pairs = countPairs(new Array(n));
+  const rounds = halvingRounds(n);
+  const shrinking = shrinkingWork(n);
+
+  console.assert(pairs === n * (n - 1) / 2);
+  console.assert(rounds === Math.log2(n)); // n là lũy thừa của 2.
+  console.assert(shrinking === 2 * n - 1);
+  console.log({ n, pairs, rounds, shrinking });
+}
+```
+
+Kết quả theo các công thức trên:
+
+| `n` | `pairs` | `rounds` | `shrinking` |
+| ---: | ---: | ---: | ---: |
+| 8 | 28 | 3 | 15 |
+| 16 | 120 | 4 | 31 |
+| 32 | 496 | 5 | 63 |
+
+Khi `n` tăng gấp đôi, số cặp tiến gần mức tăng gấp bốn, số lượt chia đôi chỉ tăng thêm 1, còn tổng công việc giảm dần tiến gần mức tăng gấp hai. Bộ đếm làm rõ sự khác nhau mà không cần quy đổi sang mili giây.
+
+Các test hữu hạn giúp phát hiện sai sót trong code và công thức; chúng không chứng minh được cận tiệm cận cho mọi kích thước. Phần chứng minh vẫn dựa vào tổng số lượt chạy và giả định về thao tác. Sau đó, nếu cần chọn implementation cho production, hãy benchmark bằng dữ liệu đại diện và đo cả thời gian lẫn peak memory.
+
+## Quy trình phân tích để dùng lại
+
+Với một đoạn code mới, bạn có thể làm theo thứ tự này:
+
+1. **Chốt input và điều kiện ban đầu.** Ghi `n`, `m` là gì, dữ liệu đã có thứ tự chưa và có được thay đổi input không.
+2. **Chọn mô hình chi phí.** Nêu rõ phép so sánh, hash, sao chép hoặc tính toán số lớn có được coi là hằng số không.
+3. **Chọn trường hợp.** Thường bắt đầu với worst case; chỉ kết luận average/expected khi có giả định phù hợp.
+4. **Đếm công việc thực.** Cộng các đoạn nối tiếp, lập tổng cho vòng lặp phụ thuộc nhau, và tính toàn bộ cây lời gọi đệ quy.
+5. **Rút gọn sau khi đã đếm.** Bỏ hệ số và số hạng thấp hơn; dùng `Θ` khi đã có cận chặt.
+6. **Tính space riêng.** Tách input, output, cấu trúc tạm, bản sao và số stack frame sống đồng thời.
+7. **Tính cả workflow.** Đừng bỏ quên sort, dựng index hoặc chuẩn bị dữ liệu trước thao tác chính.
+8. **Kiểm tra bằng ví dụ và bộ đếm.** Dùng input rỗng, một phần tử, không tìm thấy, nhiều phần tử giống nhau và dữ liệu lớn hơn.
+
+Để luyện tiếp ngay trên bài này, hãy viết bản Fibonacci lặp chỉ giữ hai giá trị gần nhất, rồi giải thích time và auxiliary space trong mô hình số kích thước cố định. Sau đó sửa bài phát hiện phần tử trùng để trả về **mọi giá trị trùng** thay vì một boolean. Yêu cầu output mới sẽ buộc bạn tính lại cả tính đúng lẫn bộ nhớ, chứ không chỉ thay dòng `return`.

@@ -1,0 +1,285 @@
+---
+title: "SQL và NoSQL: chọn database từ invariant và access pattern"
+description: "So sánh relational, document, key-value, wide-column và graph theo data model, transaction, consistency, scale, query, chi phí và khả năng thay đổi."
+---
+
+Giả sử bạn đang thiết kế hệ thống bán hàng. Tạo đơn phải giữ đúng giá, tồn kho và thanh toán; màn hình tìm kiếm lại muốn lọc rất nhiều thuộc tính với response nhanh. Chọn một database bằng câu “SQL nhất quán, NoSQL dễ scale” không giúp giải quyết hai nhu cầu cụ thể đó.
+
+Bài này đi từ dữ liệu cần bảo vệ đến đường đọc/ghi, rồi mới chọn engine. Bạn cần biết table, row và transaction ở mức cơ bản. Mình dùng order/catalog để nối các khái niệm với nhau; không giả định một sản phẩm luôn tốt hơn mọi sản phẩm thuộc nhóm còn lại.
+
+## Mục lục
+
+- [Bắt đầu bằng invariant và access pattern](#bắt-đầu-bằng-invariant-và-access-pattern)
+- [SQL và NoSQL là cách phân nhóm chưa đủ để chọn engine](#sql-và-nosql-là-cách-phân-nhóm-chưa-đủ-để-chọn-engine)
+  - [Relational database tổ chức fact và quan hệ](#relational-database-tổ-chức-fact-và-quan-hệ)
+  - [NoSQL gồm nhiều model khác nhau](#nosql-gồm-nhiều-model-khác-nhau)
+- [Normalize và denormalize là hai lựa chọn đặt chi phí](#normalize-và-denormalize-là-hai-lựa-chọn-đặt-chi-phí)
+  - [Normalize giảm việc lưu cùng một fact ở nhiều nơi](#normalize-giảm-việc-lưu-cùng-một-fact-ở-nhiều-nơi)
+  - [Denormalize đổi chi phí read thành chi phí write và đồng bộ](#denormalize-đổi-chi-phí-read-thành-chi-phí-write-và-đồng-bộ)
+- [Transaction và ACID phải gắn với phạm vi cụ thể](#transaction-và-acid-phải-gắn-với-phạm-vi-cụ-thể)
+  - [Bốn thuộc tính bảo vệ những việc khác nhau](#bốn-thuộc-tính-bảo-vệ-những-việc-khác-nhau)
+  - [Multi-document và distributed transaction có giá riêng](#multi-document-và-distributed-transaction-có-giá-riêng)
+- [Consistency: dữ liệu mới nhất đối với thao tác nào](#consistency-dữ-liệu-mới-nhất-đối-với-thao-tác-nào)
+  - [Replica có thể trả dữ liệu cũ ở cả hai nhóm database](#replica-có-thể-trả-dữ-liệu-cũ-ở-cả-hai-nhóm-database)
+  - [CAP mô tả hành vi khi network partition](#cap-mô-tả-hành-vi-khi-network-partition)
+- [Query, index và schema evolution](#query-index-và-schema-evolution)
+  - [Query mới có thể thay đổi toàn bộ chi phí](#query-mới-có-thể-thay-đổi-toàn-bộ-chi-phí)
+  - [Flexible schema không xóa migration](#flexible-schema-không-xóa-migration)
+  - [PostgreSQL JSONB và document database](#postgresql-jsonb-và-document-database)
+- [Scale: tách read capacity, write capacity và placement](#scale-tách-read-capacity-write-capacity-và-placement)
+  - [Replica và cache không làm write capacity tăng tương ứng](#replica-và-cache-không-làm-write-capacity-tăng-tương-ứng)
+  - [Partition key quyết định locality và hotspot](#partition-key-quyết-định-locality-và-hotspot)
+- [Source of truth và read model có thể dùng công cụ khác nhau](#source-of-truth-và-read-model-có-thể-dùng-công-cụ-khác-nhau)
+- [Đánh giá theo tình huống cụ thể](#đánh-giá-theo-tình-huống-cụ-thể)
+- [Chi phí vận hành và khả năng thay đổi](#chi-phí-vận-hành-và-khả-năng-thay-đổi)
+- [Quy trình chọn và nghiệm thu database](#quy-trình-chọn-và-nghiệm-thu-database)
+- [Tài liệu tham khảo và bài liên quan](#tài-liệu-tham-khảo-và-bài-liên-quan)
+
+## Bắt đầu bằng invariant và access pattern
+
+**Invariant** là quy tắc luôn phải đúng sau một thao tác nghiệp vụ. Ví dụ, không được có hai đơn cùng mã trong một tenant; số tiền thanh toán không được âm; một lượt giữ tồn kho không được làm available stock xuống dưới zero.
+
+**Access pattern** là cách application đọc hoặc ghi dữ liệu. “Lấy 20 đơn gần nhất của khách hàng”, “tìm đơn theo mã” và “tổng hợp doanh thu theo ngày” là ba access patterns khác nhau. Mỗi pattern tạo yêu cầu riêng cho key, index, sort và transaction.
+
+Hãy viết chúng thành bảng trước khi chọn database:
+
+| Thao tác | Dữ liệu chạm tới | Điều phải bảo vệ | Độ mới cần thiết |
+| --- | --- | --- | --- |
+| Tạo đơn | Order, items, inventory reservation | Không oversell theo contract | Đúng tại write boundary |
+| Lịch sử đơn | Đơn của một customer | Không lộ tenant khác | Có thể cho phép lag được định nghĩa |
+| Tìm sản phẩm | Catalog, thuộc tính tìm kiếm | Kết quả đúng quyền xem | Stale theo SLO tìm kiếm |
+| Xác nhận payment | Payment, order state | Không ghi nhận cùng giao dịch hai lần | Không quyết định từ projection cũ |
+
+Một thiết kế tốt phải nói rõ **thao tác nào atomic trong boundary nào**. Chỉ ghi “database có ACID” chưa chứng minh mọi thao tác trong toàn hệ thống cùng nằm trong một transaction.
+
+## SQL và NoSQL là cách phân nhóm chưa đủ để chọn engine
+
+### Relational database tổ chức fact và quan hệ
+
+Relational model biểu diễn dữ liệu bằng các relation, thường thấy dưới dạng table. Primary key nhận diện row; foreign key giữ quan hệ tham chiếu; constraint giúp database từ chối state không hợp lệ. SQL là ngôn ngữ truy vấn, không phải tên của một topology triển khai.
+
+PostgreSQL và MySQL là ví dụ phổ biến. Một số distributed SQL database cũng dùng relational model nhưng có kiến trúc phân tán khác hẳn một PostgreSQL primary đơn. Vì vậy, “SQL” không đồng nghĩa “chỉ có một server”.
+
+### NoSQL gồm nhiều model khác nhau
+
+| Model | Cách đọc/ghi thường gặp | Ví dụ sản phẩm | Điều cần thiết kế kỹ |
+| --- | --- | --- | --- |
+| Document | Đọc/ghi document, query theo fields | MongoDB | Document boundary, index, transaction scope |
+| Key-value | Lookup theo key | Redis, DynamoDB ở nhiều access patterns | Key design, item size, hot key, conditional write |
+| Wide-column | Partition key và dữ liệu sắp xếp trong partition | Cassandra | Query-first modeling, partition size, consistency |
+| Graph | Đi qua cạnh và đỉnh | Neo4j | Traversal, relationship density, query cost |
+| Search index | Inverted index, relevance và aggregation | Elasticsearch/OpenSearch | Derived data, freshness, mapping và rebuild |
+
+Các nhóm có thể giao nhau; DynamoDB không chỉ là cache key-value, Redis không chỉ là plain string cache. Search engine cũng không nên mặc nhiên trở thành source of truth cho order/payment chỉ vì nó tìm kiếm thuận tiện.
+
+Không phải NoSQL nào cũng eventual-only hoặc không có transaction. Không phải relational database nào cũng cung cấp cùng isolation, distributed transaction hay scaling model. Sau bước phân nhóm, phải đọc guarantee của engine, version và cấu hình cụ thể.
+
+## Normalize và denormalize là hai lựa chọn đặt chi phí
+
+### Normalize giảm việc lưu cùng một fact ở nhiều nơi
+
+Với order, dữ liệu customer hiện tại và các dòng hàng có thể ở bảng riêng:
+
+```sql
+CREATE TABLE customers (
+    id bigint PRIMARY KEY,
+    email text NOT NULL UNIQUE
+);
+
+CREATE TABLE orders (
+    id bigint PRIMARY KEY,
+    customer_id bigint NOT NULL REFERENCES customers(id),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE order_items (
+    order_id bigint NOT NULL REFERENCES orders(id),
+    line_no integer NOT NULL,
+    product_id bigint NOT NULL,
+    quantity integer NOT NULL CHECK (quantity > 0),
+    unit_price numeric(12, 2) NOT NULL CHECK (unit_price >= 0),
+    PRIMARY KEY (order_id, line_no)
+);
+```
+
+Đây là schema lab tối giản, chưa gồm tenant, currency, payment hay inventory. `unit_price` trong order item là giá đã chốt lúc mua, không phải bản sao cần tự đồng bộ với giá catalog hiện tại. Hai field nhìn giống nhau nhưng có thể biểu diễn hai fact nghiệp vụ khác nhau.
+
+Normalize hữu ích khi nhiều thao tác cùng dùng các quan hệ và cần cập nhật fact tại một nơi. Đổi lại, read có thể phải join. Join không mặc nhiên chậm: chi phí phụ thuộc cardinality, index, query plan và lượng dữ liệu phải đọc.
+
+### Denormalize đổi chi phí read thành chi phí write và đồng bộ
+
+Một read document có thể giữ sẵn customer display name và tổng tiền để trả lịch sử đơn mà không join nhiều bảng:
+
+```json
+{
+  "orderId": 456,
+  "customerId": 123,
+  "customerDisplayName": "Demo Customer",
+  "totalAmount": "125000.00",
+  "currency": "VND",
+  "sourceVersion": 7
+}
+```
+
+Phải chốt display name là snapshot lúc đặt hàng hay tên hiện tại. Nếu là snapshot, giữ nguyên khi customer đổi tên có thể hoàn toàn đúng. Nếu phải hiển thị tên hiện tại, hệ thống cần cơ chế cập nhật các bản sao hoặc đổi cách đọc.
+
+Denormalization không riêng NoSQL: relational database cũng có thể dùng bảng tổng hợp, materialized view hay cột snapshot. Document database cũng có references thay vì embed mọi thứ. Chọn vị trí lưu fact theo boundary và query, không theo một khẩu hiệu normalize-first/query-first tuyệt đối.
+
+## Transaction và ACID phải gắn với phạm vi cụ thể
+
+### Bốn thuộc tính bảo vệ những việc khác nhau
+
+| Thuộc tính | Ý nghĩa qua ví dụ tạo đơn |
+| --- | --- |
+| Atomicity | Các thay đổi thuộc cùng transaction commit cùng nhau hoặc rollback |
+| Consistency | State tuân thủ các constraint và quy tắc được thực thi đúng |
+| Isolation | Concurrent transactions tương tác theo guarantee của isolation level |
+| Durability | Commit được giữ theo guarantee recovery/durability đã cấu hình |
+
+Chữ C trong ACID không phải chữ C của CAP và không tự chứng minh mọi business invariant đúng. Nếu code không kiểm tra quy tắc hoặc transaction không bao trọn boundary cần bảo vệ, database không tự đoán ra nghiệp vụ.
+
+Ví dụ, một atomic conditional update có thể giữ tồn kho không âm trong một row:
+
+```sql
+UPDATE inventory
+SET available = available - 1
+WHERE product_id = :product_id AND available >= 1;
+```
+
+Caller phải kiểm tra affected rows. Nếu không có row thay đổi, không được tiếp tục coi reservation thành công. Khi thao tác còn ghi order hoặc nhiều sản phẩm, transaction và lock/version protocol phải bao trọn invariant tương ứng.
+
+### Multi-document và distributed transaction có giá riêng
+
+Document database có thể hỗ trợ transaction nhiều document. DynamoDB có transactional APIs với phạm vi và giới hạn được tài liệu hóa. Sự tồn tại của API không làm cross-partition coordination miễn phí; latency, throughput và giới hạn cần được kiểm chứng theo engine.
+
+Tương tự, một relational transaction trong database không bao gồm HTTP call tới payment provider. Nếu provider đã charge rồi transaction local rollback, tiền không tự quay lại. Đây là workflow liên hệ thống, thường cần idempotency, state machine và reconciliation; lựa chọn SQL hay NoSQL không loại bỏ bài toán đó.
+
+## Consistency: dữ liệu mới nhất đối với thao tác nào
+
+### Replica có thể trả dữ liệu cũ ở cả hai nhóm database
+
+User tạo đơn rồi đọc từ một replica chưa bắt kịp có thể không thấy đơn mới. Điều này có thể xảy ra với relational database dùng async read replica, không chỉ NoSQL.
+
+**Read-your-write** là kỳ vọng một client nhìn thấy thay đổi vừa được chính nó ghi. Có thể đáp ứng bằng đọc primary, session/version token hoặc chờ replica đủ mới nếu engine hỗ trợ. Mỗi cách có cost và failure behavior riêng.
+
+**Eventual consistency** là guarantee hội tụ khi các điều kiện của hệ thống được đáp ứng, không phải lời hứa “dù mất event hay projector hỏng thì dữ liệu sẽ tự đúng”. Với derived data, cần pipeline đáng tin cậy, freshness SLO và cách repair khi lệch.
+
+### CAP mô tả hành vi khi network partition
+
+**Network partition** là tình huống các node không trao đổi được với nhau dù một số node vẫn chạy. CAP cho thấy không thể đồng thời giữ linearizable consistency và availability theo định nghĩa của định lý trong mọi trường hợp partition.
+
+Linearizability là guarantee thao tác nhìn như xảy ra tức thời tại một điểm giữa lúc gọi và lúc nhận kết quả, có tôn trọng thứ tự thời gian thực. Nó khác “mọi replica thường chỉ lag một chút”. Availability trong CAP cũng không đồng nghĩa một tỷ lệ uptime marketing.
+
+Ví dụ, hai vùng mất liên lạc nhưng cùng nhận ghi vào một inventory chung. Nếu cả hai đều chấp nhận bán số lượng cuối cùng, invariant có thể bị phá. Nếu một bên từ chối để giữ một writer hợp lệ, một số request sẽ không được phục vụ trong partition.
+
+Không dùng bảng “SQL = CP, NoSQL = AP”. Hãy chọn guarantee cho thao tác và cấu hình cụ thể. Khi hệ thống hoạt động bình thường, latency và coordination vẫn có trade-off riêng nhưng không nên gọi mọi độ trễ xuyên vùng là một tình huống CAP.
+
+## Query, index và schema evolution
+
+### Query mới có thể thay đổi toàn bộ chi phí
+
+Một bảng Cassandra hoặc collection DynamoDB được thiết kế để lấy lịch sử theo `customer_id` có thể không hỗ trợ tốt truy vấn “tất cả payment failed theo country trong 30 ngày”. Bạn có thể cần index, projection hoặc pipeline khác thay vì scan toàn bộ dữ liệu.
+
+Trong relational database, SQL linh hoạt hơn với nhiều tổ hợp join/filter, nhưng query hợp lệ không đồng nghĩa query rẻ. Nếu filter không có index phù hợp, dữ liệu quá lớn hoặc statistics sai, query vẫn tốn nhiều I/O và CPU.
+
+Mình ưu tiên relational database khi access patterns còn thay đổi nhiều và dữ liệu có nhiều quan hệ. Với workload ổn định, lookup theo key và scale phân vùng rõ, một NoSQL engine phù hợp có thể làm đường đọc đơn giản hơn. Quyết định cần gắn với query thật và execution evidence.
+
+### Flexible schema không xóa migration
+
+Giả sử document cũ có `fullName`, document mới tách thành `givenName` và `familyName`. Reader mới vẫn phải hiểu dữ liệu cũ; backfill phải chạy có checkpoint; các writer cũ trong rolling deployment không được ghi ngược schema.
+
+Đó vẫn là migration, dù không có `ALTER TABLE`. Cần schema version, validation, compatibility window và cách phát hiện document sai. Relational database cũng có thể làm expand-and-contract: thêm field tương thích, triển khai reader/writer, backfill rồi mới bỏ field cũ.
+
+### PostgreSQL JSONB và document database
+
+JSONB hữu ích cho phần thuộc tính linh hoạt trong một relational model. Bạn có thể giữ order/customer constraints ở cột quan hệ và một phần catalog attributes trong JSONB. Tuy nhiên, vẫn phải thiết kế index, validation và update semantics cho JSON payload.
+
+Document database phù hợp khi document là boundary tự nhiên, access patterns và ecosystem của nó đem lại lợi ích cụ thể. Đừng chọn chỉ vì payload của API là JSON: định dạng HTTP không quyết định database model.
+
+## Scale: tách read capacity, write capacity và placement
+
+### Replica và cache không làm write capacity tăng tương ứng
+
+Read replica tăng khả năng phục vụ một số query đọc. Cache giảm việc đọc lặp lại. Cả hai không tự chia được lock contention của một hot row hay dung lượng ghi của primary.
+
+Vertical scaling có thể tăng tài nguyên một node. Partitioning trong cùng database có thể giúp quản lý hoặc truy vấn theo phạm vi, nhưng không mặc nhiên chia write qua nhiều máy. Sharding mới thay đổi nơi sở hữu dữ liệu trên nhiều node và kéo theo routing, rebalance cùng cross-shard semantics.
+
+### Partition key quyết định locality và hotspot
+
+Nếu mọi message của một user nằm trong cùng partition, lấy lịch sử của user đó có thể thuận tiện. Nhưng một user cực lớn có thể làm partition quá to hoặc quá nóng. Nếu chọn key quá rải, query lịch sử lại phải fan-out tới nhiều nơi.
+
+Một partition key cần được đánh giá theo số lượng giá trị khác nhau, phân bố bytes, QPS, growth và transaction boundary. Hash đều số key không có nghĩa tải đều: một key nhận phần lớn traffic vẫn là hot key.
+
+Không chọn sharding vì một bảng đạt đúng một số row cố định. Record size, index, write rate, hardware và SLO mới quyết định giới hạn thực tế. Các distributed SQL và NoSQL engine cũng khác nhau về replica placement, resharding và giao dịch; cần thử đúng engine dự kiến vận hành.
+
+## Source of truth và read model có thể dùng công cụ khác nhau
+
+**Read model** là dữ liệu được tổ chức lại để phục vụ query cụ thể. Ví dụ, PostgreSQL giữ order chính, còn search index giữ bản sao các field cần cho admin tìm kiếm. Search index có thể rebuild; order chính không được phụ thuộc vào việc search đã bắt kịp.
+
+```d2 title="Giữ dữ liệu nghiệp vụ và dựng read model riêng" interactive=false
+direction: right
+api: "Order API"
+db: "PostgreSQL và Outbox" {
+  shape: cylinder
+  icon: /interview-question/postgresql.svg
+}
+relay: "Relay"
+projector: "Idempotent projector"
+search: "Search read model" {shape: cylinder}
+api -> db: "Business transaction"
+db -> relay: "Event đã commit"
+relay -> projector
+projector -> search
+```
+
+Outbox là record cần phát được ghi cùng transaction với business state. Relay gửi nó đi; projector cập nhật read model. Vì message có thể được gửi lại, projector phải idempotent — xử lý trùng không làm sai kết quả.
+
+Thêm một database thứ hai đồng nghĩa thêm backup, monitoring, credentials, schema contracts, lag và recovery. Đây là **polyglot persistence**, dùng nhiều công nghệ lưu trữ theo workload. Nó đáng làm khi lợi ích query/scale lớn hơn chi phí sở hữu; không phải mặc định mỗi microservice cần một engine khác.
+
+## Đánh giá theo tình huống cụ thể
+
+| Workload | Điểm xuất phát hợp lý | Điều cần kiểm chứng trước khi chốt |
+| --- | --- | --- |
+| Order/payment có nhiều quan hệ | Relational source of truth | Constraint, transaction boundary, concurrent updates |
+| Session hoặc cache response | Redis/Valkey hoặc Memcached tùy nhu cầu | Expiry, eviction, node loss, dữ liệu có thể dựng lại không |
+| Catalog nhiều thuộc tính | Relational + JSONB hoặc document model | Query/index thực tế, validation và migration |
+| Chat message theo hội thoại | Relational hoặc partitioned key-based store | Hot conversation, ordering, retention, pagination |
+| Search nhiều tiêu chí | Search index làm read model | Freshness, quyền truy cập và rebuild |
+| Analytics dài hạn | Warehouse/analytical storage | Ingestion, lateness, scan cost và tách tải online |
+| Quan hệ nhiều tầng | Relational hoặc graph database | Traversal depth, fan-out và consistency |
+
+Đây là điểm bắt đầu để thử, không phải mapping duy nhất đúng. Một relational database có thể đủ cho chat; một NoSQL engine có transaction phù hợp có thể đáp ứng một phần order workflow. Cần chứng minh guarantee cho workload cụ thể thay vì quyết định theo nhãn.
+
+## Chi phí vận hành và khả năng thay đổi
+
+Chi phí gồm nhiều hơn storage: compute, I/O, index, replication, backup, egress, on-call và thời gian phát triển query mới. Denormalize có thể giảm read latency nhưng tăng write amplification — một thay đổi gốc phải cập nhật nhiều bản sao/index.
+
+Storage rẻ hơn không khiến consistency và đồng bộ miễn phí. Ngược lại, normalize mọi thứ đến mức query quan trọng luôn join rất nhiều dữ liệu cũng có thể đắt. Hãy so tổng chi phí của các read/write paths thực tế, kể cả backfill, repair và incident recovery.
+
+Nếu team vận hành PostgreSQL tốt nhưng chưa có kinh nghiệm Cassandra, chi phí học và trực sự cố là một phần quyết định. Không nên dùng nó để từ chối mọi công nghệ mới, nhưng cũng không bỏ qua khi tính lợi ích throughput trên giấy.
+
+## Quy trình chọn và nghiệm thu database
+
+1. Viết invariant, các thao tác đọc/ghi quan trọng và consistency boundary.
+2. Thu thập query shapes, dataset size, item size, traffic skew và tăng trưởng.
+3. Chọn một source of truth đơn giản nhất đáp ứng contract; với nghiệp vụ nhiều quan hệ và query còn biến động, mình thường bắt đầu bằng relational database.
+4. Làm prototype với schema/index thật, không chỉ `GET` một key trong benchmark.
+5. Thử concurrency, duplicate, node loss, replica lag, restore và migration.
+6. Chỉ thêm engine khác cho query hoặc capacity problem đã có bằng chứng.
+
+Nghiệm thu phải gồm cả dữ liệu cuối cùng và hành vi khi lỗi. Một engine đạt latency tốt nhưng làm mất write đã cam kết hoặc không restore được chưa đáp ứng yêu cầu. Ghi lại những guarantee phụ thuộc cấu hình để người vận hành không vô tình đổi chúng sau khi hệ thống đi vào sử dụng.
+
+## Tài liệu tham khảo và bài liên quan
+
+- [PostgreSQL constraints](https://www.postgresql.org/docs/current/ddl-constraints.html).
+- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html).
+- [MongoDB data modeling](https://www.mongodb.com/docs/manual/data-modeling/).
+- [DynamoDB core components](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.CoreComponents.html).
+- [Cassandra data modeling](https://cassandra.apache.org/doc/latest/cassandra/developing/data-modeling/intro.html).
+- [Gilbert và Lynch: CAP theorem](https://doi.org/10.1145/564585.564601).
+
+<Cards>
+  <Card title="Index trên cột nullable" href="/database/02-index-on-nullable-column" />
+  <Card title="Kiểm soát cập nhật đồng thời" href="/database/03-optimistic-vs-pessimistic-locking" />
+  <Card title="CQRS và vận hành projection" href="/system-design/04-cqrs" />
+</Cards>

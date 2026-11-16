@@ -1,0 +1,680 @@
+---
+title: "Heap, off-heap và stack: hiểu bộ nhớ trong Java"
+description: "Từ stack frame, reference và vòng đời object đến direct buffer, quản lý native memory và chẩn đoán bộ nhớ JVM qua ví dụ Java cụ thể."
+---
+
+<Callout type="info" title="Phạm vi và cách đọc">
+Bài này dành cho bạn đã biết class, method và array trong Java. Các ví dụ chính dùng JDK 21; phần `Arena` cần JDK 22 trở lên. Mô tả triển khai và các flag JVM lấy HotSpot làm mốc. Phần stack bắt đầu với platform thread, rồi giải thích điểm khác của virtual thread.
+</Callout>
+
+## Mục lục
+
+- [Bắt đầu từ một service dùng quá nhiều RAM](#bắt-đầu-từ-một-service-dùng-quá-nhiều-ram)
+- [Bản đồ bộ nhớ của một Java process](#bản-đồ-bộ-nhớ-của-một-java-process)
+  - [Ba khái niệm không nằm trên cùng một trục](#ba-khái-niệm-không-nằm-trên-cùng-một-trục)
+  - [Bộ nhớ đã reserve, đã commit và đang resident](#bộ-nhớ-đã-reserve-đã-commit-và-đang-resident)
+- [Stack giữ trạng thái thực thi của method](#stack-giữ-trạng-thái-thực-thi-của-method)
+  - [Stack frame và thứ tự gọi hàm](#stack-frame-và-thứ-tự-gọi-hàm)
+  - [Biến local không đồng nghĩa với dữ liệu nằm trên stack](#biến-local-không-đồng-nghĩa-với-dữ-liệu-nằm-trên-stack)
+  - [Đệ quy, kích thước stack và StackOverflowError](#đệ-quy-kích-thước-stack-và-stackoverflowerror)
+  - [Virtual thread thay đổi cách lưu stack](#virtual-thread-thay-đổi-cách-lưu-stack)
+- [Heap giữ object và mối quan hệ giữa chúng](#heap-giữ-object-và-mối-quan-hệ-giữa-chúng)
+  - [Phân biệt reference với object qua một chương trình](#phân-biệt-reference-với-object-qua-một-chương-trình)
+  - [Field, array và static field](#field-array-và-static-field)
+  - [Vòng đời object theo reachability](#vòng-đời-object-theo-reachability)
+  - [Allocation, GC và tối ưu của JIT](#allocation-gc-và-tối-ưu-của-jit)
+- [Off-heap giữ dữ liệu ngoài Java heap](#off-heap-giữ-dữ-liệu-ngoài-java-heap)
+  - [Direct buffer có wrapper và vùng dữ liệu riêng](#direct-buffer-có-wrapper-và-vùng-dữ-liệu-riêng)
+  - [Đọc và ghi direct buffer từng bước](#đọc-và-ghi-direct-buffer-từng-bước)
+  - [Lợi ích và chi phí thực tế của direct buffer](#lợi-ích-và-chi-phí-thực-tế-của-direct-buffer)
+  - [Mapped file là một trường hợp cần tách riêng](#mapped-file-là-một-trường-hợp-cần-tách-riêng)
+- [Quản lý vòng đời native memory](#quản-lý-vòng-đời-native-memory)
+  - [ByteBuffer không có close để giải phóng ngay](#bytebuffer-không-có-close-để-giải-phóng-ngay)
+  - [Slice nhỏ có thể giữ một allocation lớn](#slice-nhỏ-có-thể-giữ-một-allocation-lớn)
+  - [Arena trên JDK 22 cho vòng đời tường minh](#arena-trên-jdk-22-cho-vòng-đời-tường-minh)
+  - [Chia sẻ bộ nhớ cần cả đồng bộ lẫn ownership](#chia-sẻ-bộ-nhớ-cần-cả-đồng-bộ-lẫn-ownership)
+- [So sánh theo vòng đời và trách nhiệm](#so-sánh-theo-vòng-đời-và-trách-nhiệm)
+- [Lập memory budget cho service](#lập-memory-budget-cho-service)
+  - [Xmx không phải giới hạn RAM của process](#xmx-không-phải-giới-hạn-ram-của-process)
+  - [Một budget minh họa cho container 2 GiB](#một-budget-minh-họa-cho-container-2-gib)
+- [Chẩn đoán khi bộ nhớ tăng](#chẩn-đoán-khi-bộ-nhớ-tăng)
+  - [Nhận diện đúng loại sự cố](#nhận-diện-đúng-loại-sự-cố)
+  - [Quan sát heap và native memory bằng jcmd](#quan-sát-heap-và-native-memory-bằng-jcmd)
+  - [Đo direct buffer qua BufferPoolMXBean](#đo-direct-buffer-qua-bufferpoolmxbean)
+  - [Đọc heap dump mà không nhầm với native payload](#đọc-heap-dump-mà-không-nhầm-với-native-payload)
+- [Chọn cách lưu dữ liệu trong ứng dụng](#chọn-cách-lưu-dữ-liệu-trong-ứng-dụng)
+  - [Mặc định dùng heap cho domain object](#mặc-định-dùng-heap-cho-domain-object)
+  - [Ưu tiên streaming trước khi chuyển sang off-heap](#ưu-tiên-streaming-trước-khi-chuyển-sang-off-heap)
+  - [Chỉ dùng direct buffer khi đường I/O hưởng lợi](#chỉ-dùng-direct-buffer-khi-đường-io-hưởng-lợi)
+- [Bài tập đọc vòng đời dữ liệu](#bài-tập-đọc-vòng-đời-dữ-liệu)
+- [Tài liệu tham khảo và bài tiếp theo](#tài-liệu-tham-khảo-và-bài-tiếp-theo)
+
+## Bắt đầu từ một service dùng quá nhiều RAM
+
+Giả sử một service Java chạy trong container có giới hạn 2 GiB. Bạn đặt `-Xmx1g`, dashboard báo heap mới dùng khoảng 600 MiB, nhưng container vẫn bị kill vì thiếu bộ nhớ. Tăng `-Xmx` lúc này thậm chí có thể làm tình hình tệ hơn.
+
+Lý do là Java heap chỉ là một phần bộ nhớ của process. Thread cần stack, JVM cần vùng lưu metadata của class và code đã biên dịch, thư viện có thể cấp phát native memory. Nếu ứng dụng dùng direct buffer, phần byte dữ liệu còn có thể nằm ngoài heap.
+
+Để đọc đúng tình huống đó, bạn cần tách ba việc: **dữ liệu nằm ở đâu, điều gì giữ nó sống và ai có quyền kết thúc vòng đời của nó**. Heap, off-heap và stack sẽ dễ hiểu hơn khi đặt vào ba câu này, thay vì học thuộc “stack nhanh, heap chậm”.
+
+## Bản đồ bộ nhớ của một Java process
+
+### Ba khái niệm không nằm trên cùng một trục
+
+Stack trước hết mô tả cách tổ chức trạng thái thực thi: method đang chạy có những biến local nào, đang tính dở biểu thức nào và sẽ quay về đâu. Heap là vùng lưu object do JVM quản lý. Off-heap là cách gọi dữ liệu nằm ngoài Java heap, thường được truy cập qua API hoặc thư viện dùng native memory.
+
+Chẳng hạn, một method có biến local `buffer`. Biến này giữ reference đến object `ByteBuffer` trên heap. Nếu đó là direct buffer trên HotSpot, object ấy lại đại diện cho một vùng byte ngoài heap. Một thao tác đã đi qua cả ba khái niệm mà không có mâu thuẫn nào.
+
+Sơ đồ dưới đây phân biệt các vùng cần tính vào một Java process. Nó là bản đồ logic, không mô tả địa chỉ thật hay tỷ lệ kích thước.
+
+```d2 interactive=false title="Các nhóm bộ nhớ trong một Java process"
+direction: down
+process: Java process {
+  grid-columns: 1
+  heap: "Java heap\nDomain object và array\nWrapper của direct buffer"
+  native: "Ngoài Java heap\nStack của platform thread\nNative bytes của direct buffer\nMetaspace và code cache\nJVM internals và native library"
+}
+```
+
+Trong ngữ cảnh so sánh API lưu dữ liệu, “off-heap” thường chỉ direct buffer hoặc native allocation mà ứng dụng sử dụng. Trong một cuộc điều tra tổng RAM, “ngoài heap” còn bao gồm stack, Metaspace và nhiều phần khác. Vì vậy, báo cáo “native memory tăng” chưa đủ để kết luận direct buffer bị leak.
+
+Metaspace là vùng HotSpot dùng cho metadata của class, chẳng hạn thông tin về cấu trúc class và method. Code cache giữ mã máy mà JVM đã tạo ra khi biên dịch code đang chạy. Chúng không phải nơi bạn tùy ý đưa một `Order` object vào.
+
+### Bộ nhớ đã reserve, đã commit và đang resident
+
+Một JVM có thể reserve một khoảng địa chỉ lớn nhưng chưa dùng tương ứng từng ấy RAM vật lý. Ví dụ, heap tối đa 1 GiB không có nghĩa process đã chạm vào 1 GiB trang nhớ ngay lúc khởi động.
+
+| Khái niệm | Ý nghĩa khi đọc số liệu |
+| --- | --- |
+| Reserved | Không gian địa chỉ ảo được giữ cho một mục đích; chưa đồng nghĩa với RAM vật lý đang dùng |
+| Committed | Phần JVM đã làm sẵn sàng để sử dụng theo cơ chế bộ nhớ của OS; không đồng nhất với lượng trang đang resident |
+| RSS | Resident Set Size: các trang bộ nhớ của process đang hiện diện trong RAM tại thời điểm quan sát |
+| Container memory usage | Số liệu do cơ chế accounting của container báo; có thể tính thêm page cache và bộ nhớ khác, không nhất thiết bằng RSS của riêng JVM |
+
+Địa chỉ ảo là không gian địa chỉ mà process nhìn thấy; OS ánh xạ nó tới các trang bộ nhớ bên dưới. Một trang chưa bị truy cập, một trang đã bị đưa ra swap và một trang đang nằm trong RAM không có cùng trạng thái vật lý.
+
+Vì thế, không lấy tổng `reserved` trong Native Memory Tracking rồi so trực tiếp với RSS. Khi điều tra giới hạn container, hãy theo dõi cả số liệu JVM lẫn số liệu OS/container, cùng thời điểm và cùng đơn vị.
+
+## Stack giữ trạng thái thực thi của method
+
+### Stack frame và thứ tự gọi hàm
+
+Khi `main()` gọi `calculate()`, rồi `calculate()` gọi `multiply()`, mỗi lần gọi có trạng thái thực thi riêng. Trạng thái đó được mô tả bằng một **stack frame**.
+
+```java
+static int multiply(int x, int y) {
+    int result = x * y;
+    return result;
+}
+
+static int calculate(int price) {
+    int quantity = 3;
+    return multiply(price, quantity);
+}
+```
+
+Trong mô hình JVM, frame chứa vùng local variables, operand stack và thông tin phục vụ việc gọi/return method. Local variables giữ tham số và biến local. Operand stack giữ các giá trị trung gian khi thực thi bytecode; nó không phải một stack thread khác.
+
+Ở thời điểm `multiply()` đang chạy, frame của `calculate()` vẫn cần tồn tại về mặt logic để lời gọi có thể hoàn tất. Khi `multiply()` return, kết quả được chuyển về bên gọi. Khi `calculate()` hoàn tất, trạng thái của lần gọi đó cũng không còn cần nữa. Đây là thứ tự LIFO: lần gọi vào sau hoàn tất trước.
+
+Một hình dung hữu ích là chồng giấy ghi việc đang làm dở. Bạn đặt việc hiện tại xuống để xử lý một việc con, rồi quay lại tờ giấy trước. Giới hạn của hình dung này là JVM có thể tối ưu hoặc gộp lời gọi; không phải mỗi method trong source luôn tương ứng một mẩu bộ nhớ vật lý riêng biệt.
+
+<Callout type="info" title="Mô hình JVM khác với bố trí vật lý">
+JVM Specification quy định stack và frame theo hành vi của máy ảo, không bắt buộc một bố trí RAM duy nhất. JIT có thể inline method hoặc giữ giá trị trong CPU register. Các mô tả về frame ở đây giúp bạn suy luận chương trình, không phải một cam kết về từng địa chỉ bộ nhớ.
+</Callout>
+
+### Biến local không đồng nghĩa với dữ liệu nằm trên stack
+
+Xét hai dòng trong cùng một method:
+
+```java
+int retries = 3;
+byte[] payload = new byte[1024 * 1024];
+```
+
+`retries` là một giá trị primitive local. `payload` là một reference local, còn `new byte[...]` tạo một array object với khoảng 1 MiB phần tử trên heap. Array còn có phần overhead do JVM quản lý; kích thước thực không chỉ là tổng số byte phần tử.
+
+Như vậy, khai báo array trong method không đưa toàn bộ array lên stack. Nếu tăng array từ 1 MiB lên 100 MiB, bạn chủ yếu tăng nhu cầu heap, không tăng frame thêm 99 MiB.
+
+Một reference là giá trị dùng để truy cập object. Bạn có thể hình dung nó như một phiếu chỉ tới kiện hàng: sao chép phiếu không nhân đôi kiện hàng. Nhưng đừng coi reference Java là con trỏ địa chỉ thô có thể cộng trừ; JVM có quyền thay đổi cách biểu diễn và di chuyển object.
+
+### Đệ quy, kích thước stack và StackOverflowError
+
+Một lời gọi đệ quy chưa kết thúc phải giữ trạng thái để tiếp tục sau khi lời gọi sâu hơn return. Nếu độ sâu quá lớn, stack không còn đủ chỗ và JVM có thể ném `StackOverflowError`.
+
+Ví dụ, duyệt một linked list rất dài bằng đệ quy tạo ra chuỗi lời gọi phụ thuộc độ dài danh sách. Duyệt bằng vòng lặp thường chỉ cần giữ một số biến local cố định. Java không bảo đảm tối ưu tail-call để biến đệ quy thành vòng lặp, nên đừng dựa vào điều đó để tránh tràn stack.
+
+Trên HotSpot, `-Xss` điều chỉnh kích thước stack của thread theo các ràng buộc của nền tảng. Tăng giá trị này có thể cho phép lời gọi sâu hơn, nhưng cũng làm tăng ngân sách bộ nhớ cần dành cho nhiều platform thread.
+
+Không có con số chung như “stack 1 MiB chứa được đúng 10.000 lời gọi”. Kích thước frame, JIT, nền tảng và đường thực thi đều ảnh hưởng. Nếu dữ liệu đầu vào có thể sâu tùy ý, hãy sửa thuật toán thay vì chỉ tăng `-Xss`.
+
+### Virtual thread thay đổi cách lưu stack
+
+Virtual thread, có bản chính thức từ JDK 21, không đơn giản là một platform thread rẻ hơn với một native stack cố định giống hệt. Theo JEP 444, stack của virtual thread được lưu trong Java heap bằng các **stack chunk object**: những phần bộ nhớ giữ trạng thái thực thi và có thể tăng giảm theo nhu cầu.
+
+Virtual thread vẫn giữ mô hình mỗi luồng thực thi có call stack riêng. Tuy nhiên, cách lưu vật lý khác với mô hình platform thread vừa trình bày. JVM còn cần platform thread để thực thi virtual thread trên CPU; các platform thread đảm nhiệm việc đó thường được gọi là carrier thread.
+
+Kết luận thực dụng: không lấy số virtual thread nhân với `-Xss` rồi coi đó là native memory đang sử dụng. Bạn cần đo heap cho stack chunk, đồng thời đo stack và overhead của các platform thread thực sự tồn tại. Virtual thread cũng không biến đệ quy vô hạn thành an toàn.
+
+## Heap giữ object và mối quan hệ giữa chúng
+
+### Phân biệt reference với object qua một chương trình
+
+Hai biến cùng giữ reference đến một object sẽ nhìn thấy cùng dữ liệu của object đó. Ngược lại, gán một biến sang object khác không tự đổi giá trị reference trong biến còn lại.
+
+Chương trình `ReferenceDemo.java` dưới đây tách hai thao tác: sửa object được trỏ tới và gán lại một tham số. Các bước chỉ hướng dẫn đọc code; viewer không chạy Java.
+
+```code-walkthrough
+title: Reference được sao chép nhưng object không được nhân đôi
+language: java
+snapshots:
+  - id: references
+    title: ReferenceDemo.java
+    code: |-
+      public class ReferenceDemo {
+          static final class Box {
+              int value;
+              Box(int value) { this.value = value; }
+          }
+
+          static void change(Box box) {
+              box.value = 20;
+              box = new Box(99);
+          }
+
+          public static void main(String[] args) {
+              Box a = new Box(10);
+              Box b = a;
+              change(b);
+              System.out.println(a.value);
+              System.out.println(b.value);
+              System.out.println(a == b);
+          }
+      }
+steps:
+  - id: allocation
+    snapshot: references
+    title: Tạo object đầu tiên
+    description: new Box(10) tạo một object. Biến a giữ reference đến object ấy; field value là một phần dữ liệu của object.
+    ranges: [[13, 13]]
+  - id: alias
+    snapshot: references
+    title: Hai biến cùng tham chiếu
+    description: b nhận bản sao giá trị reference trong a. Không có Box thứ hai được tạo bởi phép gán này.
+    ranges: [[13, 14]]
+  - id: mutation
+    snapshot: references
+    title: Sửa object qua tham số
+    description: Java truyền giá trị reference vào box. box.value = 20 sửa đúng object mà cả a và b đang tham chiếu.
+    ranges: [[7, 8], [15, 15]]
+  - id: reassign
+    snapshot: references
+    title: Gán lại tham số không gán lại biến bên gọi
+    description: box = new Box(99) chỉ thay giá trị của tham số box. a và b vẫn cùng tham chiếu Box có value bằng 20.
+    ranges: [[9, 9], [16, 18]]
+```
+
+Khi lưu snapshot thành `ReferenceDemo.java`, bạn có thể chạy bằng source-file mode:
+
+```bash
+java ReferenceDemo.java
+```
+
+Kết quả của chương trình là:
+
+```text
+20
+20
+true
+```
+
+Đây là ý nghĩa của **Java truyền tham số theo giá trị**, kể cả khi giá trị ấy là một reference. Method nhận một bản sao reference, không nhận quyền thay thế biến local của bên gọi.
+
+Frame của `change()` kết thúc không làm `Box` đầu tiên biến mất. `a` và `b` ở bên gọi vẫn dùng nó. `Box(99)` không được trả về hay lưu vào nơi khác; sau khi không còn reference sống giữ nó, JVM có thể thu hồi nó.
+
+### Field, array và static field
+
+Quy tắc “primitive ở stack, object ở heap” bỏ sót nơi primitive xuất hiện. Trong `Box` phía trên, `value` là `int`, nhưng nó là field thuộc một object trên heap.
+
+| Khai báo | Cách hiểu đúng trong mô hình Java |
+| --- | --- |
+| `int n = 3` trong method | Một giá trị primitive local của lần gọi |
+| `Box box = new Box(3)` trong method | Một reference local và một object riêng trên heap |
+| `int value` trong `Box` | Field primitive thuộc dữ liệu của `Box` |
+| `Box child` trong một object | Field reference; object được tham chiếu có vòng đời riêng |
+| `int[] values = new int[100]` | Array object chứa 100 phần tử primitive trên heap |
+| `Box[] boxes = new Box[100]` | Array chứa 100 reference ban đầu là `null`, chưa tạo 100 `Box` |
+
+Static field gắn với class, không gắn với từng instance và cũng không thuộc frame của method khai báo nó. Nếu static field giữ một cache chứa `Box`, cache ấy có thể giữ object sống lâu sau khi method đã return.
+
+Đừng đồng nhất static field với Metaspace. Trên HotSpot, metadata của class nằm trong Metaspace, còn object `java.lang.Class` và các object mà static field tham chiếu vẫn liên quan tới Java heap. Việc một static cache còn giữ dữ liệu cần được điều tra qua reference, không qua nhãn “static nên nằm ngoài heap”.
+
+### Vòng đời object theo reachability
+
+Garbage collector, viết tắt là **GC**, thu hồi storage của các object không còn cần giữ sống theo quy tắc tham chiếu của JVM. Với strong reference thông thường, cách suy luận cơ bản là tìm đường đi từ **GC roots** tới object.
+
+GC roots là các điểm xuất phát mà collector phải xét để xác định dữ liệu còn sống, chẳng hạn các reference sống trong platform-thread stack và các reference được JVM hoặc native code giữ. Chi tiết tập root phụ thuộc runtime; bạn không cần thuộc toàn bộ để đọc một cache leak.
+
+Trong ví dụ dưới đây, request đã kết thúc nhưng một cache lâu sống vẫn giữ payload. Sơ đồ dùng strong reference thông thường và bỏ qua weak/soft reference để tập trung vào đường giữ dữ liệu.
+
+```d2 interactive=false title="Method kết thúc nhưng cache vẫn giữ payload sống"
+direction: down
+roots: "GC roots liên quan"
+cache: "Cache qua static field"
+entry: "Cache entry"
+payload: "byte[] payload"
+request: "Request local không còn sống"
+roots -> cache: "Còn reachable"
+cache -> entry: "Giữ entry"
+entry -> payload: "Giữ dữ liệu"
+request -> payload: "Đường này đã mất" {
+  style.stroke-dash: 5
+}
+```
+
+Đường nét đứt biểu thị reference đã không còn giữ dữ liệu; nó không phải một cạnh sống bổ sung. Chỉ cần đường từ cache tới payload vẫn tồn tại thì payload chưa thể được thu hồi theo strong reachability.
+
+Nếu entry bị loại khỏi cache và không còn đường sống nào khác, payload mới đủ điều kiện để GC thu hồi. **Đủ điều kiện không có nghĩa đã được thu hồi ngay tại dòng code đó.** GC chạy theo cơ chế của collector, không theo thời điểm đóng dấu ngoặc của method.
+
+Hai object chỉ tham chiếu lẫn nhau nhưng không còn reachable từ root vẫn có thể được thu hồi. Java GC không chỉ đơn giản đếm số reference. Ngược lại, một `Map` reachable giữ dữ liệu không còn ích lợi cho nghiệp vụ vẫn có thể gây memory leak, dù mọi reference đều hợp lệ.
+
+Cũng không nên đồng nhất phạm vi khai báo với thời gian sống chính xác. JIT có thể nhận ra một biến không còn được dùng trước khi method return. Trong code ứng dụng, hãy thiết kế ownership rõ ràng thay vì dựa vào giả định “GC chắc chắn chưa đụng tới object cho đến cuối block”.
+
+### Allocation, GC và tối ưu của JIT
+
+Cấp phát một object nhỏ trên heap có thể rất rẻ. HotSpot có thể dùng **TLAB**, Thread-Local Allocation Buffer: một vùng cấp phát riêng tạm dành cho thread bên trong Java heap. Với đường cấp phát phù hợp, tạo object chủ yếu là dịch vị trí cấp phát và khởi tạo dữ liệu.
+
+TLAB không phải thread stack và không biến object thành dữ liệu chỉ thread đó mới thấy. Sau khi bạn đưa object vào một cấu trúc chia sẻ, các thread khác vẫn có thể truy cập nó nếu việc công bố và đồng bộ là đúng.
+
+Chi phí thường cần quan tâm là **allocation rate**, lượng bộ nhớ cấp phát theo thời gian, và **live set**, lượng object còn sống mà collector phải duy trì. Tạo nhiều object tạm làm tăng công việc thu gom. Giữ một đồ thị object lớn lâu dài làm tăng nhu cầu heap và công việc theo dõi reference.
+
+JIT, bộ biên dịch tối ưu code trong lúc chạy, còn có thể dùng **escape analysis** để xét một object có thoát khỏi phạm vi mà compiler phân tích hay không. Với trường hợp phù hợp, **scalar replacement** thay việc lưu object đầy đủ bằng các giá trị thành phần. Object khi đó có thể không cần một allocation vật lý riêng.
+
+Ví dụ, một object tạm chỉ giữ hai số và không bao giờ bị công bố có thể được tối ưu như vậy. Điều này không cho phép bạn kết luận mọi `new` trong method đều “được đưa lên stack”. Hãy viết theo semantics của Java, rồi dùng profiler hoặc benchmark phù hợp để kiểm tra chi phí trên runtime thực tế.
+
+## Off-heap giữ dữ liệu ngoài Java heap
+
+### Direct buffer có wrapper và vùng dữ liệu riêng
+
+Hai câu lệnh sau cùng tạo một object `ByteBuffer`, nhưng cách lưu phần byte dữ liệu khác nhau:
+
+```java
+ByteBuffer heapBuffer = ByteBuffer.allocate(1024);
+ByteBuffer directBuffer = ByteBuffer.allocateDirect(1024);
+```
+
+`allocate()` tạo buffer có backing array trên heap. **Backing storage** là vùng thực sự giữ dữ liệu mà buffer cho phép truy cập. Với `allocateDirect()` trên HotSpot, backing storage là vùng native memory ngoài Java heap; wrapper Java vẫn ở heap.
+
+Sơ đồ này cho thấy cùng một biến local nhưng hai đường tới payload khác nhau:
+
+```d2 interactive=false title="Heap buffer và direct buffer khác nhau ở backing storage"
+direction: down
+locals: "Reference local"
+heap: Java heap {
+  hb: "Heap ByteBuffer"
+  array: "byte[] backing array"
+  db: "Direct ByteBuffer wrapper"
+  hb -> array: "Đọc và ghi"
+}
+native: Ngoài Java heap {
+  bytes: "Native byte region"
+}
+locals -> heap.hb: heapBuffer
+locals -> heap.db: directBuffer
+heap.db -> native.bytes: "Truy cập backing storage"
+```
+
+Đừng hiểu `allocateDirect()` là tạo một `byte[]` rồi chuyển array đó ra ngoài heap. Direct buffer cung cấp API đọc/ghi byte trên một storage khác. Nó không phải cách chuyển tùy ý `List<Order>` hay một đồ thị object Java thành off-heap.
+
+Cũng cần phân biệt `ByteBuffer.wrap(existingArray)`: thao tác này dùng array hiện có làm backing storage, không tự tạo direct buffer và không tự sao chép toàn bộ nội dung array.
+
+### Đọc và ghi direct buffer từng bước
+
+Buffer có `capacity`, `position` và `limit`. `capacity` là sức chứa; `position` là vị trí cho thao tác tương đối tiếp theo; `limit` là giới hạn hiện tại của phần được phép đọc hoặc ghi.
+
+Chương trình `DirectBufferDemo.java` sau dùng buffer nhỏ để quan sát semantics. Kích thước 16 byte chỉ phục vụ ví dụ, không phải khuyến nghị dùng direct buffer cho payload nhỏ.
+
+```java
+import java.nio.ByteBuffer;
+
+public class DirectBufferDemo {
+    public static void main(String[] args) {
+        ByteBuffer heap = ByteBuffer.allocate(16);
+        ByteBuffer direct = ByteBuffer.allocateDirect(16);
+        System.out.println(heap.isDirect() + " " + direct.isDirect());
+
+        direct.putInt(42);
+        direct.flip();
+        ByteBuffer view = direct.slice();
+        System.out.println(view.getInt(0));
+
+        view.putInt(0, 99);
+        System.out.println(direct.getInt(0));
+
+        direct.clear();
+        System.out.println(direct.getInt(0));
+    }
+}
+```
+
+Kết quả của chương trình:
+
+```text
+false true
+42
+99
+99
+```
+
+Sau `putInt(42)`, buffer đã ghi 4 byte và `position` bằng 4. `flip()` đặt `limit` thành 4 và đưa `position` về 0 để đọc phần vừa ghi. `slice()` tạo một view của vùng đang còn lại; view có trạng thái vị trí riêng nhưng chia sẻ nội dung với buffer gốc.
+
+Vì vậy, `view.putInt(0, 99)` làm thay đổi dữ liệu mà `direct.getInt(0)` đọc được. Các thao tác có index tuyệt đối như `getInt(0)` không tăng `position`.
+
+Cuối cùng, `clear()` chỉ đặt lại trạng thái để buffer sẵn sàng ghi từ đầu. Nó không zero các byte, không giải phóng native memory và không phải một thao tác xóa dữ liệu nhạy cảm. Giá trị 99 vẫn còn nguyên trong ví dụ.
+
+### Lợi ích và chi phí thực tế của direct buffer
+
+Direct buffer hữu ích nhất khi byte dữ liệu đi qua native I/O, chẳng hạn một số đường đọc/ghi bằng channel. JVM có thể cố tránh một bước copy trung gian giữa heap array và native buffer. API chỉ cam kết nỗ lực tốt nhất cho đường I/O phù hợp, không bảo đảm mọi thao tác đều không copy.
+
+Nếu chương trình chỉ cộng các số trong một array nhỏ, direct buffer chưa chắc có lợi. Bạn có thêm chi phí cấp phát, truy cập qua API buffer và quản lý vòng đời, trong khi không loại bỏ được một bước I/O nào.
+
+Một lợi ích khác là payload lớn không còn là một array lớn trong Java heap. Collector không phải quản lý payload ấy như một Java array. Tuy nhiên, wrapper và các object quản lý vẫn tồn tại; việc cấp phát và thu hồi direct memory còn có thể tương tác với GC trong triển khai HotSpot.
+
+**Ít payload trong heap không đồng nghĩa ít RAM cho process.** Native bytes vẫn phải nằm trong memory budget. Chuyển 500 MiB dữ liệu từ heap sang native storage không tự làm nhu cầu lưu 500 MiB đó biến mất.
+
+Không gọi direct buffer là “zero-copy” chỉ vì `isDirect()` trả `true`. Zero-copy là tính chất của một đường truyền dữ liệu cụ thể. Bạn cần chỉ ra bước copy nào được bỏ, giữa những thành phần nào, rồi đo toàn bộ đường đó.
+
+### Mapped file là một trường hợp cần tách riêng
+
+Memory-mapped file ánh xạ một vùng file vào không gian địa chỉ của process, ví dụ qua `FileChannel.map()`. Truy cập buffer tương ứng sẽ đọc/ghi dữ liệu qua cơ chế mapping của OS. Buffer được map không có nghĩa toàn bộ file đã được đọc vào RAM ngay lập tức.
+
+Khác với một native allocation thuần, mapping có quan hệ với file và các trang do OS quản lý. Page cache, trang đã resident, kiểu mapping và thao tác ghi bền xuống storage là các vấn đề riêng. Vì thế, đừng cộng kích thước file được map như thể mọi byte đều là RAM private đã commit của process.
+
+`MappedByteBuffer` cũng không phải cách làm dữ liệu trong RAM tự trở thành một database bền vững. Nếu dùng mapping để lưu trạng thái quan trọng, bạn vẫn phải thiết kế định dạng, đồng bộ ghi, xử lý crash và cơ chế force phù hợp.
+
+## Quản lý vòng đời native memory
+
+### ByteBuffer không có close để giải phóng ngay
+
+Với object Java thông thường, bạn chủ yếu quyết định còn giữ reference hay không. Với native resource, còn một việc khác: kết thúc quyền sử dụng vùng dữ liệu bên ngoài heap.
+
+Trên HotSpot, direct buffer được cấp phát bởi `allocateDirect()` thường gắn với cơ chế cleaner để thu hồi native allocation khi không còn được giữ sống. Đây là chi tiết triển khai, không phải lời hứa từ API rằng một lệnh gán `null` sẽ giải phóng bytes ngay.
+
+`ByteBuffer` không triển khai `AutoCloseable` và không có public `close()` cho việc này. `clear()`, `flip()` hay `rewind()` chỉ đổi trạng thái đọc/ghi. `System.gc()` cũng không phải một API giải phóng direct buffer có thời hạn được bảo đảm.
+
+Nếu mỗi request tạo một direct buffer lớn rồi bỏ đi, native memory có thể chịu áp lực trước khi việc thu hồi theo kịp. Đừng sửa bằng cách gọi `System.gc()` sau mỗi request. Hãy giảm lượng dữ liệu đang giữ đồng thời, tái sử dụng có giới hạn hoặc chọn API có ownership tường minh nếu bài toán yêu cầu.
+
+Các thư viện dùng buffer có reference counting đưa ra một hợp đồng khác: mỗi lần giữ hoặc chuyển quyền sử dụng phải tương ứng với việc release đúng quy định của thư viện. Không gọi release gây leak; release quá sớm gây truy cập dữ liệu đã hết quyền sử dụng. Cần theo API của thư viện, không áp dụng nguyên xi cơ chế của `ByteBuffer` chuẩn.
+
+### Slice nhỏ có thể giữ một allocation lớn
+
+Giả sử một direct buffer 64 MiB chứa một batch dữ liệu. Bạn giữ lại một slice dài 128 byte để làm header và bỏ reference tới buffer gốc. Slice vẫn cần backing storage tồn tại để đọc header, nên không thể xem phần allocation lớn là đã hết vòng đời.
+
+Trên HotSpot, các direct-buffer view giữ liên kết cần thiết với storage sở hữu dữ liệu. Một view nhỏ còn sống vì thế có thể kéo dài tuổi thọ của toàn bộ allocation lớn. `duplicate()` cũng chia sẻ nội dung, không phải deep copy.
+
+Nếu header cần sống lâu còn batch đã xử lý xong, sao chép 128 byte header vào một array riêng có thể hợp lý hơn. Bạn trả một chi phí copy nhỏ để tách vòng đời, thay vì giữ 64 MiB chỉ vì một view.
+
+Đây là ví dụ về **retention**: dữ liệu bị giữ sống lâu hơn nhu cầu thực tế. Nó có thể xảy ra cả trong heap lẫn off-heap; chỉ nhìn kích thước object wrapper sẽ không thấy toàn bộ chi phí.
+
+### Arena trên JDK 22 cho vòng đời tường minh
+
+Foreign Function & Memory API, bản chính thức từ JDK 22, cung cấp `MemorySegment` để truy cập vùng nhớ và `Arena` để quản lý vòng đời của các native segment được cấp phát qua nó. Một segment mô tả vùng nhớ được phép truy cập; arena là phạm vi sở hữu vùng nhớ ấy.
+
+Với `Arena.ofConfined()`, bạn có thể giới hạn quyền sử dụng trong một block và đóng arena bằng try-with-resources. Ví dụ độc lập dưới đây cần **JDK 22 trở lên**, không chạy được bằng JDK 21:
+
+```java
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+
+public class ArenaDemo {
+    public static void main(String[] args) {
+        MemorySegment saved;
+        try (Arena arena = Arena.ofConfined()) {
+            saved = arena.allocate(ValueLayout.JAVA_LONG);
+            saved.set(ValueLayout.JAVA_LONG, 0, 42L);
+            System.out.println(saved.get(ValueLayout.JAVA_LONG, 0));
+        }
+
+        try {
+            saved.get(ValueLayout.JAVA_LONG, 0);
+            throw new AssertionError("Access should have failed");
+        } catch (IllegalStateException expected) {
+            System.out.println("Arena is closed");
+        }
+    }
+}
+```
+
+Theo hợp đồng của API, lần đọc trong block trả về 42. Khi arena đóng thành công, backing memory của các allocation do arena quản lý được giải phóng và các segment liên quan không còn được phép truy cập. Lần đọc bên ngoài block bị chặn bằng `IllegalStateException`, dù biến `saved` vẫn giữ reference đến một object Java.
+
+Điểm quan trọng là reference còn tồn tại không đồng nghĩa native resource còn hợp lệ. Đây là sự khác nhau giữa vòng đời wrapper và vòng đời tài nguyên mà wrapper đại diện.
+
+Confined arena chỉ cho thread sở hữu truy cập segment và đóng arena. `Arena.ofShared()` cho phép nhiều thread truy cập, nhưng không tự làm các lần ghi dữ liệu thành thread-safe. `Arena.ofAuto()` có vòng đời do reachability quản lý, nên không thay thế cho nhu cầu đóng tài nguyên ngay tại một thời điểm xác định.
+
+Mình sẽ chọn arena đóng tường minh khi phạm vi sở hữu native memory rõ ràng và API tích hợp hỗ trợ nó. Không nên chuyển toàn bộ domain model sang native segment chỉ để thay cú pháp cấp phát: bạn sẽ phải tự thiết kế layout dữ liệu, cách truy cập và hợp đồng vòng đời.
+
+### Chia sẻ bộ nhớ cần cả đồng bộ lẫn ownership
+
+Heap là vùng chia sẻ giữa các thread, nhưng một object trên heap có thể chỉ được một thread sử dụng. Ngược lại, một reference local nằm trong frame riêng vẫn có thể trỏ đến object đang bị thread khác sửa.
+
+Direct buffer cũng không tự thread-safe. Nếu hai thread dùng chung một `ByteBuffer`, chúng có thể xung đột ở cả byte dữ liệu lẫn `position` và `limit`. `duplicate()` tạo trạng thái vị trí riêng nhưng vẫn chia sẻ nội dung. Nó không loại bỏ data race: các lần truy cập cùng dữ liệu, trong đó có lần ghi, không được đồng bộ đúng giữa các thread.
+
+Bạn cần giải quyết hai hợp đồng độc lập:
+
+- **Đồng bộ truy cập:** ai được đọc/ghi, lúc nào dữ liệu trở nên nhìn thấy, có cần lock hay cơ chế công bố an toàn hay không.
+- **Ownership:** ai giữ tài nguyên, ai được kết thúc vòng đời, làm sao biết mọi tác vụ bất đồng bộ đã dùng xong.
+
+Ví dụ, một native segment được dùng để xử lý bất đồng bộ không được đóng chỉ vì method gửi tác vụ đã return. Phạm vi sở hữu phải kéo dài đến khi tác vụ hoàn tất, và loại arena phải cho phép thread thực thi truy cập. Mọi nhánh lỗi, hủy hoặc timeout cũng phải tuân theo cùng hợp đồng.
+
+## So sánh theo vòng đời và trách nhiệm
+
+Bảng này dùng platform-thread stack làm trường hợp cơ sở. Nó không thay thế phần khác biệt của virtual thread đã nêu ở trên.
+
+| Tiêu chí | Stack frame | Java heap | Off-heap dùng cho payload |
+| --- | --- | --- | --- |
+| Giữ gì | Trạng thái của lần gọi, local variables và giá trị trung gian | Object, array và reference giữa các object | Byte dữ liệu/native layout, vùng map hoặc tài nguyên theo API |
+| Ai tổ chức | JVM và cơ chế thực thi thread | JVM và collector | JVM, thư viện, OS hoặc code ứng dụng tùy API |
+| Khi nào hết vòng đời | Lần gọi hoàn tất về mặt logic | Object không còn được giữ sống theo quy tắc GC, rồi được thu hồi | Theo cleaner, arena, reference count hoặc hợp đồng khác |
+| Có object wrapper trên heap | Không phải cách phân loại wrapper | Bản thân object ở đây | Thường có wrapper/handle trên heap |
+| Chia sẻ giữa thread | Frame không được thread khác truy cập trực tiếp | Object có thể chia sẻ, cần đồng bộ nếu có truy cập xung đột | Phụ thuộc API; direct không có nghĩa thread-safe |
+| Áp lực thường gặp | Độ sâu call stack và số platform thread | Allocation rate, live set, object bị giữ lâu | Tổng native bytes, thời điểm release, fragmentation và retention |
+| Công cụ quan sát | Thread dump, NMT cho native stack trên HotSpot | GC metrics, heap histogram, heap dump | Buffer pool metrics, NMT trong phạm vi hỗ trợ, công cụ native/OS |
+| Điều không nên suy ra | Local reference không chứa toàn bộ payload | Có GC không có nghĩa không leak | Ngoài heap không có nghĩa ngoài RAM hoặc ngoài giới hạn container |
+
+Không có thứ hạng tốc độ chung cho ba cột. Đọc một biến local, cấp phát một object, copy một payload và ghi xuống socket là bốn công việc khác nhau. So sánh chỉ có ý nghĩa khi workload, kích thước dữ liệu và điều kiện đo tương ứng.
+
+## Lập memory budget cho service
+
+### Xmx không phải giới hạn RAM của process
+
+`-Xmx` đặt trần Java heap, không phải trần cho toàn bộ process. Một service dùng heap 1 GiB vẫn cần RAM cho các phần ngoài heap và có thể bị container dừng trước khi JVM kịp ném một Java exception.
+
+Các cấu hình sau tác động tới những phần khác nhau. Chúng là cơ chế HotSpot; hỗ trợ và giá trị mặc định cần kiểm tra trên JDK triển khai thực tế.
+
+| Cấu hình | Phạm vi | Không bảo đảm điều gì |
+| --- | --- | --- |
+| `-Xms` | Kích thước heap ban đầu/tối thiểu theo cách JVM quản lý | Không phải tổng RAM ban đầu của process |
+| `-Xmx` | Kích thước heap tối đa | Không giới hạn mọi native allocation |
+| `-Xss` | Kích thước stack thread theo nền tảng | Không phải RAM resident cố định cho mỗi virtual thread |
+| `-XX:MaxDirectMemorySize` | Giới hạn dùng cho các direct-buffer allocation được HotSpot kiểm soát tương ứng | Không giới hạn toàn bộ JNI, mọi thư viện native hay mọi file mapping |
+| `-XX:MaxMetaspaceSize` | Trần Metaspace theo cơ chế HotSpot | Không giới hạn code cache hay domain object |
+| `-XX:NativeMemoryTracking=summary` | Bật theo dõi các nhóm native memory mà HotSpot hỗ trợ | Là công cụ quan sát, không phải giới hạn bộ nhớ |
+
+Không nên đoán direct-memory limit khi chưa đặt flag. Giá trị mặc định và cách accounting phụ thuộc runtime. Hãy kiểm tra cấu hình thực tế, theo dõi buffer pool và đặt giới hạn có chủ đích nếu direct buffer chiếm phần đáng kể trong service.
+
+### Một budget minh họa cho container 2 GiB
+
+Bảng sau là **kế hoạch giả định**, không phải số đo hay bộ flag tối ưu sẵn cho mọi ứng dụng. Dùng MiB/GiB theo hệ nhị phân: 2 GiB tương ứng 2048 MiB.
+
+| Khoản dự trù | MiB |
+| --- | ---: |
+| Java heap tối đa | 1024 |
+| Direct buffer đang được giữ | 256 |
+| Metaspace và code cache | 192 |
+| Stack của platform thread | 128 |
+| Native overhead khác | 128 |
+| Khoảng dự phòng cho dao động và accounting | 320 |
+| Tổng | 2048 |
+
+Đây không phải phép tính RSS chính xác: reserved, committed, resident và bộ nhớ được chia sẻ không cộng trừ đơn giản như các phong bì ngân sách. Bảng giúp phát hiện sớm một kế hoạch chắc chắn không vừa, rồi được hiệu chỉnh bằng số liệu tải thực.
+
+Phần dự phòng không phải RAM “bỏ phí”. Class loading, JIT warm-up, burst request và bộ đệm tạm có thể làm nhu cầu tăng. Native allocator cũng có thể giữ vùng đã cấp phát để tái sử dụng, nên ứng dụng release dữ liệu không bảo đảm RSS giảm ngay tương ứng.
+
+Nếu tăng heap thêm 512 MiB mà không thay các khoản còn lại, budget đã không còn vừa container. Hướng xử lý có thể là giảm concurrency, giảm buffer đang giữ hoặc tăng memory limit; không nhất thiết là tiếp tục tăng `-Xmx`.
+
+## Chẩn đoán khi bộ nhớ tăng
+
+### Nhận diện đúng loại sự cố
+
+Bước đầu tiên là phân biệt lỗi do JVM báo với việc OS/container kết thúc process. Thông báo dưới đây là những dạng thường gặp, không phải hợp đồng về chuỗi lỗi trên mọi bản JDK.
+
+| Dấu hiệu | Hướng nghi ngờ đầu tiên | Kiểm tra tiếp |
+| --- | --- | --- |
+| `StackOverflowError` | Chuỗi gọi quá sâu, đệ quy hoặc vòng gọi lặp | Stack trace, đầu vào gây lỗi, thuật toán |
+| `OutOfMemoryError: Java heap space` | Không cấp phát được trên heap | Live set sau GC, object giữ dữ liệu, kích thước batch |
+| `OutOfMemoryError: Direct buffer memory` hoặc thông báo không reserve được direct memory | Áp lực direct-buffer allocation | Buffer pool, số buffer đang giữ, limit, pool và slice |
+| `OutOfMemoryError: Metaspace` | Metadata class vượt khả năng cấp phát | Số class/classloader, classloader leak, cấu hình Metaspace |
+| Không tạo được native thread | Giới hạn thread/PID hoặc thiếu tài nguyên native | Số platform thread, OS limits, memory budget |
+| Container báo OOM kill, có thể thấy `OOMKilled` | Vượt bộ nhớ mà container/OS cho phép | Container events, memory limit, RSS/accounting và mọi vùng ngoài heap |
+| RSS tăng nhưng heap ổn định | Native memory, mapping, allocator hoặc thành phần ngoài heap khác | Buffer pool, NMT, memory map và profiler native nếu cần |
+
+Exit code 137 riêng lẻ không chứng minh OOM: đó có thể là kết quả của `SIGKILL` vì lý do khác. Kiểm tra trạng thái container và sự kiện từ nền tảng trước khi đặt tên sự cố.
+
+Cũng không kết luận memory leak chỉ từ đường biểu đồ đi lên sau vài request. Cache warm-up, JIT và buffer pool đều có thể tăng rồi ổn định. Điều đáng xem là sau khi tải trở về mức tương đương, lượng dữ liệu còn bị giữ có tiếp tục tăng qua nhiều chu kỳ hay không.
+
+### Quan sát heap và native memory bằng jcmd
+
+Trong môi trường điều tra được phép, bạn có thể bật NMT từ lúc khởi động:
+
+```bash
+java -XX:NativeMemoryTracking=summary -jar app.jar
+```
+
+Đây là mẫu lệnh, không phải yêu cầu khởi động lại production ngay. NMT có overhead và không bật ngược đầy đủ cho một JVM vốn khởi động khi NMT đang tắt. Cần lên kế hoạch trước hoặc tái hiện trong môi trường phù hợp.
+
+Các lệnh sau dành cho **HotSpot trên cùng máy và cùng user có quyền attach**. Gán `PID` thành PID JVM cần kiểm tra, không phải PID lấy ngẫu nhiên từ một container khác. `jcmd` cần khả năng attach và quyền tương ứng; container tối giản có thể không chứa công cụ này.
+
+```bash
+PID=12345
+jcmd "$PID" GC.heap_info
+jcmd "$PID" Thread.print
+jcmd "$PID" VM.native_memory summary scale=MB
+```
+
+`12345` chỉ là PID minh họa. `GC.heap_info` cho ảnh chụp về heap. Thread dump giúp đọc các platform thread và call stack mà lệnh hỗ trợ; đừng coi `Thread.print` là bản kiểm kê đầy đủ mọi virtual thread. Báo cáo NMT tách các nhóm như Java Heap, Class, Thread và Code.
+
+Để so sánh trước và sau một giai đoạn tải đã biết, lấy baseline sau warm-up rồi xem diff:
+
+```bash
+jcmd "$PID" VM.native_memory baseline
+# Chờ workload cần điều tra chạy; không tạo tải bất ngờ trên production.
+jcmd "$PID" VM.native_memory summary.diff scale=MB
+```
+
+Hãy đối chiếu phần **committed** của từng nhóm cùng số lượng thread/class và RSS trong cùng khoảng thời gian. Không chỉ nhìn dòng tổng `reserved`, vì một vùng địa chỉ được reserve lớn chưa phải bằng chứng nó đang chiếm từng ấy RAM vật lý.
+
+<Callout type="warn" title="NMT không nhìn thấy mọi native allocation">
+NMT chủ yếu theo dõi các allocation nội bộ mà HotSpot đã tích hợp cơ chế đo. Nó không phải profiler bao quát mọi allocation từ thư viện native bên thứ ba hoặc code gọi qua JNI. JNI là cầu nối giữa Java và native code. Các vùng trong báo cáo cũng không nhất thiết được đặt tên “Direct” hay “Off-heap”. Nếu RSS tăng mà số liệu NMT không giải thích được, hãy mở rộng sang công cụ OS/native thay vì kết luận không có vấn đề.
+</Callout>
+
+### Đo direct buffer qua BufferPoolMXBean
+
+Để quan sát các buffer pool mà runtime công bố, dùng `BufferPoolMXBean`. Chương trình độc lập sau chỉ in pool của **chính JVM đang chạy nó**:
+
+```java
+import java.lang.management.BufferPoolMXBean;
+import java.lang.management.ManagementFactory;
+import java.nio.ByteBuffer;
+
+public class BufferPoolDemo {
+    public static void main(String[] args) {
+        ByteBuffer buffer = ByteBuffer.allocateDirect(1024 * 1024);
+        for (BufferPoolMXBean pool :
+                ManagementFactory.getPlatformMXBeans(BufferPoolMXBean.class)) {
+            System.out.printf("%s count=%d used=%d capacity=%d%n",
+                    pool.getName(), pool.getCount(),
+                    pool.getMemoryUsed(), pool.getTotalCapacity());
+        }
+        System.out.println("Demo capacity=" + buffer.capacity());
+        java.lang.ref.Reference.reachabilityFence(buffer);
+    }
+}
+```
+
+`count` là số buffer trong pool theo cách runtime báo. `used` là ước lượng bộ nhớ đã dùng, còn `capacity` là tổng capacity ước lượng. Hai số sau không bắt buộc bằng nhau vì alignment, allocator và cách triển khai. Riêng `getMemoryUsed()` có thể trả `-1` nếu không xác định được lượng bộ nhớ.
+
+`reachabilityFence()` ở cuối giúp giữ buffer reachable đến sau đoạn đọc metrics; trong chương trình thực, bạn thường giữ nó sống vì còn thao tác dữ liệu. Đừng dựa vào việc biến vẫn còn trong scope để suy ra chính xác thời điểm JVM có thể coi nó là không còn sống.
+
+Chạy demo trên sẽ không đọc được direct memory của service khác. Trong ứng dụng thật, lấy cùng MXBean trong process đó hoặc xuất metric qua JMX/monitoring hiện có. Theo dõi xu hướng theo tải, không biến một ảnh chụp đơn lẻ thành kết luận leak.
+
+### Đọc heap dump mà không nhầm với native payload
+
+Heap dump hữu ích để tìm object nào giữ `ByteBuffer`, cache entry nào giữ payload, hoặc classloader nào không được giải phóng. Nhưng native bytes của một direct buffer không trở thành một `byte[]` đầy đủ trong heap dump chỉ vì wrapper xuất hiện ở đó.
+
+**Shallow size** là kích thước của riêng một object trong heap. **Retained size** trong công cụ phân tích heap thường ước lượng phần heap có thể thu hồi nếu object và phần chỉ nó giữ bị bỏ đi. Hai con số này không mặc nhiên bao gồm toàn bộ backing native memory.
+
+Do đó, một wrapper có shallow size nhỏ vẫn có thể liên quan tới native allocation rất lớn. Với direct buffer, cần đọc thêm capacity, liên kết giữa view và storage, đường giữ reference và metrics native tương ứng.
+
+Heap dump cũng có thể chứa payload, token và dữ liệu cá nhân còn nằm trong heap. Chỉ thu thập khi được phép, bảo vệ file như dữ liệu production, kiểm tra dung lượng đĩa và ảnh hưởng pause trước khi chạy. Đừng coi lệnh dump là bước quan sát nhẹ có thể chạy tùy ý trong lúc service đang thiếu tài nguyên.
+
+## Chọn cách lưu dữ liệu trong ứng dụng
+
+### Mặc định dùng heap cho domain object
+
+Với `Order`, `Customer`, collection nghiệp vụ và dữ liệu cần liên kết bằng object reference, heap là lựa chọn mặc định. Bạn có type system, collection API và cơ chế quản lý vòng đời quen thuộc.
+
+Nếu heap tăng quá cao, hãy tìm dữ liệu nào thật sự cần giữ. Cache thiếu eviction, danh sách kết quả không giới hạn hoặc nhiều request đồng thời giữ cùng lúc payload lớn thường là vấn đề về vòng đời và concurrency. Chuyển cách lưu sang native memory không sửa được nhu cầu giữ dữ liệu vô hạn.
+
+Với stack, bạn không lựa chọn “đưa object lên stack” như một API tối ưu thông thường. Việc có ích hơn là giới hạn độ sâu lời gọi, tránh đệ quy không kiểm soát và để compiler tối ưu code rõ ràng.
+
+### Ưu tiên streaming trước khi chuyển sang off-heap
+
+Giả sử cần xử lý file 1 GiB. Nếu đọc toàn bộ file vào `byte[]`, bạn giữ một payload rất lớn dù tại mỗi thời điểm chỉ cần một phần nhỏ. Chuyển nguyên 1 GiB đó sang direct buffer chỉ chuyển nơi chịu áp lực.
+
+Đọc theo chunk và xử lý xong từng phần có thể giảm working set, tức lượng dữ liệu thực sự cần giữ đồng thời. Nhưng nếu sau mỗi chunk bạn lại đưa kết quả vào một queue không giới hạn, tổng bộ nhớ vẫn có thể tăng mãi.
+
+Cần kết hợp chunking với **backpressure**: cơ chế buộc bên sản xuất chậm lại khi bên xử lý chưa theo kịp. Một queue có giới hạn và số worker có giới hạn giúp biến nhu cầu bộ nhớ thành thứ có thể dự trù.
+
+Ví dụ giả định, tối đa 8 tác vụ cùng giữ một chunk 1 MiB tạo ra khoảng 8 MiB phần byte đang xử lý. Con số này chưa tính parser, kết quả, queue và overhead. Nó vẫn là một điểm khởi đầu rõ ràng hơn nhiều so với “đọc hết rồi đợi GC”.
+
+### Chỉ dùng direct buffer khi đường I/O hưởng lợi
+
+Mình sẽ cân nhắc direct buffer khi ứng dụng xử lý byte dữ liệu tương đối lớn, buffer có thể tái sử dụng và thư viện I/O thực sự dùng được storage ấy. Trước khi chuyển, cần xác định bước copy muốn bỏ hoặc nguồn áp lực GC muốn giảm.
+
+Đo cùng workload ở hai phương án. Theo dõi throughput, phân bố latency, CPU, allocation rate, GC và tổng memory usage; đừng chỉ chứng minh heap nhỏ hơn. Buffer pool cũng phải có giới hạn theo tổng capacity, không chỉ theo số lượng, nếu kích thước buffer thay đổi.
+
+Pooling không phải mặc định luôn tốt. Một pool giữ buffer quá lớn sau một đợt burst có thể làm footprint ở mức cao lâu dài. Ngoài giới hạn capacity, cần quy tắc trả buffer, xử lý lỗi/hủy và chính sách không giữ mãi allocation ngoại cỡ.
+
+Nếu không có lợi ích đo được hoặc thư viện vẫn copy sang array ngay sau đó, tiếp tục dùng heap thường đơn giản hơn. Độ phức tạp ownership là một chi phí thực, không phải chi tiết để xử lý sau.
+
+## Bài tập đọc vòng đời dữ liệu
+
+Trước khi chỉnh flag JVM, hãy thử giải thích năm tình huống sau bằng mô hình của bài. Đây là bài tập suy luận, không phải hướng dẫn tạo OOM trên production.
+
+| Tình huống | Kết luận cần rút ra |
+| --- | --- |
+| Method tạo `byte[1 MiB]` rồi trả array về bên gọi | Frame có thể kết thúc nhưng array còn sống vì bên gọi giữ reference |
+| Cache giữ `ByteBuffer.allocateDirect(64 MiB)` sau khi request hoàn tất | Wrapper trên heap và native payload đều còn liên quan tới một tài nguyên được giữ sống |
+| Giữ slice 128 byte của buffer lớn, bỏ reference gốc | Slice chia sẻ backing storage; kích thước view không phải kích thước allocation có thể bị giữ |
+| Gọi `clear()` rồi đưa buffer về pool | Buffer vẫn giữ capacity và bytes; cần tính nó vào budget của pool |
+| Segment còn reference nhưng arena đã đóng thành công | Object Java còn tồn tại nhưng quyền truy cập native memory đã kết thúc |
+
+Áp dụng vào service của bạn bằng cách chọn một payload lớn và lần theo đường giữ nó: nơi tạo, nơi chuyển giao, nơi lưu tạm, nơi dùng cuối cùng. Nếu không chỉ ra được điểm kết thúc vòng đời hoặc giới hạn số payload đang giữ, hãy làm rõ phần đó trước khi đổi heap sang off-heap.
+
+## Tài liệu tham khảo và bài tiếp theo
+
+Các nguồn dưới đây tách hợp đồng JVM/API khỏi chi tiết công cụ HotSpot. Đối chiếu đúng phiên bản JDK bạn triển khai khi chọn flag hoặc dùng native-memory API.
+
+- [JVM Specification 21, Runtime Data Areas và Frames](https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-2.html#jvms-2.5): mô hình heap, stack, frame và local variables.
+- [ByteBuffer, Java 21](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/ByteBuffer.html): direct buffer, backing storage, `slice()`, `flip()` và `clear()`.
+- [JEP 444: Virtual Threads](https://openjdk.org/jeps/444): stack chunk trên heap và mô hình virtual thread.
+- [HotSpot Performance Enhancements, JDK 21](https://docs.oracle.com/en/java/javase/21/vm/java-hotspot-virtual-machine-performance-enhancements.html): escape analysis và việc loại bỏ allocation bằng scalar replacement, không phải tự chuyển object lên stack.
+- [Arena, Java 22](https://docs.oracle.com/en/java/javase/22/docs/api/java.base/java/lang/foreign/Arena.html): scope, confinement và đóng native segment.
+- [BufferPoolMXBean, Java 21](https://docs.oracle.com/en/java/javase/21/docs/api/java.management/java/lang/management/BufferPoolMXBean.html): ý nghĩa và giới hạn của các metric buffer pool.
+- [Native Memory Tracking, HotSpot 21](https://docs.oracle.com/en/java/javase/21/vm/native-memory-tracking.html): bật NMT, baseline và phạm vi tracking.
+- [Diagnostic Tools, JDK 21](https://docs.oracle.com/en/java/javase/21/troubleshoot/diagnostic-tools.html): công cụ quan sát, reserved/committed và điều tra JVM.
+
+<Cards>
+  <Card title="Thiết kế pipeline merge dữ liệu lớn" href="/java/02-bulk-upsert-billion-rows/" description="Áp dụng tư duy batch có giới hạn khi xử lý một triệu bản ghi, thay vì giữ toàn bộ công việc trong một lần xử lý." />
+</Cards>

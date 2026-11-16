@@ -1,0 +1,516 @@
+---
+title: "Module Federation: microfrontend React và Vue"
+description: "Ghép một Vue catalog vào React shell bằng Webpack 5, từ remotes/exposes đến mount, routing và những lỗi chỉ xuất hiện khi deploy."
+---
+
+Giả sử bạn đang có một ứng dụng React. Phần catalog do một team khác phụ trách, họ dùng Vue và muốn tự build, tự release phần đó. Người dùng thì vẫn cần một website liền mạch, chứ không phải bấm vào Catalog là bị đưa sang một trang khác.
+
+Bạn có thể chuyển catalog thành package npm rồi cài vào app React. Nhưng mỗi lần catalog có bản mới, phía React lại phải cập nhật package và build lại. Nếu điều bạn muốn là hai bên release riêng, cách đó chưa giải quyết được vấn đề.
+
+Bài này dùng Webpack 5 Module Federation để React tải code đã build của Vue ngay trong browser. Phần cấu hình kết nối không dài. Phần cần nghĩ kỹ hơn là: ai tạo và hủy Vue app, ai giữ URL, và chuyện gì xảy ra nếu remote không tải được.
+
+Ví dụ bên dưới có đủ source để chạy trên máy. Nếu bạn chưa quen entry, loader và chunk, nên đọc [bài Webpack](/web/03-webpack-tu-source-den-trinh-duyet) trước; ở đây chúng ta sẽ dùng lại các khái niệm đó.
+
+<SourceRef project="module-federation-react-vue" file="shell/webpack.config.cjs" variant="button">Mở source đầy đủ · React shell + Vue remote</SourceRef>
+
+## Mục lục
+
+- [1. Tách hai app để giải quyết việc gì?](#1-tách-hai-app-để-giải-quyết-việc-gì)
+- [2. Chạy ví dụ trước khi đọc config](#2-chạy-ví-dụ-trước-khi-đọc-config)
+  - [Build và preview production output](#build-và-preview-production-output)
+- [3. Đọc source theo luồng chạy](#3-đọc-source-theo-luồng-chạy)
+- [4. Nối remotes, exposes và import](#4-nối-remotes-exposes-và-import)
+  - [Shell tìm remote ở đâu?](#shell-tìm-remote-ở-đâu)
+  - [Vue cho phép shell lấy module nào?](#vue-cho-phép-shell-lấy-module-nào)
+  - [remoteEntry.js có chứa toàn bộ Vue app không?](#remoteentryjs-có-chứa-toàn-bộ-vue-app-không)
+- [5. Khi nào browser thực sự tải Vue?](#5-khi-nào-browser-thực-sự-tải-vue)
+- [6. Có module rồi, gắn Vue vào React thế nào?](#6-có-module-rồi-gắn-vue-vào-react-thế-nào)
+  - [Rời Catalog trong lúc remote còn đang tải](#rời-catalog-trong-lúc-remote-còn-đang-tải)
+  - [Remote lỗi thì chỉ vùng Catalog báo lỗi](#remote-lỗi-thì-chỉ-vùng-catalog-báo-lỗi)
+- [7. Hai router nhưng chỉ một thanh địa chỉ](#7-hai-router-nhưng-chỉ-một-thanh-địa-chỉ)
+  - [Shell báo location xuống Vue](#shell-báo-location-xuống-vue)
+  - [Vue nhờ shell đổi URL](#vue-nhờ-shell-đổi-url)
+- [8. Phần config không liên quan đến Federation](#8-phần-config-không-liên-quan-đến-federation)
+- [9. Remote entry tải được, vì sao chunk vẫn 404?](#9-remote-entry-tải-được-vì-sao-chunk-vẫn-404)
+  - [publicPath quyết định nơi tải chunk](#publicpath-quyết-định-nơi-tải-chunk)
+  - [uniqueName khác tên container](#uniquename-khác-tên-container)
+  - [Đọc output của hai build](#đọc-output-của-hai-build)
+- [10. Shared dependencies và async bootstrap](#10-shared-dependencies-và-async-bootstrap)
+- [11. Đưa hai app lên server](#11-đưa-hai-app-lên-server)
+  - [URL remote trong ví dụ được chốt lúc build](#url-remote-trong-ví-dụ-được-chốt-lúc-build)
+  - [CORS phải được cấu hình ở server remote](#cors-phải-được-cấu-hình-ở-server-remote)
+  - [Đừng xóa chunk cũ ngay khi có bản mới](#đừng-xóa-chunk-cũ-ngay-khi-có-bản-mới)
+- [12. Tự kiểm tra thay vì chỉ nhìn giao diện](#12-tự-kiểm-tra-thay-vì-chỉ-nhìn-giao-diện)
+  - [Theo dõi request từ Home đến Catalog](#theo-dõi-request-từ-home-đến-catalog)
+  - [Refresh một deep link](#refresh-một-deep-link)
+  - [Đọc stats và chạy kiểm thử tự động](#đọc-stats-và-chạy-kiểm-thử-tự-động)
+- [13. Tra lỗi theo triệu chứng](#13-tra-lỗi-theo-triệu-chứng)
+- [14. Có nên dùng cách này cho dự án của bạn?](#14-có-nên-dùng-cách-này-cho-dự-án-của-bạn)
+- [Đọc thêm](#đọc-thêm)
+
+## 1. Tách hai app để giải quyết việc gì?
+
+Trong tình huống trên, điều đáng quan tâm không phải là “React có chạy chung với Vue được không?”. Cả hai cuối cùng đều chạy JavaScript và cập nhật DOM. Điều chúng ta cần là sửa catalog mà không phải build lại toàn bộ website.
+
+Đó là một lý do để cân nhắc **microfrontend**: chia frontend thành những phần có thể phát triển và deploy tương đối độc lập. Module Federation là một cách để nối các phần đó lại. Cụ thể, nó cho phép một build tải module do build khác cung cấp khi ứng dụng đang chạy. Bạn vẫn có thể làm microfrontend bằng iframe hay cách tích hợp khác; không bắt buộc phải dùng Federation.
+
+Ví dụ trong bài chỉ có hai app:
+
+| App | Phần việc của nó | Dev / preview |
+| --- | --- | --- |
+| React shell, còn gọi là host | Trang chính, browser history và vùng DOM dành cho catalog | `5173` / `4173` |
+| Vue catalog, còn gọi là remote | Giao diện catalog, các route con và API để mount/unmount | `5174` / `4174` |
+
+Hai app có build riêng. Đến khi người dùng mở Catalog, shell mới yêu cầu module từ phía Vue:
+
+```d2 title="Hai build riêng, ghép lại khi chạy trong browser"
+direction: right
+S: "Source React shell"
+S.icon: /interview-question/react.svg
+SB: "Build shell"
+V: "Source Vue catalog"
+VB: "Build remote"
+H: "Trang shell trong browser"
+R: "remoteEntry.js và chunks Vue"
+S -> SB
+V -> VB
+SB -> H
+VB -> R
+H -> R: "import vueSub/mount"
+R -> H: "mount vào DOM do shell cấp"
+```
+
+Shell không đọc hay biên dịch file `.vue`. Nó chỉ biết module phía kia có một hàm để gắn giao diện vào phần tử DOM được cấp. Việc build Vue thành JavaScript là trách nhiệm của remote.
+
+Dùng hai framework ở đây giúp thấy rõ ranh giới ấy. Nó không phải lời khuyên rằng một website nên có càng nhiều framework càng tốt. Nếu một team đang làm việc ổn với một app, việc tách ra thường chỉ khiến họ có thêm thứ phải vận hành.
+
+## 2. Chạy ví dụ trước khi đọc config
+
+Source nằm trong `examples/module-federation-react-vue/` của repository tài liệu. Dùng Node.js **22.12+** và npm, rồi chạy từ thư mục gốc repository:
+
+```bash
+cd examples/module-federation-react-vue
+npm --prefix shell install
+npm --prefix vue-sub install
+node scripts/dev.mjs
+```
+
+Thư mục ví dụ không có `package.json` chung. Mỗi app tự cài dependencies; <SourceRef project="module-federation-react-vue" file="scripts/dev.mjs">dev.mjs</SourceRef> chỉ giúp khởi động hai process để bạn không phải mở hai terminal.
+
+Mở `http://127.0.0.1:5173/`. Trang Home lúc này chỉ có React. Bấm **Catalog**, bạn sẽ thấy giao diện Vue xuất hiện ngay dưới navigation của shell.
+
+Thử tăng **Remote count**, rồi bấm **Product 42**. Số đếm phải giữ nguyên dù URL đã đổi. Tiếp đó thử Back, Forward và refresh tại `/catalog/products/42?color=blue#details`. Những thao tác này sẽ giúp kiểm tra phần routing ở phía sau, không chỉ mỗi việc “Vue đã hiện lên”.
+
+Bạn cũng có thể mở `http://127.0.0.1:5174/`: cùng Vue app đó chạy độc lập, không cần React shell. Nếu chưa clone repository, hãy mở nút source phía trên và copy các file theo đúng đường dẫn; đây là project riêng, không cần ghép vào source của bài Webpack trước.
+
+### Build và preview production output
+
+Dev server tiện cho lúc sửa code, nhưng khi xem browser tải những file nào, production output sẽ dễ theo dõi hơn:
+
+```bash
+# Vẫn ở examples/module-federation-react-vue
+npm --prefix shell run build
+npm --prefix vue-sub run build
+node scripts/dev.mjs --preview
+```
+
+Shell preview chạy ở `http://127.0.0.1:4173/`, remote ở `4174`, nên không trùng cổng dev. Config shell chọn URL remote mặc định theo build mode.
+
+<SourceRef project="module-federation-react-vue" file="scripts/preview.mjs">Preview server</SourceRef> phục vụ các file trong `dist`, có SPA fallback và CORS cho môi trường local. Nó đủ để kiểm tra bản build, chưa phải cấu hình server để mang nguyên lên production.
+
+## 3. Đọc source theo luồng chạy
+
+Bạn không cần đọc hết hai project trước khi đi tiếp. Theo luồng từ shell đến remote sẽ dễ hơn: shell tìm remote, tải module, gọi mount; sau đó hai bên đồng bộ location và cleanup khi rời trang.
+
+| Câu hỏi | File nên mở |
+| --- | --- |
+| Host tìm remote ở đâu? | <SourceRef project="module-federation-react-vue" file="shell/webpack.config.cjs" region="federation">remotes của shell</SourceRef> |
+| Remote cho phép tải module nào? | <SourceRef project="module-federation-react-vue" file="vue-sub/webpack.config.cjs" region="federation">exposes của Vue</SourceRef> |
+| Khi nào lệnh import chạy? | <SourceRef project="module-federation-react-vue" file="shell/src/remote.ts" region="load-remote">remote.ts</SourceRef> |
+| React gắn và gỡ Vue thế nào? | <SourceRef project="module-federation-react-vue" file="shell/src/shell/VueHost.tsx" region="mount-lifecycle">VueHost.tsx</SourceRef> |
+| Vue chuẩn bị router và instance ra sao? | <SourceRef project="module-federation-react-vue" file="vue-sub/src/mount.ts" region="mount-api">mount.ts</SourceRef> |
+| Giao diện và route con nằm ở đâu? | <SourceRef project="module-federation-react-vue" file="vue-sub/src/CatalogApp.vue">CatalogApp.vue</SourceRef>, <SourceRef project="module-federation-react-vue" file="vue-sub/src/router.ts">router.ts</SourceRef> |
+| Chạy Vue độc lập khác chỗ nào? | <SourceRef project="module-federation-react-vue" file="vue-sub/src/bootstrap.ts">bootstrap.ts của Vue</SourceRef> |
+
+Dependencies và lệnh chạy nằm trong <SourceRef project="module-federation-react-vue" file="shell/package.json">shell/package.json</SourceRef> và <SourceRef project="module-federation-react-vue" file="vue-sub/package.json">vue-sub/package.json</SourceRef>. Các đoạn code trong bài chỉ trích phần đang giải thích; file đầy đủ nằm trong trình xem source.
+
+## 4. Nối remotes, exposes và import
+
+Ba chỗ này cần đọc cùng nhau. `remotes` cho host biết đi đâu để lấy code, `exposes` cho biết remote công khai phần nào, còn `import` là nơi host yêu cầu phần code đó.
+
+### Shell tìm remote ở đâu?
+
+Phần chính trong <SourceRef project="module-federation-react-vue" file="shell/webpack.config.cjs" region="federation">config Federation của shell</SourceRef> có dạng:
+
+```js
+remotes: {
+  vueSub: 'vueSub@http://127.0.0.1:5174/remoteEntry.js',
+}
+```
+
+Hai chữ `vueSub` ở đây giống nhau nhưng làm hai việc khác nhau. Key bên trái là alias dùng trong source của shell. Tên trước dấu `@` là tên container mà remote công bố — container là phần runtime cho phép host yêu cầu các module của remote. Sau dấu `@` là URL để tải container entry đó.
+
+Bạn có thể đổi key bên trái thành `catalog`, rồi import bằng `catalog/mount`. Tên bên phải vẫn phải khớp với `name` của remote. Trong config thật, URL được lấy từ biến `remoteUrl`; chuỗi trên chỉ viết cụ thể cho môi trường dev để dễ đọc.
+
+### Vue cho phép shell lấy module nào?
+
+Phía <SourceRef project="module-federation-react-vue" file="vue-sub/webpack.config.cjs" region="federation">Vue remote</SourceRef> khai báo:
+
+```js
+name: 'vueSub',
+filename: 'remoteEntry.js',
+exposes: { './mount': './src/mount.ts' },
+```
+
+`name` khớp với tên container mà shell đang chờ. `exposes` đặt một tên công khai là `./mount` cho file `src/mount.ts`. Nhờ vậy, phía shell có thể viết:
+
+```ts
+const remote = await import('vueSub/mount');
+```
+
+`vueSub` trong import khớp với alias của host; `/mount` trỏ đến key `./mount` phía remote. Đường dẫn `src/mount.ts` là chuyện nội bộ của project Vue. Nếu sau này đổi chỗ file đó nhưng giữ nguyên key expose và API, shell không cần biết.
+
+Đây cũng là điểm khác với một dynamic import thông thường trong cùng project. Shell không cần có source `mount.ts` lúc build; runtime sẽ lấy JavaScript do build Vue tạo ra.
+
+### remoteEntry.js có chứa toàn bộ Vue app không?
+
+Không nên hiểu `remoteEntry.js` là một file bundle chứa hết catalog. Nó là đầu mối để runtime tìm và lấy các module được expose. Code của `mount` và dependencies có thể nằm ở các chunk riêng.
+
+Khi <SourceRef project="module-federation-react-vue" file="shell/src/remote.ts" region="load-remote">remote loader</SourceRef> gọi import, luồng xử lý về cơ bản như sau:
+
+```d2 title="Từ import đến lúc Vue được mount"
+shape: sequence_diagram
+Host: "React VueHost"
+HRT: "Webpack runtime của host"
+Remote: "Vue container"
+Server: "Server remote"
+Host -> HRT: "import vueSub/mount"
+HRT -> Server: "GET remoteEntry.js"
+HRT -> Remote: "init share scope, get ./mount"
+Remote -> Server: "Tải chunks còn thiếu"
+Remote -> Host: "protocolVersion, mountVueSub" {style.stroke-dash: 4}
+Host -> Host: "await mountVueSub(element, options)"
+```
+
+`share scope` là nơi runtime đăng ký và chọn các dependency dùng chung; phần `shared` bên dưới sẽ giải thích thêm. Sơ đồ này mô tả thứ tự phối hợp, không phải số request cố định: nếu module hoặc chunk đã có trong cache, browser có thể không tải lại.
+
+## 5. Khi nào browser thực sự tải Vue?
+
+Vào Home chưa có nghĩa là tải cả Vue. Luồng khởi động của shell đi từ <SourceRef project="module-federation-react-vue" file="shell/index.html">index.html</SourceRef> đến <SourceRef project="module-federation-react-vue" file="shell/src/main.tsx">main.tsx</SourceRef>, rồi entry này gọi:
+
+```ts
+import('./bootstrap');
+```
+
+<SourceRef project="module-federation-react-vue" file="shell/src/bootstrap.tsx">bootstrap.tsx</SourceRef> tạo React root và BrowserRouter. Đến đây shell đã chạy, nhưng <SourceRef project="module-federation-react-vue" file="shell/src/shell/App.tsx">App.tsx</SourceRef> chỉ render `VueHost` khi route thuộc `/catalog/*`. Lúc đó effect trong `VueHost` mới gọi loader và yêu cầu remote.
+
+Có hai việc bất đồng bộ riêng: tải bootstrap để khởi động app, và tải remote khi vào Catalog. Tách bootstrap không tự làm mọi remote thành lazy; thời điểm gọi import mới quyết định remote có bị tải sớm hay không.
+
+Loader trong `remote.ts` giữ một Promise để các lời gọi đồng thời dùng chung lần tải. Nó cũng kiểm tra API nhận được trước khi trả cho React. Nếu tải lỗi, loader xóa Promise đó thay vì giữ mãi một kết quả reject. Tuy vậy, Webpack runtime còn có cache riêng; ví dụ dùng nút reload trang để thử lại, không hứa rằng chỉ gọi lại hàm là đủ cho mọi loại lỗi.
+
+Còn <SourceRef project="module-federation-react-vue" file="shell/src/env.d.ts">env.d.ts</SourceRef> chỉ giúp TypeScript hiểu tên module `vueSub/mount`. Khai báo type không làm remote tồn tại ở URL đã cấu hình, cũng không kiểm tra được API của bản remote đang chạy trên server.
+
+## 6. Có module rồi, gắn Vue vào React thế nào?
+
+`import()` chỉ trả về exports. Nó không biết bạn muốn đặt giao diện ở đâu, càng không tự biến một Vue component thành React component.
+
+Thay vì expose trực tiếp component, ví dụ expose một hàm `mountVueSub`. Shell cấp phần tử DOM và location ban đầu; remote tự tạo Vue app bên trong phần tử đó. Hai bên thống nhất API trong <SourceRef project="module-federation-react-vue" file="vue-sub/src/protocol.ts">protocol.ts</SourceRef>:
+
+```ts
+interface MountOptions {
+  initialLocation: string;
+  onNavigate(location: string): void;
+}
+
+interface VueSubInstance {
+  updateLocation(location: string): Promise<void>;
+  unmount(): void;
+}
+```
+
+Hàm mount nhận `HTMLElement` cùng `MountOptions`, rồi trả về `Promise<VueSubInstance>`. Nó là hàm async vì remote cần đưa router đến route ban đầu và đợi router sẵn sàng trước khi mount. Nhờ đó, mở thẳng trang Product 42 không phải mount ở trang mặc định rồi mới chuyển tiếp.
+
+Với API này, React không cần biết `createApp` hay Vue Router được gọi thế nào. Nó chỉ cần giữ instance để cập nhật location hoặc unmount về sau. Đổi lại, Vue không được tự ý chiếm DOM bên ngoài vùng được cấp.
+
+**React giữ container; Vue quản lý các node con bên trong.** Đừng để React vừa render children vào đó, vừa yêu cầu Vue quản lý chính những node ấy. Hai framework không có cơ chế chung để quyết định bên nào được sửa chúng.
+
+### Rời Catalog trong lúc remote còn đang tải
+
+Trường hợp dễ bỏ sót là người dùng bấm Catalog rồi quay về Home ngay, trước khi request tải code hoàn tất. Nếu effect cứ tiếp tục mount khi Promise resolve, Vue có thể được tạo ra dù component React đã biến mất.
+
+<SourceRef project="module-federation-react-vue" file="shell/src/shell/VueHost.tsx" region="mount-lifecycle">Effect trong VueHost.tsx</SourceRef> dùng cờ `cancelled` để xử lý cả hai thời điểm. Nếu import xong mà host đã bị hủy, nó không bắt đầu mount. Nếu mount đang chạy và chỉ hoàn tất sau cleanup, nó gọi `unmount()` ngay trên instance vừa nhận.
+
+Đây không phải hủy request mạng. Nó là cách tránh dùng kết quả async khi nơi cần kết quả đó không còn tồn tại.
+
+Khi rời Catalog bình thường, cleanup cũng gọi `unmount()`. Phía <SourceRef project="module-federation-react-vue" file="vue-sub/src/mount.ts" region="mount-api">remote</SourceRef> gỡ navigation hook và hủy Vue instance. Hàm này kiểm tra trạng thái để gọi lặp vẫn an toàn. Bỏ phần cleanup có thể để lại hooks, subscriptions hoặc state sau nhiều lần chuyển trang, dù lần mở đầu tiên trông hoàn toàn bình thường.
+
+### Remote lỗi thì chỉ vùng Catalog báo lỗi
+
+Nếu remote không chạy, shell vẫn phải cho người dùng quay về Home. Vì vậy `VueHost` có loading state, thông báo lỗi và nút reload ngay trong vùng Catalog; navigation vẫn do React render.
+
+Remote export `protocolVersion = 1`. Host kiểm tra version này cùng sự tồn tại của `mountVueSub` trước khi gọi. Đây là version của API do hai app thống nhất, không phải version Webpack. Kiểm tra đó giúp phát hiện một số bản remote không tương thích, chưa phải xác thực nguồn code hay kiểm tra đầy đủ mọi giá trị trả về.
+
+Một tab đang mở có thể vẫn chạy shell cũ khi bạn vừa deploy remote mới. Giữ API tương thích với shell ấy là trách nhiệm của hai bên; Federation không làm hộ việc đó.
+
+## 7. Hai router nhưng chỉ một thanh địa chỉ
+
+Đến đây Vue đã hiện được trong React. Nhưng nếu cả React Router lẫn Vue Router đều tự cập nhật browser history, một cú click có thể bị hai bên xử lý theo hai cách khác nhau. Back/Forward, query và hash cũng bắt đầu khó kiểm soát.
+
+Ví dụ chọn một quy tắc đơn giản: shell sở hữu URL trên thanh địa chỉ. <SourceRef project="module-federation-react-vue" file="shell/src/bootstrap.tsx">React dùng BrowserRouter</SourceRef>, còn Vue khi nhúng vào shell dùng `createMemoryHistory()`. Memory router vẫn biết route hiện tại của Vue, nhưng không tự ghi browser history.
+
+Khi chạy standalone, <SourceRef project="module-federation-react-vue" file="vue-sub/src/bootstrap.ts">Vue bootstrap</SourceRef> lại dùng `createWebHistory()`. Lúc đó không có shell, nên Vue cần tự quản lý thanh địa chỉ. Cùng một giao diện, nhưng cách khởi tạo router khác nhau tùy nơi chạy.
+
+### Shell báo location xuống Vue
+
+Giả sử người dùng mở trực tiếp:
+
+```text
+/catalog/products/42?color=blue#details
+```
+
+Shell phải truyền cả `pathname + search + hash`, không chỉ `/catalog/products/42`. <SourceRef project="module-federation-react-vue" file="shell/src/shell/VueHost.tsx" region="location-bridge">Location effect</SourceRef> gọi `updateLocation(fullPath)` mỗi khi location thay đổi, kể cả do Back/Forward.
+
+Lúc mount đầu tiên, `initialLocation` đưa Vue đến đúng trang. Các lần sau chỉ cần cập nhật memory router, không tạo lại cả Vue app. Nếu bạn đưa mỗi thay đổi pathname vào effect mount/unmount, số đếm của Vue sẽ về 0 khi chuyển từ Catalog sang Product 42. Đó là remount nhầm, không phải Vue Router tự làm mất state.
+
+### Vue nhờ shell đổi URL
+
+Khi người dùng bấm Product 42 bên trong Vue, Vue Router đổi route nội bộ rồi gọi callback `onNavigate`. Shell nhận location đó, dùng React Router `navigate()` để cập nhật URL thật. Location mới lại được truyền xuống Vue qua chiều vừa mô tả:
+
+```d2 title="Shell giữ browser history, Vue gửi yêu cầu điều hướng"
+direction: right
+vue: "Vue memory router"
+shell: "React Router"
+history: "Browser history"
+vue -> shell: "onNavigate(fullPath)"
+shell -> history: "navigate(fullPath)"
+history -> shell: "Location mới hoặc Back/Forward"
+shell -> vue: "updateLocation(fullPath)"
+```
+
+Luồng này có thể lặp nếu Vue cứ nhận update từ host rồi phát lại `onNavigate`. Trong <SourceRef project="module-federation-react-vue" file="vue-sub/src/mount.ts" region="mount-api">mount.ts</SourceRef>, remote không replace khi full path đã khớp và không báo ngược lên trong lúc đang xử lý update của host. Navigation bị router hủy hoặc lỗi cũng không được phát như một lần chuyển trang thành công.
+
+Phía <SourceRef project="module-federation-react-vue" file="shell/src/shell/VueHost.tsx" region="mount-lifecycle">shell</SourceRef> chỉ nhận location thuộc namespace `/catalog` và từ chối chuỗi có backslash. Callback không phải chỗ để remote tùy ý đưa một URL ngoài app vào navigation.
+
+Bạn có thể kiểm tra cả vòng này bằng bộ đếm đã thử lúc đầu: chuyển giữa các route con thì số đếm còn nguyên; rời hẳn Catalog rồi quay lại thì có instance mới, số đếm trở về 0.
+
+## 8. Phần config không liên quan đến Federation
+
+Hai app kết nối được với nhau không có nghĩa là chúng dùng chung cách biên dịch. Shell vẫn cần rules cho TSX và CSS; remote vẫn cần xử lý Vue Single-File Component (SFC), tức các file `.vue` có template, script và style.
+
+Các rules đó nằm ở <SourceRef project="module-federation-react-vue" file="shell/webpack.config.cjs" region="loaders">loaders của shell</SourceRef> và <SourceRef project="module-federation-react-vue" file="vue-sub/webpack.config.cjs" region="loaders">loaders của remote</SourceRef>. Phía Vue có vài dòng dễ gây thắc mắc:
+
+- `vue-loader` xử lý các phần của SFC; `VueLoaderPlugin` giúp chúng đi qua những rules tương ứng.
+- `appendTsSuffixTo: [/\.vue$/]` giúp phần TypeScript trong SFC đi qua `ts-loader`. Nó không đổi tên file `.vue` trên đĩa.
+- Alias `vue$` chọn bản runtime-only, vì template SFC đã được compile lúc build.
+- CSS đi qua `css-loader` rồi `style-loader`. `<style scoped>` giới hạn selector của component, không cách ly toàn bộ hai ứng dụng hay tạo security sandbox.
+
+Cả hai app đặt `transpileOnly: true` cho `ts-loader`, nên bước chuyển TypeScript thành JavaScript không đồng thời kiểm tra type đầy đủ. Script build chạy check riêng trước: shell dùng `tsc --noEmit`, Vue dùng `vue-tsc --noEmit`. Dev server không tự chạy bước full type-check này.
+
+Bạn sẽ thấy `noEmit: true` trong <SourceRef project="module-federation-react-vue" file="shell/tsconfig.json">tsconfig React</SourceRef> và <SourceRef project="module-federation-react-vue" file="vue-sub/tsconfig.json">tsconfig Vue</SourceRef>, trong khi loader ghi đè `noEmit: false`. Hai cấu hình phục vụ hai việc: type checker không cần ghi JavaScript ra đĩa, còn loader cần tạo JavaScript để chuyển cho Webpack. Không cần sinh các file `.js` cạnh source mới build được.
+
+## 9. Remote entry tải được, vì sao chunk vẫn 404?
+
+Đây là lúc cần phân biệt URL của trang với URL của code remote. Trang đang mở ở shell `5173`, nhưng Vue được tải từ `5174`. Render vào DOM của shell không có nghĩa là các chunk Vue cũng nằm trên server shell.
+
+### publicPath quyết định nơi tải chunk
+
+Trong <SourceRef project="module-federation-react-vue" file="vue-sub/webpack.config.cjs" region="output">output của Vue</SourceRef>, `publicPath: 'auto'` giúp runtime suy ra nơi tải các chunk tiếp theo từ ngữ cảnh script. Với remote entry ở:
+
+```text
+http://127.0.0.1:5174/remoteEntry.js
+```
+
+các chunk remote cần được lấy từ server Vue, không phải tự ghép vào origin `5173` của trang đang mở. Nếu entry trả 200 nhưng chunk tiếp theo 404, hãy nhìn URL request trước khi sửa `exposes`.
+
+Có mấy loại đường dẫn khác nhau trong config:
+
+| Cấu hình | Nó quyết định gì? |
+| --- | --- |
+| `output.path` | Thư mục Webpack ghi file trên máy build |
+| `HtmlWebpackPlugin.publicPath: '/'` | URL gốc cho script/link plugin chèn vào HTML |
+| `output.publicPath: 'auto'` | Base URL runtime dùng để tải thêm chunk/asset |
+| SPA fallback của server | Route ứng dụng nào cần được trả về HTML |
+
+Chúng không thay thế cho nhau. Ví dụ deploy dưới `/demo/` cần kiểm tra lại cả public paths và router base; dấu `'/'` đang dùng cho local không tự biến thành prefix mới.
+
+### uniqueName khác tên container
+
+<SourceRef project="module-federation-react-vue" file="shell/webpack.config.cjs" region="output">Shell</SourceRef> đặt `uniqueName: 'routingReactShell'`, remote đặt `routingVueSub`. Tên này phân biệt các runtime/chunk-loading globals khi nhiều build cùng chạy trên một trang, tránh vô tình đụng nhau.
+
+Nó không phải alias dùng trong import, cũng không phải `name: 'vueSub'` của container. Alias giúp source shell chỉ đến một remote; container name giúp runtime tìm container đó; `uniqueName` tránh xung đột giữa các build. Việc đặt chúng giống nhau trong một ví dụ nhỏ dễ làm bạn tưởng chúng là một cấu hình duy nhất.
+
+### Đọc output của hai build
+
+Sau khi build, output có dạng bên dưới. Tên có `<hash>` chỉ để minh họa, không phải tên file cố định:
+
+```text
+shell/dist/
+├── index.html
+├── main.<hash>.js
+└── <chunks>.<hash>.js
+
+vue-sub/dist/
+├── index.html
+├── main.<hash>.js
+├── remoteEntry.js
+└── <chunks>.<hash>.js
+```
+
+Shell không tải `index.html` của Vue để nhúng trang vào trong trang. Nó tải container entry và các chunk cần thiết. HTML của Vue dành cho chế độ standalone; tùy entrypoints mà HtmlWebpackPlugin có thể chèn cả entry app lẫn container entry vào HTML đó.
+
+`output.filename` đặt tên initial chunks, còn `ModuleFederationPlugin.filename` chủ động giữ tên `remoteEntry.js`. Nếu thấy file mang ID số, cũng đừng suy ra số đó luôn là chunk Vue hay một source file cụ thể. Muốn biết nó chứa gì, hãy xem stats của đúng lần build.
+
+Các [build capture ở bài Webpack](/web/03-webpack-tu-source-den-trinh-duyet#81-so-sánh-output-trước-và-sau-khi-tách-bootstrap) có thể giúp bạn đọc runtime trước. Chúng là output của ví dụ Webpack cơ bản, không phải artifacts của hai app trong bài này.
+
+## 10. Shared dependencies và async bootstrap
+
+Nếu nhiều remote cùng dùng Vue, tải lại một bản Vue cho từng remote có thể là điều bạn muốn tránh. `shared` cho phép các build đăng ký việc cung cấp và sử dụng package qua share scope của runtime.
+
+<SourceRef project="module-federation-react-vue" file="vue-sub/webpack.config.cjs" region="federation">Vue remote khai báo</SourceRef>:
+
+```js
+vue: { singleton: true, requiredVersion: pkg.dependencies.vue },
+'vue-router': { singleton: true, requiredVersion: pkg.dependencies['vue-router'] },
+```
+
+`singleton: true` yêu cầu runtime chọn một phiên bản cho package trong share scope liên quan. `requiredVersion` nói khoảng version mà build mong đợi. Nếu các bên yêu cầu version không tương thích, bạn vẫn cần xử lý xung đột; chữ singleton không làm những API khác version trở nên tương thích với nhau.
+
+Trong ví dụ chỉ có một remote Vue. Shell dùng React nên không khai báo shared Vue, và shared React cũng không giúp gì cho Vue. Đây là cấu hình phía remote để tham gia cơ chế sharing, không phải bằng chứng rằng hai framework đang dùng chung một runtime.
+
+Phần shared cũng giải thích vì sao <SourceRef project="module-federation-react-vue" file="vue-sub/src/main.ts">entry của Vue</SourceRef> tách bootstrap bằng dynamic import. Ranh giới async cho runtime cơ hội chuẩn bị shared modules trước khi code sử dụng chúng chạy. Nếu dùng dependency quá sớm, tùy graph và cấu hình, bạn có thể gặp:
+
+```text
+Shared module is not available for eager consumption
+```
+
+Khi gặp lỗi đó, nên kiểm tra async boundary và cấu hình shared trước, thay vì thêm `eager: true` chỉ để lỗi biến mất. Cũng không cần suy rộng thành “mọi React app đều phải có bootstrap riêng”: bản React cơ bản ở bài trước chạy được khi chưa dùng cơ chế này.
+
+## 11. Đưa hai app lên server
+
+Chạy được ở hai cổng local mới kiểm tra một phần câu chuyện. Khi deploy, bạn còn phải quyết định URL remote, cache entry và thời gian giữ assets cũ. Đây là những thứ quyết định hai app có thực sự release riêng được hay không.
+
+### URL remote trong ví dụ được chốt lúc build
+
+<SourceRef project="module-federation-react-vue" file="shell/webpack.config.cjs">Config shell</SourceRef> đọc `process.env.VUE_SUB_URL`. Ví dụ build shell với remote trên CDN:
+
+```bash
+# Chạy ở examples/module-federation-react-vue
+VUE_SUB_URL=https://cdn.example.com/catalog/remoteEntry.js \
+  npm --prefix shell run build
+```
+
+URL đó được dùng trong `remotes`; <SourceRef project="module-federation-react-vue" file="shell/webpack.config.cjs" region="constants">DefinePlugin</SourceRef> cũng đưa nó vào code để giao diện có thể hiển thị địa chỉ remote khi báo lỗi.
+
+Đổi biến môi trường trên server sau khi build không sửa được bundle đã tạo. Config này cũng không tự đọc `.env`, nên chỉ thêm file `.env` chưa đủ. Nếu muốn đổi URL mà không build lại host, bạn cần thiết kế thêm runtime configuration; ví dụ hiện tại chưa có phần đó.
+
+Còn nếu URL giữ nguyên và API vẫn tương thích, bạn có thể phát hành bản remote mới mà không build lại shell. Cách browser nhận bản mới phụ thuộc vào cache và thời điểm nó tải module, không phải mọi tab đang mở sẽ lập tức thay code đang chạy.
+
+<Callout type="warn" title="Bundle browser không giữ được secrets">
+Đừng đưa secrets vào DefinePlugin. Giá trị được thay vào JavaScript và người dùng có thể tải file đó về đọc.
+</Callout>
+
+### CORS phải được cấu hình ở server remote
+
+Shell và remote ở hai cổng khác nhau là hai origin khác nhau. `localhost` và `127.0.0.1` cũng không phải một origin. <SourceRef project="module-federation-react-vue" file="vue-sub/webpack.config.cjs" region="dev-server">Dev server Vue</SourceRef> cho phép những shell origins đã liệt kê; preview server có allowlist tương ứng cho các cổng preview.
+
+`crossOriginLoading: 'anonymous'` chỉ cấu hình cách runtime tải script cross-origin. Nó không tạo header `Access-Control-Allow-Origin` trên server remote. Khi chuyển lên CDN hoặc Nginx, bạn cần cấu hình phía server đó, không chỉ giữ nguyên tùy chọn Webpack. [Bài CORS](/web/01-cors) giải thích kỹ hơn cách kiểm tra origin và response headers.
+
+CORS cũng không cách ly code remote. Script đã chạy trong trang vẫn có thể truy cập DOM của trang. Chỉ tải remote mà bạn tin cậy; nếu cần cách ly code không tin cậy, hãy cân nhắc ranh giới như iframe cùng cấu hình sandbox phù hợp. Authentication và authorization vẫn là bài toán riêng.
+
+### Đừng xóa chunk cũ ngay khi có bản mới
+
+Giả sử một tab đã tải remote entry bản A. Bạn deploy bản B và xóa toàn bộ chunk của A. Khi tab cũ cần tải thêm một chunk mà A tham chiếu, request sẽ 404, dù bản B đang chạy tốt trên một tab mới.
+
+Vì vậy, file có content hash thường phù hợp để cache lâu, còn HTML và `remoteEntry.js` tên cố định cần policy revalidate phù hợp. Bạn cũng cần giữ assets cũ đủ lâu cho những tab đang mở và kế hoạch rollback. `output.clean` dọn thư mục build local, không phải chiến lược rolling deployment.
+
+Preview script dùng `no-store` để bạn dễ thử trên máy. Nó không mô phỏng CDN production. Khi cấu hình server thật, hãy kiểm tra riêng asset URLs, SPA fallback, CORS, cache và CSP — cấu hình `devServer` không tự được chuyển sang server ấy.
+
+## 12. Tự kiểm tra thay vì chỉ nhìn giao diện
+
+Trang Catalog hiện lên là tín hiệu tốt, nhưng chưa đủ để biết việc tích hợp đã đúng. Một lỗi remount hay một fallback trả nhầm HTML thường chỉ lộ ra khi bạn đổi route hoặc refresh.
+
+### Theo dõi request từ Home đến Catalog
+
+Mở DevTools → Network, bật Disable cache rồi tải lại Home. Bạn sẽ thấy HTML, entry và các chunk React, nhưng chưa cần `remoteEntry.js`. Bấm Catalog mới xuất hiện request đến container Vue và những chunk cần cho mount.
+
+Nhìn tiếp cột Initiator để phân biệt request do HTML khởi tạo với request do runtime yêu cầu. Sau đó kiểm tra host của các request Vue: chúng phải tiếp tục đi đến server remote, không lạc về server shell. Development có thêm request của dev server, nên production preview sẽ ít nhiễu hơn.
+
+### Refresh một deep link
+
+Mở thẳng `/catalog/products/42?color=blue#details` rồi refresh. Để trang hiện đúng, cả chuỗi sau phải hoạt động:
+
+1. Server shell trả HTML qua SPA fallback.
+2. HTML tải entry từ URL đúng, không ghép nhầm dưới `/catalog/products/`.
+3. React Router chọn `VueHost` theo location hiện tại.
+4. Host tải remote và truyền full location vào memory router của Vue.
+5. Vue hiện Product 42 với query `color=blue` và hash `#details`.
+
+Nếu refresh hỏng nhưng click từ Home lại chạy được, hãy bắt đầu từ response HTML và asset URLs. Không có một tùy chọn Federation nào sửa được toàn bộ chuỗi này.
+
+### Đọc stats và chạy kiểm thử tự động
+
+Bạn có thể xem trực tiếp những file hai build tạo ra:
+
+```bash
+# Từ thư mục ví dụ, sau khi build cả hai app
+ls shell/dist
+ls vue-sub/dist
+cat shell/dist/index.html
+cat vue-sub/dist/index.html
+
+# Build trực tiếp để xuất stats; lệnh này không chạy bước type-check của npm run build.
+cd shell
+npx webpack --config webpack.config.cjs --mode production \
+  --profile --json /tmp/federation-shell-stats.json
+```
+
+Trong stats, đối chiếu chunk ID với `files`, `initial`, modules và remote dependencies. Dữ liệu này cho biết chunk của lần build đó chứa gì, thay vì phải đoán theo tên file.
+
+Repository cũng có kiểm thử browser cho ví dụ. Chạy từ **thư mục gốc repository tài liệu**, không phải thư mục shell:
+
+```bash
+npx playwright install chromium
+npm run examples:federation:test
+```
+
+Script cài và build hai app trong thư mục tạm, dùng các cổng trống rồi kiểm tra lazy loading, mount/unmount, navigation, Back/Forward, deep refresh, standalone và remote không sẵn sàng. Nó không cần dừng dev server bạn đang mở.
+
+## 13. Tra lỗi theo triệu chứng
+
+Khi có lỗi, hãy xác định nó xảy ra ở bước nào: build host, tải container, tải chunk, mount hay đồng bộ route. Bảng này là điểm bắt đầu, không phải mọi nguyên nhân có thể xảy ra.
+
+| Hiện tượng | Kiểm tra trước |
+| --- | --- |
+| Webpack không resolve `vueSub/mount` khi build | Alias trong host `remotes` và spelling của import. Nếu chỉ TypeScript báo lỗi, xem thêm `env.d.ts` |
+| `remoteEntry.js` 404 | URL đã được build vào shell, remote server và đường dẫn deploy |
+| Entry tải được nhưng không tìm thấy module | Container name và key `./mount` trong `exposes` |
+| Lỗi eager consumption | Async boundary, shared config và thời điểm sử dụng dependency |
+| Entry tải được nhưng chunk remote 404 | Remote `publicPath`, vị trí chunks và cache của remote entry |
+| Request `.js` lại nhận HTML | Asset URL sai hoặc SPA fallback quá rộng |
+| Browser báo CORS | Origin thực tế, allowlist và response headers của server remote |
+| Import thành công nhưng không có UI | Host đã gọi và await mount chưa; kiểm tra root element, protocol và lỗi router |
+| Chuyển route con làm số đếm Vue về 0 | Có đang remount root theo mỗi location thay vì gọi `updateLocation` không? |
+| Back/Forward hoặc query/hash bị lệch | Bridge có truyền full path không; có đúng chỉ shell ghi browser history không? |
+| Rời Catalog nhưng hooks/state vẫn chạy | Effect cleanup của React và `unmount` của remote |
+| Remote mới làm shell cũ hỏng | API compatibility, version selection và việc giữ assets cũ |
+| Đổi `VUE_SUB_URL` nhưng browser vẫn gọi địa chỉ cũ | Biến được đọc lúc build; cần rebuild host với URL mới |
+
+## 14. Có nên dùng cách này cho dự án của bạn?
+
+Nếu vướng mắc hiện tại chỉ là code nhiều hoặc bundle lớn, hãy thử chia module, lazy loading và cải thiện build trước. Những việc đó không bắt bạn phải quản lý thêm remote URL, version API và các trường hợp hai bản deploy không khớp nhau.
+
+Microfrontend đáng cân nhắc hơn khi có những phần nghiệp vụ do các team khác nhau sở hữu, cần release riêng, hoặc khi bạn muốn thay dần một phần ứng dụng mà chưa thể viết lại toàn bộ. Khi ấy, chia theo catalog, checkout hay account thường có ý nghĩa hơn chia đơn thuần theo “phần React” và “phần Vue”. Framework là lựa chọn bên trong mỗi phần, không phải lý do để đặt ranh giới.
+
+Trước khi mang ví dụ này vào dự án thật, hãy thử một việc: chặn request `remoteEntry.js` trong DevTools rồi mở Catalog. Bạn có thông báo lỗi dễ hiểu không? Có quay về Home được không? Sau đó nghĩ đến trường hợp shell cũ gặp remote mới và cách rollback mà không làm mất chunk của tab đang mở. Nếu chưa trả lời được những câu đó, phần cần làm tiếp là contract và vận hành, không phải thêm một remote nữa.
+
+## Đọc thêm
+
+- [Webpack: từ source code đến trình duyệt](/web/03-webpack-tu-source-den-trinh-duyet) — nền tảng entry, loaders, chunks và runtime.
+- [Frontend build tooling](/web/02-frontend-build-tooling) — phân biệt compiler, bundler và type checker.
+- [CORS](/web/01-cors) — kiểm tra origin và response headers.
+- [Micro Frontends — Cam Jackson](https://martinfowler.com/articles/micro-frontends.html) — nhìn bài toán từ ranh giới team, independent deployment đến chi phí vận hành.
+- [Microfrontend, Module Federation — đưa microservices đến với frontend](https://viblo.asia/p/microfrontend-module-federation-dua-microservices-den-voi-frontend-AZoJjXEEVY7) — ví dụ tiếng Việt về shell và các widget khác framework.
+- [How to build Microfrontends with Module Federation and Vue — alexop.dev](https://alexop.dev/posts/how-to-build-microfrontends-with-module-federation-and-vue/) — một ví dụ khác về routing, giao tiếp và xử lý remote lỗi. Bài đó dùng tooling khác ví dụ Webpack 5 ở đây.
+- [Webpack Module Federation](https://webpack.js.org/concepts/module-federation/) và [ModuleFederationPlugin](https://webpack.js.org/plugins/module-federation-plugin/) — container, `remotes`, `exposes`, `shared` và async bootstrap.
+- [Webpack Public Path](https://webpack.js.org/guides/public-path/) — base URL của chunk và asset.
+- [Vue Loader](https://vue-loader.vuejs.org/guide/) và [Vue Router history modes](https://router.vuejs.org/guide/essentials/history-mode.html) — cách build SFC và chọn web/memory history.

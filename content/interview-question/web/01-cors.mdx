@@ -1,0 +1,872 @@
+---
+title: "CORS: cơ chế browser, preflight và cấu hình an toàn"
+description: "Hiểu đúng Same-Origin Policy, simple request, preflight, credentials, cookies, CSRF và cách cấu hình CORS an toàn với Spring Boot 3."
+---
+
+API trả `200` khi gọi bằng curl nhưng frontend vẫn báo không đọc được response. Đây là một tình huống dễ dẫn tới cách sửa sai: thêm wildcard ở nhiều tầng hoặc tắt cơ chế bảo vệ trong browser. Muốn sửa đúng, bạn cần biết request nào đã được gửi và browser đang từ chối ở bước nào.
+
+Bài này đi từ origin và Same-Origin Policy đến hai luồng CORS, rồi áp dụng vào cookie, Spring Security và việc debug qua gateway/CDN. Mục tiêu là giữ policy đủ hẹp mà application vẫn hoạt động, không biến CORS thành cơ chế authentication.
+
+<Callout type="info" title="Kiến thức nền">
+Bạn cần đọc được HTTP method, header, status và một lời gọi `fetch`. Ví dụ dùng Spring Boot 3/Spring Security 6; hãy đối chiếu API với version dự án. Các request/response là minh họa protocol, không phải lưu lượng đã gửi tới endpoint thật.
+</Callout>
+
+## Mục lục
+
+- [Cùng endpoint nhưng curl và browser có hành vi khác nhau](#cùng-endpoint-nhưng-curl-và-browser-có-hành-vi-khác-nhau)
+- [Origin gồm scheme, host và port](#origin-gồm-scheme-host-và-port)
+- [Same-Origin Policy và quyền đọc response](#same-origin-policy-và-quyền-đọc-response)
+- [Hai flow quan trọng: request không preflight và request có preflight](#hai-flow-quan-trọng-request-không-preflight-và-request-có-preflight)
+  - [Flow A — request không cần preflight](#flow-a--request-không-cần-preflight)
+  - [Điều kiện của request không cần preflight](#điều-kiện-của-request-không-cần-preflight)
+  - [Flow B — request có preflight](#flow-b--request-có-preflight)
+- [Các trường hợp kích hoạt preflight](#các-trường-hợp-kích-hoạt-preflight)
+- [Bảng các CORS headers cần nhớ](#bảng-các-cors-headers-cần-nhớ)
+  - [Request headers do browser gửi](#request-headers-do-browser-gửi)
+  - [Response headers do server gửi](#response-headers-do-server-gửi)
+  - [`Allow-Headers` khác `Expose-Headers`](#allow-headers-khác-expose-headers)
+- [Credentials: cookie, HTTP authentication và TLS client certificate](#credentials-cookie-http-authentication-và-tls-client-certificate)
+  - [Bearer token và credentials mode của Fetch](#bearer-token-và-credentials-mode-của-fetch)
+- [CORS và CSRF: liên quan nhưng không thay thế nhau](#cors-và-csrf-liên-quan-nhưng-không-thay-thế-nhau)
+- [Cấu hình CORS đúng trong Spring Boot 3 / Spring Security 6](#cấu-hình-cors-đúng-trong-spring-boot-3--spring-security-6)
+  - [Đưa origins ra configuration](#đưa-origins-ra-configuration)
+  - [`allowedOrigins` và `allowedOriginPatterns`](#allowedorigins-và-allowedoriginpatterns)
+  - [Phạm vi sử dụng `@CrossOrigin`](#phạm-vi-sử-dụng-crossorigin)
+- [Một layer sở hữu CORS policy](#một-layer-sở-hữu-cors-policy)
+  - [Cache response biến thể theo Origin](#cache-response-biến-thể-theo-origin)
+- [Quy trình debug CORS theo flow, không đoán](#quy-trình-debug-cors-theo-flow-không-đoán)
+  - [Bước 1 — Ghi lại tuple của request](#bước-1--ghi-lại-tuple-của-request)
+  - [Bước 2 — Mở Network tab và tìm `OPTIONS`](#bước-2--mở-network-tab-và-tìm-options)
+  - [Bước 3 — Reproduce preflight bằng `curl`](#bước-3--reproduce-preflight-bằng-curl)
+  - [Bước 4 — Theo trace qua từng hop](#bước-4--theo-trace-qua-từng-hop)
+  - [Bước 5 — Kiểm tra cả error path](#bước-5--kiểm-tra-cả-error-path)
+  - [Bước 6 — Test từ browser thật](#bước-6--test-từ-browser-thật)
+- [Những lỗi thường gặp và cách định vị](#những-lỗi-thường-gặp-và-cách-định-vị)
+  - [Trường hợp `Origin: null`](#trường-hợp-origin-null)
+  - [Private Network Access](#private-network-access)
+- [Security checklist cho CORS policy](#security-checklist-cho-cors-policy)
+- [Observability và alerting](#observability-và-alerting)
+- [Test CORS policy](#test-cors-policy)
+  - [Integration test với Spring MockMvc](#integration-test-với-spring-mockmvc)
+  - [Những case tối thiểu](#những-case-tối-thiểu)
+- [Dùng same-origin BFF khi cần đơn giản hóa boundary](#dùng-same-origin-bff-khi-cần-đơn-giản-hóa-boundary)
+- [Policy cho nhiều tenant domains](#policy-cho-nhiều-tenant-domains)
+- [Tài liệu chính thức](#tài-liệu-chính-thức)
+- [Bài liên quan](#bài-liên-quan)
+
+## Cùng endpoint nhưng curl và browser có hành vi khác nhau
+
+Giả sử frontend được phục vụ tại:
+
+```txt
+https://app.example.com
+```
+
+và gọi API:
+
+```txt
+https://api.example.com/orders
+```
+
+Backend vẫn khỏe:
+
+```bash
+curl -i https://api.example.com/orders
+# HTTP/2 200
+# Content-Type: application/json
+# {"items":[...]}
+```
+
+Nhưng browser báo:
+
+```txt
+Access to fetch at 'https://api.example.com/orders'
+from origin 'https://app.example.com' has been blocked by CORS policy
+```
+
+Hai kết quả này không mâu thuẫn. `curl` là HTTP client, nó không thực thi Same-Origin Policy của browser. Browser nhận biết JavaScript từ `app.example.com` đang muốn đọc tài nguyên của `api.example.com`, nên áp dụng CORS protocol trước khi giao response cho JavaScript.
+
+Mental model đúng là:
+
+```d2 title="Browser là nơi thực thi CORS"
+direction: down
+js: "JavaScript"
+browser: "Browser security boundary\nQuyết định preflight, kiểm tra CORS response headers"
+network: "Network / CDN / Gateway / Backend"
+js -> browser: "fetch()"
+browser -> network
+```
+
+CORS error trong console chỉ nói rằng **browser không cho JavaScript dùng response**. Nó chưa nói backend chết, DNS sai, certificate sai, request bị `401`, gateway redirect hay response thiếu header. Vì vậy bước đầu tiên luôn là mở **DevTools → Network**, không chỉ đọc một dòng console.
+
+---
+
+## Origin gồm scheme, host và port
+
+Một origin gồm đúng ba thành phần:
+
+```txt
+origin = scheme + host + port
+```
+
+So sánh với `https://app.example.com`:
+
+| URL | Same origin? | Lý do |
+|---|---:|---|
+| `https://app.example.com/profile` | Có | Path không thuộc origin |
+| `https://app.example.com:443/api` | Có | `443` là default port của HTTPS |
+| `http://app.example.com` | Không | Khác scheme |
+| `https://api.example.com` | Không | Khác host |
+| `https://www.app.example.com` | Không | Khác host/subdomain |
+| `https://app.example.com:8443` | Không | Khác port |
+
+Hai hiểu lầm rất phổ biến:
+
+1. **Cùng parent domain không có nghĩa là cùng origin.** `app.example.com` và `api.example.com` vẫn cross-origin.
+2. **Path không ảnh hưởng origin.** `/admin` và `/public` trên cùng scheme/host/port là same-origin; muốn phân quyền theo path phải dùng authorization, không dùng CORS như access-control theo user.
+
+Browser thường gửi request header:
+
+```http
+Origin: https://app.example.com
+```
+
+Origin không có path và không có dấu `/` cuối. Vì vậy allowlist `https://app.example.com/` có thể không match nếu framework yêu cầu exact origin string.
+
+---
+
+## Same-Origin Policy và quyền đọc response
+
+**Same-Origin Policy (SOP)** là security boundary mặc định của browser: script từ một origin không được tùy ý đọc dữ liệu của origin khác. Nếu không có boundary này, một trang độc hại mở trong browser có thể dùng session đang đăng nhập của bạn để đọc email, tài khoản ngân hàng hoặc dữ liệu nội bộ từ site khác.
+
+**CORS** là protocol dựa trên HTTP headers để server nói với browser:
+
+```txt
+"Tôi cho phép JavaScript từ origin X đọc response này
+với method/header/credentials theo policy Y."
+```
+
+Điểm tinh tế: SOP chủ yếu giới hạn **khả năng đọc response từ script**, không phải firewall chặn mọi request cross-origin.
+
+- `<form>` từ site A từ lâu đã có thể submit `POST` sang site B.
+- `<img>` có thể tải ảnh từ site B.
+- Một số `fetch` cross-origin có thể được gửi và server vẫn thực hiện side effect.
+- Nhưng JavaScript chỉ đọc được response nếu CORS checks pass.
+
+Do đó:
+
+```txt
+CORS ≠ authentication
+CORS ≠ authorization
+CORS ≠ CSRF protection
+CORS ≠ network firewall
+```
+
+API phải xác thực token/cookie và phân quyền ở server với mọi client. Không được nghĩ rằng “origin không nằm trong CORS allowlist nên attacker không gọi API được”; attacker có thể dùng `curl`, mobile app, server riêng hoặc gửi form mà không cần browser đọc response.
+
+---
+
+## Hai flow quan trọng: request không preflight và request có preflight
+
+### Flow A — request không cần preflight
+
+Frontend:
+
+```ts
+const response = await fetch("https://api.example.com/public/products");
+const products = await response.json();
+```
+
+Browser có thể gửi thẳng; backend trả response và CORS policy như sau. Đây là transcript minh họa, không gửi request thật:
+
+```protocol-exchange
+title: CORS — GET không cần preflight
+variants:
+  - id: allowed
+    title: Origin được phép đọc response
+    request:
+      method: GET
+      url: https://api.example.com/public/products
+      headers:
+        - {id: host, name: Host, value: api.example.com}
+        - {id: origin, name: Origin, value: 'https://app.example.com'}
+    response:
+      status: 200
+      statusText: OK
+      headers:
+        - {id: type, name: Content-Type, value: application/json}
+        - {id: allow-origin, name: Access-Control-Allow-Origin, value: 'https://app.example.com'}
+        - {id: vary, name: Vary, value: Origin}
+      body: {kind: json, json: '{"items":[]}'}
+```
+
+Browser so sánh `Origin` đã gửi với `Access-Control-Allow-Origin` nhận về. Nếu hợp lệ, JavaScript được đọc response. Nếu header thiếu hoặc sai, request có thể vẫn nhận `200` trên network nhưng `fetch()` reject với `TypeError: Failed to fetch`.
+
+### Điều kiện của request không cần preflight
+
+Tài liệu thường gọi nhóm này là **simple request**; về cơ chế, bạn cần xem các điều kiện CORS-safelisted trong Fetch specification. Request tránh preflight khi thỏa toàn bộ nhóm điều kiện chính:
+
+- Method chỉ là `GET`, `HEAD` hoặc `POST`.
+- Header do JavaScript tự đặt chỉ thuộc CORS safelist, ví dụ `Accept`, `Accept-Language`, `Content-Language`, và `Content-Type` với giới hạn.
+- `Content-Type`, nếu có, chỉ là `application/x-www-form-urlencoded`, `multipart/form-data` hoặc `text/plain`.
+- Không dùng các khả năng đặc biệt như upload listener/stream khiến request ra khỏi safelist.
+
+`POST` không đồng nghĩa với preflight. Ví dụ form POST dùng `application/x-www-form-urlencoded` có thể không preflight. Ngược lại, một `GET` có header `Authorization` sẽ preflight.
+
+### Flow B — request có preflight
+
+Frontend gọi:
+
+```ts
+const response = await fetch("https://api.example.com/orders", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${accessToken}`,
+    "X-Request-Id": crypto.randomUUID(),
+  },
+  body: JSON.stringify({ productId: "p-123", quantity: 2 }),
+});
+```
+
+`application/json`, `Authorization` và `X-Request-Id` làm request này cần preflight. Browser tự gửi `OPTIONS` trước:
+
+```http
+OPTIONS /orders HTTP/1.1
+Host: api.example.com
+Origin: https://app.example.com
+Access-Control-Request-Method: POST
+Access-Control-Request-Headers: authorization,content-type,x-request-id
+```
+
+Server phải trả policy phù hợp:
+
+```http
+HTTP/1.1 204 No Content
+Access-Control-Allow-Origin: https://app.example.com
+Access-Control-Allow-Methods: POST
+Access-Control-Allow-Headers: Authorization, Content-Type, X-Request-Id
+Access-Control-Max-Age: 600
+Vary: Origin
+```
+
+Browser kiểm tra response. Nếu pass, nó mới gửi actual request:
+
+```http
+POST /orders HTTP/1.1
+Host: api.example.com
+Origin: https://app.example.com
+Authorization: Bearer eyJ...
+Content-Type: application/json
+X-Request-Id: 019...
+
+{"productId":"p-123","quantity":2}
+```
+
+Và **actual response cũng phải có** CORS header:
+
+```http
+HTTP/1.1 201 Created
+Access-Control-Allow-Origin: https://app.example.com
+Vary: Origin
+Content-Type: application/json
+
+{"orderId":"ord-456"}
+```
+
+Preflight pass nhưng actual response thiếu `Access-Control-Allow-Origin` vẫn khiến browser chặn JavaScript đọc response.
+
+---
+
+## Các trường hợp kích hoạt preflight
+
+Thay vì học thuộc một danh sách rời rạc, hãy dùng mental model:
+
+```txt
+Nếu request vượt ra ngoài những gì một HTML form truyền thống có thể gửi,
+browser thường muốn hỏi server trước bằng OPTIONS.
+```
+
+Các trigger thường gặp:
+
+| Request | Preflight? | Vì sao |
+|---|---:|---|
+| `GET` không custom header | Thường không | Safelisted |
+| `POST` + `text/plain` | Thường không | Method/content type safelisted |
+| `POST` + `application/json` | Có | JSON không phải safelisted content type |
+| `GET` + `Authorization` | Có | `Authorization` không thuộc safelist |
+| `PUT`, `PATCH`, `DELETE` | Có | Method không thuộc safelist |
+| Bất kỳ method + `X-Tenant-Id` | Có | Custom request header |
+
+Không nên “tối ưu” bằng cách đổi JSON sang `text/plain` chỉ để né preflight nếu làm API contract khó hiểu hoặc ảnh hưởng security. Nếu preflight là overhead đáng kể, giải pháp đúng thường là cache preflight hợp lý, dùng same-origin reverse proxy/BFF, hoặc đo xem latency thực sự nằm ở đâu.
+
+---
+
+## Bảng các CORS headers cần nhớ
+
+### Request headers do browser gửi
+
+| Header | Xuất hiện ở đâu | Ý nghĩa |
+|---|---|---|
+| `Origin` | Preflight và actual request cross-origin | Origin của page khởi tạo request |
+| `Access-Control-Request-Method` | Chỉ preflight | Method của actual request dự kiến |
+| `Access-Control-Request-Headers` | Chỉ preflight | Danh sách header của actual request dự kiến |
+
+Frontend không nên tự set các header `Origin` hoặc `Access-Control-Request-*`; browser quản lý chúng.
+
+### Response headers do server gửi
+
+| Header | Ý nghĩa | Lưu ý |
+|---|---|---|
+| `Access-Control-Allow-Origin` | Origin được phép đọc response | Một response chỉ có một origin cụ thể hoặc `*` |
+| `Access-Control-Allow-Methods` | Methods được phép | Chủ yếu dùng khi trả preflight |
+| `Access-Control-Allow-Headers` | Request headers được phép | Phải cover headers browser hỏi trong preflight |
+| `Access-Control-Allow-Credentials` | Cho phép expose response khi request có credentials | Giá trị hợp lệ là `true`, không phải `*` |
+| `Access-Control-Expose-Headers` | Cho JavaScript đọc thêm response headers | Không liên quan request headers |
+| `Access-Control-Max-Age` | Thời gian browser cache kết quả preflight | Browser có internal cap riêng |
+| `Vary: Origin` | Báo cache rằng response thay đổi theo origin | Quan trọng với dynamic allowlist/CDN |
+
+### `Allow-Headers` khác `Expose-Headers`
+
+Hai headers phục vụ hai hướng dữ liệu khác nhau:
+
+`Access-Control-Allow-Headers` nói request được phép gửi headers nào, chẳng hạn `Authorization`. `Access-Control-Expose-Headers` lại cho JavaScript đọc thêm response headers, chẳng hạn `Location`. Allow một request header không tự expose một response header cùng tên.
+
+Ví dụ API tạo resource trả `Location`, frontend muốn đọc:
+
+```http
+Access-Control-Expose-Headers: Location, X-Request-Id
+```
+
+```ts
+const location = response.headers.get("Location");
+```
+
+`Set-Cookie` không trở thành header JavaScript đọc được chỉ vì thêm vào `Expose-Headers`; browser quản lý cookie theo cookie model và không expose `Set-Cookie` cho frontend code.
+
+---
+
+## Credentials: cookie, HTTP authentication và TLS client certificate
+
+Trong Fetch API, `credentials` kiểm soát việc browser gửi credentials và xử lý cookie response:
+
+```ts
+await fetch("https://api.example.com/me", {
+  credentials: "include",
+});
+```
+
+Với cross-origin request dùng credentials, server cần:
+
+```http
+Access-Control-Allow-Origin: https://app.example.com
+Access-Control-Allow-Credentials: true
+Vary: Origin
+```
+
+Không được dùng:
+
+```http
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Credentials: true
+```
+
+Browser sẽ từ chối wildcard origin khi credentials mode yêu cầu credentials. Server phải trả **origin cụ thể đã được validate**.
+
+Một flow cookie thành công cần nhiều điều kiện độc lập:
+
+```txt
+Frontend fetch credentials: "include"
+        +
+Server Access-Control-Allow-Credentials: true
+        +
+Server Access-Control-Allow-Origin: exact allowed origin
+        +
+Cookie Domain/Path phù hợp
+        +
+Cookie Secure nếu cần HTTPS
+        +
+Cookie SameSite phù hợp
+        +
+Browser third-party-cookie policy cho phép
+```
+
+CORS đúng không đảm bảo cookie sẽ được gửi. Ví dụ cross-site cookie thường cần:
+
+```http
+Set-Cookie: SESSION=abc; Path=/; HttpOnly; Secure; SameSite=None
+```
+
+Nhưng không nên máy móc đổi mọi cookie thành `SameSite=None`. Nếu frontend và API có thể đặt cùng site hoặc dùng BFF/reverse proxy same-origin, `SameSite=Lax/Strict` có security posture tốt hơn. Ngoài ra, browser/privacy policy có thể chặn third-party cookies bất kể server đã cấu hình CORS đúng.
+
+### Bearer token và credentials mode của Fetch
+
+Header `Authorization: Bearer ...` làm request cần preflight, nhưng việc bạn tự đặt header này không giống cookie tự động gắn theo `credentials: "include"`. Dù vậy, API vẫn phải allow `Authorization` trong preflight và xác thực token ở actual request. Không nên kết luận rằng dùng JWT thì không cần quan tâm CORS.
+
+---
+
+## CORS và CSRF: liên quan nhưng không thay thế nhau
+
+CSRF xảy ra khi browser tự động gắn credentials, thường là cookie, vào request do site độc hại khởi tạo. Attacker có thể không đọc được response nhưng vẫn gây side effect như đổi email hoặc chuyển tiền nếu server chỉ dựa vào cookie.
+
+Ví dụ request “simple” có thể được gửi không cần preflight:
+
+```html
+<form action="https://bank.example/transfer" method="POST">
+  <input name="amount" value="1000000" />
+  <input name="to" value="attacker" />
+</form>
+<script>document.forms[0].submit()</script>
+```
+
+Nếu server nghĩ “CORS không cho evil.example nên an toàn” thì sai: form submission không cần JavaScript đọc response. Server vẫn phải có CSRF defense phù hợp:
+
+- `SameSite` cookie.
+- CSRF token/synchronizer token hoặc cookie-to-header pattern.
+- Kiểm tra `Origin`/`Referer` như một lớp defense-in-depth cho state-changing request.
+- Re-authentication/step-up auth cho thao tác đặc biệt nhạy cảm.
+- Authorization và business invariant ở server.
+
+Trong Spring Security, không nên copy config `.csrf(csrf -> csrf.disable())` chỉ để “fix CORS”. Với stateless API dùng bearer token không tự động gửi bởi browser, CSRF risk profile khác cookie-based session. Quyết định disable/enable CSRF phải dựa trên authentication mechanism, không dựa trên việc frontend đang báo CORS error.
+
+---
+
+## Cấu hình CORS đúng trong Spring Boot 3 / Spring Security 6
+
+Một cấu hình tập trung, explicit và phù hợp production:
+
+```java
+package com.example.api.config;
+
+import java.time.Duration;
+import java.util.List;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.Customizer;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+@Configuration
+public class SecurityConfig {
+
+    @Bean
+    UrlBasedCorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration cors = new CorsConfiguration();
+
+        // Exact origins lấy từ typed configuration/environment trong code thật.
+        cors.setAllowedOrigins(List.of(
+            "https://app.example.com",
+            "https://admin.example.com"
+        ));
+        cors.setAllowedMethods(List.of(
+            "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"
+        ));
+        cors.setAllowedHeaders(List.of(
+            "Authorization", "Content-Type", "X-Request-Id", "X-CSRF-TOKEN"
+        ));
+        cors.setExposedHeaders(List.of(
+            "Location", "X-Request-Id", "X-RateLimit-Remaining"
+        ));
+        cors.setAllowCredentials(true);
+
+        // 10 phút: giảm preflight nhưng policy thay đổi vẫn rollout tương đối nhanh.
+        // Không có con số đúng cho mọi hệ thống; browser còn có internal cap.
+        cors.setMaxAge(Duration.ofMinutes(10));
+
+        UrlBasedCorsConfigurationSource source =
+            new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/api/**", cors);
+        return source;
+    }
+
+    @Bean
+    SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            // Spring Security dùng CorsConfigurationSource ở trên.
+            // CORS phải được xử lý trước authentication cho preflight.
+            .cors(Customizer.withDefaults())
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/actuator/health").permitAll()
+                .requestMatchers("/api/public/**").permitAll()
+                .anyRequest().authenticated()
+            );
+
+        // Chỉ quyết định CSRF sau khi phân tích cơ chế auth.
+        // Không disable CSRF chỉ để chữa lỗi CORS.
+        return http.build();
+    }
+}
+```
+
+Spring Security yêu cầu CORS được xử lý trước security authentication vì preflight chuẩn không mang session cookie như `JSESSIONID`. Khi security chain chạy trước và yêu cầu authenticated cho `OPTIONS`, browser nhận `401/403`, actual request không bao giờ được gửi.
+
+### Đưa origins ra configuration
+
+Không hard-code domain production cùng localhost trong class nếu nhiều environment:
+
+```yaml
+app:
+  cors:
+    allowed-origins:
+      - https://app.example.com
+      - https://admin.example.com
+```
+
+Có thể bind bằng `@ConfigurationProperties` và validate URL khi startup. Production không nên tự động allow `http://localhost:*`; local origin chỉ xuất hiện trong development profile.
+
+### `allowedOrigins` và `allowedOriginPatterns`
+
+- `allowedOrigins`: exact list, dễ audit, ưu tiên khi số domain hữu hạn.
+- `allowedOriginPatterns`: hữu ích khi thật sự cần pattern port/subdomain, nhưng blast radius lớn hơn.
+
+Không dùng pattern rộng như `https://*.example.com` nếu bất kỳ subdomain nào có thể do user tạo hoặc có nguy cơ subdomain takeover. Một subdomain bị chiếm sẽ trở thành trusted origin và, nếu credentials được phép, có thể đọc dữ liệu người dùng.
+
+### Phạm vi sử dụng `@CrossOrigin`
+
+`@CrossOrigin` là API thật của Spring MVC và hữu ích cho demo hoặc policy rất cục bộ:
+
+```java
+@CrossOrigin(origins = "https://app.example.com")
+@RestController
+@RequestMapping("/api/products")
+class ProductController {
+    // ...
+}
+```
+
+Nhưng trong hệ thống lớn, rải annotation qua controller làm policy khó audit, dễ conflict với global config và dễ quên endpoint mới. Thường nên để một central policy owner; chỉ dùng per-controller override khi có requirement rõ và test riêng.
+
+---
+
+## Một layer sở hữu CORS policy
+
+Request production thường đi qua nhiều tầng:
+
+```d2 title="Request đi qua nhiều tầng"
+direction: right
+n0: "Browser"
+n1: "CloudFront / CDN"
+n2: "AWS ALB / API Gateway / Ingress"
+n3: "Spring Security"
+n4: "Spring MVC Controller"
+n0 -> n1 -> n2 -> n3 -> n4
+```
+
+Nếu cả CDN, ingress và application cùng thêm CORS headers, response có thể thành:
+
+```http
+Access-Control-Allow-Origin: https://app.example.com
+Access-Control-Allow-Origin: *
+```
+
+Nhiều browser coi multiple values là invalid. Hoặc preflight do gateway trả đúng nhưng error response `500` từ application lại thiếu header; kết quả là frontend chỉ thấy “CORS error” và root cause thật bị che.
+
+Thiết kế nên chỉ rõ:
+
+```txt
+Policy owner: API Gateway hoặc Application — chọn một
+Các layer còn lại: pass-through, không tự ý append/overwrite
+Error responses: cũng phải đi qua CORS processing
+Redirects: không redirect OPTIONS sang login/trailing slash/domain khác
+Cache key: vary theo Origin khi response CORS khác nhau
+```
+
+### Cache response biến thể theo Origin
+
+Nếu server dynamic echo một origin đã allow:
+
+```http
+Access-Control-Allow-Origin: https://tenant-a.example
+Vary: Origin
+```
+
+CDN/proxy cần biết response cho tenant A khác response cho tenant B. Thiếu `Vary: Origin`, cache có thể trả header của tenant A cho tenant B, gây lỗi chức năng; trong thiết kế tệ hơn, cache/policy sai có thể tạo data exposure.
+
+Không được đơn giản làm:
+
+```java
+response.setHeader("Access-Control-Allow-Origin", request.getHeader("Origin"));
+```
+
+Đó là **blind origin reflection**. Chỉ echo sau khi exact/pattern match một allowlist đáng tin cậy, và phải xử lý cả `null` origin theo policy rõ ràng.
+
+---
+
+## Quy trình debug CORS theo flow, không đoán
+
+### Bước 1 — Ghi lại tuple của request
+
+```txt
+Page origin:     https://app.example.com
+Request URL:     https://api.example.com/orders
+Method:          POST
+Request headers: Authorization, Content-Type, X-Request-Id
+Credentials:     include hay omit?
+Expected status: 201
+```
+
+Không nói chung chung “domain đã allow”. So exact scheme/host/port.
+
+### Bước 2 — Mở Network tab và tìm `OPTIONS`
+
+Nếu có preflight, kiểm tra:
+
+```txt
+Request:
+  Origin
+  Access-Control-Request-Method
+  Access-Control-Request-Headers
+
+Response:
+  status có 2xx không?
+  có redirect 301/302/307/308 không?
+  Access-Control-Allow-Origin có exact không?
+  Allow-Methods có method thật không?
+  Allow-Headers có đủ không?
+  Allow-Credentials có cần không?
+```
+
+Nếu không thấy actual request, lỗi nằm ở preflight. Nếu actual request có xuất hiện, tiếp tục xem actual status/headers/body.
+
+### Bước 3 — Reproduce preflight bằng `curl`
+
+`curl` không tự enforce CORS, nhưng ta có thể mô phỏng preflight để inspect raw response:
+
+```bash
+curl -i -X OPTIONS 'https://api.example.com/api/orders' \
+  -H 'Origin: https://app.example.com' \
+  -H 'Access-Control-Request-Method: POST' \
+  -H 'Access-Control-Request-Headers: authorization,content-type,x-request-id'
+```
+
+Expected tối thiểu:
+
+```http
+HTTP/2 200
+access-control-allow-origin: https://app.example.com
+access-control-allow-methods: POST
+access-control-allow-headers: authorization,content-type,x-request-id
+```
+
+Test actual response với Origin:
+
+```bash
+curl -i 'https://api.example.com/api/orders/ord-456' \
+  -H 'Origin: https://app.example.com' \
+  -H 'Authorization: Bearer redacted'
+```
+
+Nếu gọi `curl` không có `Origin`, backend có thể không trả CORS headers; đó không phải bằng chứng lỗi.
+
+### Bước 4 — Theo trace qua từng hop
+
+Dùng `X-Request-Id`/OpenTelemetry trace để kiểm tra:
+
+```txt
+CDN access log
+ALB/API Gateway log
+Ingress log
+Spring Security log
+Application trace
+```
+
+Một response `403` có thể do WAF chặn `OPTIONS`; `301` có thể do HTTP→HTTPS; `302` có thể do OAuth login; `404` có thể do route không nhận OPTIONS. Browser gom nhiều trường hợp thành CORS-looking failure.
+
+### Bước 5 — Kiểm tra cả error path
+
+Happy path `200` có CORS header nhưng `401`, `403`, `429`, `500` không có header sẽ làm frontend mất status/body thật. CORS processing nên bao phủ error responses để frontend đọc được lỗi hợp lệ, miễn là origin được allow.
+
+### Bước 6 — Test từ browser thật
+
+Unit test config chưa đủ. Cần browser/E2E test qua domain thật vì:
+
+- CDN có thể cache/strip header.
+- Gateway có thể tự trả preflight.
+- TLS/domain/redirect khác localhost.
+- Browser cookie policy không xuất hiện trong Postman.
+- Service worker hoặc extension có thể ảnh hưởng request.
+
+---
+
+## Những lỗi thường gặp và cách định vị
+
+| Triệu chứng | Root cause khả dĩ | Kiểm tra đầu tiên |
+|---|---|---|
+| `OPTIONS 401/403` | Security chạy trước CORS | Spring Security chain/gateway auth |
+| `OPTIONS 404/405` | Route/proxy không xử lý OPTIONS | Ingress/API Gateway route |
+| Preflight pass, `POST` bị block | Actual response thiếu/sai ACAO | Headers của actual response |
+| Wildcard + credentials error | `*` không hợp lệ với credentials | `Allow-Origin` và fetch credentials |
+| Cookie không được gửi | `credentials`, `SameSite`, `Secure`, third-party policy | DevTools Cookies/Issues |
+| Frontend không đọc được `Location` | Thiếu `Expose-Headers` | Response CORS config |
+| Chỉ một tenant/domain lỗi | Exact origin mismatch/cache | Scheme/port/trailing config, `Vary` |
+| Localhost chạy, production lỗi | CDN/gateway/environment allowlist | Test từng hop |
+| Chỉ error response hiện CORS | Error path thêm header không nhất quán | Filter order/error handler |
+| Browser báo CORS sau redirect | Preflight/actual request bị redirect | Network redirect chain |
+
+### Trường hợp `Origin: null`
+
+Browser có thể gửi `Origin: null` trong một số sandboxed iframe, local file hoặc opaque origin. Không nên mặc định allow `null`, đặc biệt với credentials. Hãy coi nó như một origin riêng chỉ allow khi có use case và threat model cụ thể.
+
+### Private Network Access
+
+Browser hiện đại có thêm kiểm soát khi public website gọi tài nguyên ở private network/local network. Lỗi có thể nhìn giống CORS và liên quan preflight bổ sung. Đừng giải quyết bằng allow-all trên router/admin endpoint; cần hiểu client context, browser support và tránh expose private management plane cho public origin.
+
+---
+
+## Security checklist cho CORS policy
+
+```txt
+[ ] Exact allowlist theo environment, không lấy Origin rồi echo mù quáng
+[ ] Không dùng wildcard origin với credentials
+[ ] Chỉ allow methods thật sự cần
+[ ] Chỉ allow request headers thật sự cần
+[ ] Expose tối thiểu response headers cho frontend
+[ ] Localhost chỉ ở dev/test profile
+[ ] Review wildcard subdomain và subdomain takeover risk
+[ ] CORS xử lý trước authentication cho preflight
+[ ] Không disable CSRF chỉ vì lỗi CORS
+[ ] Error responses có CORS headers nhất quán
+[ ] Dynamic origin response có Vary: Origin
+[ ] Một layer duy nhất sở hữu policy
+[ ] Preflight không bị redirect
+[ ] CDN cache behavior được test với ít nhất 2 origins
+[ ] Có log/metric cho denied origins nhưng không log token/cookie
+[ ] Contract/E2E tests chạy qua public endpoint thật
+```
+
+CORS allowlist là một phần security configuration, nên thay đổi cần code review và audit trail. Không nên có endpoint admin runtime cho phép bất kỳ user nào thêm origin mà không validate ownership/domain lifecycle.
+
+---
+
+## Observability và alerting
+
+Không nên alert chỉ vì có origin bị deny; internet luôn có scan/noise. Nên đo theo service, environment, normalized origin và reason:
+
+```txt
+cors_preflight_requests_total{service,route,result}
+cors_denied_requests_total{service,reason}
+http_server_requests_seconds_count{method="OPTIONS",status}
+http_server_requests_seconds_bucket{method="OPTIONS"}
+```
+
+Không đưa full high-cardinality URL, access token hay cookie vào label/log. Với origin, nếu tenant count rất lớn, log sampled hoặc map sang tenant ID đã biết thay vì tạo Prometheus label không giới hạn.
+
+Alert có ý nghĩa:
+
+```yaml
+groups:
+  - name: cors
+    rules:
+      - alert: CorsPreflightFailureSpike
+        expr: |
+          sum(rate(http_server_requests_seconds_count{method="OPTIONS",status=~"4..|5.."}[10m]))
+          /
+          clamp_min(sum(rate(http_server_requests_seconds_count{method="OPTIONS"}[10m])), 1)
+          > 0.05
+        for: 10m
+        annotations:
+          summary: "Tỷ lệ preflight 4xx/5xx vượt 5% trong 10 phút"
+```
+
+Ngưỡng `5%` chỉ là ví dụ khởi đầu, không phải magic number. Cần baseline traffic thật; endpoint public bị scan có thể có nhiều OPTIONS invalid, nên alert nên kết hợp known-origin traffic hoặc release marker để tránh noise.
+
+---
+
+## Test CORS policy
+
+### Integration test với Spring MockMvc
+
+```java
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.options;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+@Test
+void allowsKnownOriginToCreateOrder() throws Exception {
+    mockMvc.perform(options("/api/orders")
+            .header("Origin", "https://app.example.com")
+            .header("Access-Control-Request-Method", "POST")
+            .header(
+                "Access-Control-Request-Headers",
+                "authorization,content-type,x-request-id"
+            ))
+        .andExpect(status().isOk())
+        .andExpect(header().string(
+            "Access-Control-Allow-Origin",
+            "https://app.example.com"
+        ));
+}
+
+@Test
+void doesNotAllowUnknownOrigin() throws Exception {
+    mockMvc.perform(options("/api/orders")
+            .header("Origin", "https://evil.example")
+            .header("Access-Control-Request-Method", "POST"))
+        .andExpect(status().isForbidden());
+}
+```
+
+Exact status cho rejected preflight có thể khác theo framework/config, nên contract chính cần assert rằng unknown origin **không nhận allow header** và actual browser flow bị từ chối. Đừng viết test quá phụ thuộc implementation nếu gateway là policy owner.
+
+### Những case tối thiểu
+
+```txt
+1. Known origin + allowed method/header -> pass
+2. Unknown origin -> no allow
+3. Known origin + disallowed method -> reject
+4. Known origin + disallowed header -> reject
+5. Credentialed request -> exact origin + allow-credentials
+6. Actual 2xx response -> correct CORS headers
+7. Actual 401/403/429/500 -> correct CORS headers cho known origin
+8. Hai origin qua CDN -> không lẫn cached Allow-Origin
+9. Localhost không được allow ở production
+10. OPTIONS không redirect và không yêu cầu login
+```
+
+---
+
+## Dùng same-origin BFF khi cần đơn giản hóa boundary
+
+CORS không xấu; nhưng nhiều hệ thống có thể đơn giản hóa bằng same-origin BFF/reverse proxy:
+
+```d2 title="Browser chỉ nhìn thấy origin của BFF" interactive=false
+direction: right
+browser: "Browser tại app.example.com"
+frontend: "Frontend assets"
+bff: "BFF tại app.example.com"
+service: "Internal order service"
+browser -> frontend: "GET /"
+browser -> bff: "POST /api/orders"
+bff -> service: "Server-to-server request"
+```
+
+Browser chỉ thấy một origin nên không cần CORS cho browser-to-BFF. BFF có thể giữ token server-side, dùng secure `HttpOnly` cookie và giảm việc access token xuất hiện trong JavaScript.
+
+Trade-off:
+
+- Thêm một hop và component cần vận hành.
+- BFF phải chống CSRF nếu dùng cookie.
+- Không loại bỏ auth/authz giữa BFF và services.
+- Mobile/partner APIs vẫn cần contract riêng.
+
+Dùng BFF khi nó giải quyết nhiều vấn đề cùng lúc: token handling, API composition, frontend-specific response và same-origin security model. Không dựng BFF chỉ để che một dòng cấu hình CORS sai.
+
+## Policy cho nhiều tenant domains
+
+Nếu khách hàng dùng custom domain, quản lý allowlist như dữ liệu có vòng đời: xác minh ownership trước khi thêm, lưu audit và hỗ trợ revoke. So exact origin đã chuẩn hóa; không blind-reflect `Origin` chỉ vì hostname chứa một chuỗi quen thuộc.
+
+Có thể cache allowlist để tránh query database trên mọi request, nhưng TTL cache cũng là thời gian revoke có thể chậm. Hãy kiểm thử một domain vừa được thu hồi, một subdomain bị bỏ quên và response đi qua CDN. Nếu credential model quá khó kiểm soát, cân nhắc same-origin gateway theo từng domain thay vì mở pattern quá rộng.
+
+## Tài liệu chính thức
+
+- [MDN CORS](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS).
+- [Fetch standard: CORS protocol](https://fetch.spec.whatwg.org/#http-cors-protocol).
+- [Spring Security CORS integration](https://docs.spring.io/spring-security/reference/servlet/integrations/cors.html).
+
+## Bài liên quan
+
+- [Page 60ms ở Singapore nhưng 6s ở Mỹ — xử lý như thế nào?](/system-design/02-geo-latency-60ms-vs-6s) — request flow qua DNS, CDN, TLS và origin server.
+- [Scale từ 1,000 lên 50,000 users](/system-design/03-scale-1k-to-50k-users) — cách tổ chức load balancer, stateless application và observability ở production.

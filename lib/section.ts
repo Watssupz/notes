@@ -68,4 +68,11 @@ export const sections: Section[] = [
     group: "backend",
     icon: Cpu,
   },
+  {
+    id: "interview-question",
+    title: "Interview Questions",
+    meta: "Bộ câu hỏi",
+    group: "web",
+    icon: Cpu,
+  },
 ];

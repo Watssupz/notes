@@ -1,0 +1,887 @@
+---
+title: "Thiết kế webhook delivery: tin cậy, cô lập lỗi và replay an toàn"
+description: "Thiết kế Webhook Delivery System theo at-least-once với Transactional Outbox, fair scheduling, retry, idempotency, HMAC, chống SSRF và replay an toàn."
+---
+
+Giả sử hệ thống đã ghi nhận một đơn thanh toán thành công và phải thông báo tới endpoint của khách hàng. Endpoint có thể chậm, tắt hoặc xử lý xong nhưng làm mất response. Không nên giữ request thanh toán chờ nó, nhưng cũng không được bỏ quên thông báo sau khi database commit.
+
+Bài này xây dựng đường delivery từ transaction nghiệp vụ tới từng lần gọi HTTP, dùng giả định 10 triệu deliveries mỗi ngày. Bạn sẽ thấy vì sao retry cần state bền vững, duplicate là bình thường và một endpoint lỗi không được chiếm hết worker của các khách hàng khác.
+
+<Callout type="info" title="Kiến thức nền">
+Bạn cần biết HTTP và database transaction. **At-least-once** nghĩa là hệ thống có thể thử giao cùng event nhiều lần trong phạm vi policy, không phải lời hứa endpoint đang tắt sẽ luôn nhận thành công. **Idempotency** là thiết kế để xử lý lặp cùng thao tác không tạo thêm effect ngoài ý muốn. Các mốc tải, timeout và retention dưới đây là giả định để thiết kế và kiểm thử.
+</Callout>
+
+## Mục lục
+
+- [Chốt thuật ngữ trước khi vẽ kiến trúc](#chốt-thuật-ngữ-trước-khi-vẽ-kiến-trúc)
+- [Chốt phạm vi và hợp đồng delivery](#chốt-phạm-vi-và-hợp-đồng-delivery)
+- [Ước lượng tải: average nhỏ, tail latency mới đắt](#ước-lượng-tải-average-nhỏ-tail-latency-mới-đắt)
+- [Kiến trúc tổng thể và trách nhiệm từng chặng](#kiến-trúc-tổng-thể-và-trách-nhiệm-từng-chặng)
+- [Chọn queue theo recovery và cách schedule](#chọn-queue-theo-recovery-và-cách-schedule)
+- [Data model: event, delivery và attempt phải tách nhau](#data-model-event-delivery-và-attempt-phải-tách-nhau)
+- [Triage một delivery lỗi trước khi đọc sâu từng kịch bản](#triage-một-delivery-lỗi-trước-khi-đọc-sâu-từng-kịch-bản)
+- [Kịch bản 1 — Business transaction đã commit nhưng webhook event biến mất](#kịch-bản-1--business-transaction-đã-commit-nhưng-webhook-event-biến-mất)
+  - [Nhận diện](#nhận-diện)
+  - [Nguyên nhân phổ biến](#nguyên-nhân-phổ-biến)
+  - [Mitigate ngay](#mitigate-ngay)
+  - [Fix đúng](#fix-đúng)
+- [Kịch bản 2 — Receiver đã xử lý nhưng sender vẫn retry](#kịch-bản-2--receiver-đã-xử-lý-nhưng-sender-vẫn-retry)
+  - [Nhận diện](#nhận-diện-1)
+  - [Nguyên nhân phổ biến](#nguyên-nhân-phổ-biến-1)
+  - [Mitigate ngay](#mitigate-ngay-1)
+  - [Fix đúng](#fix-đúng-1)
+- [Kịch bản 3 — Một endpoint down làm backlog toàn hệ thống tăng](#kịch-bản-3--một-endpoint-down-làm-backlog-toàn-hệ-thống-tăng)
+  - [Nhận diện](#nhận-diện-2)
+  - [Nguyên nhân phổ biến](#nguyên-nhân-phổ-biến-2)
+  - [Mitigate ngay](#mitigate-ngay-2)
+  - [Fix đúng](#fix-đúng-2)
+- [Kịch bản 4 — Worker chết khi delivery đang `IN_FLIGHT`](#kịch-bản-4--worker-chết-khi-delivery-đang-in_flight)
+  - [Nhận diện](#nhận-diện-3)
+  - [Nguyên nhân phổ biến](#nguyên-nhân-phổ-biến-3)
+  - [Mitigate ngay](#mitigate-ngay-3)
+  - [Fix đúng](#fix-đúng-3)
+- [Kịch bản 5 — Poison delivery vào `DEAD`, support muốn replay hàng loạt](#kịch-bản-5--poison-delivery-vào-dead-support-muốn-replay-hàng-loạt)
+  - [Nhận diện](#nhận-diện-4)
+  - [Nguyên nhân phổ biến](#nguyên-nhân-phổ-biến-4)
+  - [Mitigate ngay](#mitigate-ngay-4)
+  - [Fix đúng](#fix-đúng-4)
+- [Kịch bản 6 — Endpoint hợp lệ về cú pháp nhưng là một SSRF target](#kịch-bản-6--endpoint-hợp-lệ-về-cú-pháp-nhưng-là-một-ssrf-target)
+  - [Nhận diện](#nhận-diện-5)
+  - [Nguyên nhân phổ biến](#nguyên-nhân-phổ-biến-5)
+  - [Mitigate ngay](#mitigate-ngay-5)
+  - [Fix đúng](#fix-đúng-5)
+- [HTTP contract phải đủ rõ để hai bên cùng implement](#http-contract-phải-đủ-rõ-để-hai-bên-cùng-implement)
+- [Ordering: chỉ bảo đảm ở boundary business thật sự cần](#ordering-chỉ-bảo-đảm-ở-boundary-business-thật-sự-cần)
+- [Observability: support phải lần được một delivery end-to-end](#observability-support-phải-lần-được-một-delivery-end-to-end)
+- [Test failure path, không chỉ load test happy path](#test-failure-path-không-chỉ-load-test-happy-path)
+- [Ownership, chi phí và vòng đời sản phẩm](#ownership-chi-phí-và-vòng-đời-sản-phẩm)
+- [Từ cơ chế đến một lần delivery cụ thể](#từ-cơ-chế-đến-một-lần-delivery-cụ-thể)
+- [Bài liên quan](#bài-liên-quan)
+
+## Chốt thuật ngữ trước khi vẽ kiến trúc
+
+“Webhook event” thường bị dùng cho ba đối tượng khác nhau:
+
+| Đối tượng | Ý nghĩa | Identity nên ổn định |
+| --- | --- | --- |
+| **Event** | Một business fact đã xảy ra, ví dụ `order.paid` | `event_id` |
+| **Delivery** | Nghĩa vụ giao một event tới một endpoint cụ thể | `(event_id, endpoint_id)` hoặc `delivery_id` |
+| **Attempt** | Một lần HTTP request của delivery | `attempt_id` mới mỗi lần |
+
+Một event có thể fan-out thành nhiều deliveries, và một delivery có thể cần nhiều attempts:
+
+```d2 title="1. Chốt thuật ngữ trước khi vẽ kiến trúc"
+direction: right
+E: "Event: order.paid"
+D1: "Delivery tới endpoint A"
+D2: "Delivery tới endpoint B"
+A11: "Attempt 1: timeout"
+A12: "Attempt 2: 204"
+A21: "Attempt 1: 200"
+E -> D1
+E -> D2
+D1 -> A11
+D1 -> A12
+D2 -> A21
+```
+
+Nếu yêu cầu nói 10 triệu **events trước fan-out**, capacity phải nhân thêm số subscription trung bình. Trong phần còn lại, ta giả định 10 triệu là **deliveries sau fan-out**.
+
+## Chốt phạm vi và hợp đồng delivery
+
+Trước khi chọn queue hay database, cần thống nhất phạm vi giao nhận với bên sử dụng. Bảng dưới đây ghi rõ các giả định của thiết kế; khi contract thay đổi, capacity và recovery policy cũng phải đổi theo:
+
+| Nhóm | Yêu cầu cần xác nhận | Baseline dùng trong bài |
+| --- | --- | --- |
+| Volume | 10 triệu là event hay delivery? Peak/average bao nhiêu? | 10 triệu deliveries/ngày, peak `10x` average |
+| Latency | Đo từ lúc nào? Áp dụng cho endpoint khỏe hay mọi endpoint? | 99% first attempt bắt đầu trong 5 giây với endpoint khỏe |
+| Success | Status nào được chấp nhận? | Mọi `2xx`; không tự follow `3xx` |
+| Timeout | Receiver được phép giữ request bao lâu? | Connect 2 giây, total 10 giây làm baseline để test |
+| Retry | Lỗi nào retry, trong bao lâu? | Backoff + jitter, tối đa 24 giờ; policy theo event type |
+| Ordering | Global, theo endpoint hay theo aggregate? | Không global order; chỉ serialize lane thật sự cần |
+| Retention | Payload, attempt và audit giữ bao lâu? | Payload 30 ngày; audit có thể lâu hơn |
+| Recovery | RPO/RTO và multi-region? | Multi-AZ trước; multi-region chỉ khi business yêu cầu |
+
+Các con số trên không phải “best practice” áp dụng cho mọi công ty. Chúng là baseline có thể đo, load test và thay đổi khi Product đưa ra contract khác.
+
+<Callout type="info" title="Quan trọng">
+Không đưa endpoint lỗi vào cùng latency SLO với endpoint khỏe. Hệ thống không thể bảo đảm giao trong 5 giây nếu server của khách hàng đang tắt; nó chỉ có thể bảo đảm event không mất, retry đúng policy và tenant khác không bị ảnh hưởng.
+</Callout>
+
+## Ước lượng tải: average nhỏ, tail latency mới đắt
+
+Throughput trung bình:
+
+```text
+10.000.000 / 86.400 ≈ 116 deliveries/giây
+```
+
+Nếu peak gấp 10 lần:
+
+```text
+Peak ≈ 1.160 deliveries/giây
+```
+
+Với endpoint khỏe có latency trung bình 300 ms, Little's Law cho số request đang bay:
+
+```text
+Concurrency ≈ throughput × latency
+            ≈ 1.160 × 0,3
+            ≈ 348 requests in-flight
+```
+
+Nhưng chỉ cần 5% request chờ hết timeout 10 giây:
+
+```text
+Weighted latency = 95% × 0,3 + 5% × 10 = 0,785 giây
+Concurrency      ≈ 1.160 × 0,785 ≈ 911 requests in-flight
+```
+
+Chưa kể retry. Nếu tỷ lệ first-attempt failure là `r` và mọi lỗi đều được thử thêm một lần, traffic gần đúng sẽ nhân với `1 + r`. Khi đối tác outage diện rộng, retry có thể lớn hơn live traffic nếu không có budget riêng.
+
+Payload trung bình 5 KB tạo khoảng:
+
+```text
+10.000.000 × 5 KB ≈ 50 GB/ngày
+30 ngày ≈ 1,5 TB raw payload
+```
+
+Do đó không copy payload vào mỗi attempt row. Event giữ payload một lần; delivery giữ state; attempt chỉ giữ metadata và response body đã truncate.
+
+## Kiến trúc tổng thể và trách nhiệm từng chặng
+
+```d2 title="4. Kiến trúc tổng thể và trách nhiệm từng chặng"
+direction: right
+API: "Business API"
+DB: "Business DB + Outbox" {shape: cylinder}
+R: "Outbox Relay hoặc CDC"
+B: "Durable Broker"
+F: "Fan-out Consumer"
+DS: "Event và Delivery Store" {shape: cylinder}
+Q: "Ready Queue"
+FD: "Fair Dispatcher"
+W: "Delivery Workers"
+EG: "Egress Proxy"
+EP: "Customer Endpoints"
+AS: "Attempt Store" {shape: cylinder}
+RS: "Retry Scheduler"
+DEAD: "DEAD Deliveries" {shape: cylinder}
+UI: "Support UI và Replay API"
+API -> DB
+DB -> R
+R -> B
+B -> F
+F -> DS
+F -> Q
+Q -> FD
+FD -> W
+W -> EG
+EG -> EP
+W -> AS
+W -> RS
+RS -> Q
+W -> DEAD
+DEAD -> UI
+UI -> RS
+```
+
+Mỗi box phải có một lý do:
+
+| Chặng | Trách nhiệm | Failure nếu bỏ qua |
+| --- | --- | --- |
+| Business DB + Outbox | Atomic giữa business state và event cần phát | Commit order nhưng mất webhook event |
+| Relay / CDC | Chuyển outbox sang broker, chấp nhận publish duplicate | Producer bị buộc dual-write DB và broker |
+| Durable broker | Hấp thụ burst, tách producer khỏi delivery fleet | Worker outage tạo mất event hoặc ép business request chờ |
+| Fan-out | Tạo đúng một delivery cho mỗi subscription | Kafka redelivery tạo delivery trùng |
+| Fair dispatcher | Chia capacity theo tenant/endpoint | Một endpoint timeout chiếm hết worker |
+| Worker | Claim, ký, gửi, phân loại kết quả, ghi attempt | Không có lifecycle rõ để recovery |
+| Retry scheduler | Đưa delivery quay lại đúng thời điểm | Worker phải `sleep` hoặc retry storm |
+| DEAD + Replay | Cho support điều tra và khôi phục có kiểm soát | Failure bị chôn trong DLQ không owner |
+| Egress proxy | Enforce network policy cho URL không tin cậy | SSRF vào metadata hoặc internal service |
+
+## Chọn queue theo recovery và cách schedule
+
+Một durable queue giữ công việc qua process restart theo guarantee của sản phẩm. Với tải vừa, managed queue hoặc PostgreSQL queue có claim bằng `SKIP LOCKED` có thể đủ. Kafka phù hợp khi cần stream replay, nhiều consumer độc lập hoặc đã có năng lực vận hành; nó không tự giải quyết mọi kiểu delayed retry.
+
+Mình sẽ chọn cơ chế đơn giản nhất đáp ứng peak, retention và recovery cần thiết. Dù chọn queue nào, business database và broker vẫn là hai nơi ghi riêng; outbox bên dưới xử lý cửa sổ lỗi giữa chúng. Khi queue chỉ là tín hiệu đánh thức worker, delivery store bền vững còn phải đủ để dựng lại công việc sau queue loss.
+
+## Data model: event, delivery và attempt phải tách nhau
+
+Schema rút gọn:
+
+```sql
+CREATE TABLE webhook_events (
+    event_id        UUID PRIMARY KEY,
+    tenant_id       UUID NOT NULL,
+    event_type      VARCHAR(120) NOT NULL,
+    schema_version  INTEGER NOT NULL,
+    payload         JSONB NOT NULL,
+    occurred_at     TIMESTAMPTZ NOT NULL,
+    expires_at      TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE webhook_deliveries (
+    delivery_id         UUID PRIMARY KEY,
+    event_id            UUID NOT NULL REFERENCES webhook_events(event_id),
+    endpoint_id         UUID NOT NULL,
+    status              VARCHAR(30) NOT NULL,
+    attempt_count       INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at     TIMESTAMPTZ,
+    leased_by           VARCHAR(120),
+    leased_until        TIMESTAMPTZ,
+    last_error_category VARCHAR(50),
+    delivered_at        TIMESTAMPTZ,
+    dead_at             TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (event_id, endpoint_id)
+);
+
+CREATE TABLE webhook_attempts (
+    attempt_id       UUID PRIMARY KEY,
+    delivery_id      UUID NOT NULL REFERENCES webhook_deliveries(delivery_id),
+    attempt_number   INTEGER NOT NULL,
+    started_at       TIMESTAMPTZ NOT NULL,
+    finished_at      TIMESTAMPTZ,
+    outcome          VARCHAR(40) NOT NULL,
+    http_status      INTEGER,
+    latency_ms       INTEGER,
+    response_excerpt VARCHAR(4096),
+    UNIQUE (delivery_id, attempt_number)
+);
+
+CREATE INDEX idx_webhook_deliveries_due
+ON webhook_deliveries (next_attempt_at, delivery_id)
+WHERE status IN ('PENDING', 'RETRY_SCHEDULED');
+```
+
+`UNIQUE(event_id, endpoint_id)` làm fan-out idempotent khi broker redeliver. Partial index cho due deliveries giữ index nhỏ vì không chứa rows đã `DELIVERED`; [partial index trên cột nullable và outbox](/database/02-index-on-nullable-column) giải thích kỹ hơn trade-off này.
+
+State machine:
+
+```d2 title="5. Data model: event, delivery và attempt phải tách nhau"
+direction: right
+start: "Bắt đầu" {shape: circle}
+done: "Kết thúc" {shape: circle}
+start -> PENDING
+PENDING -> IN_FLIGHT: "worker claim lease"
+IN_FLIGHT -> DELIVERED: "accepted 2xx"
+IN_FLIGHT -> RETRY_SCHEDULED: "transient failure"
+IN_FLIGHT -> DEAD: "permanent failure hoặc hết budget"
+RETRY_SCHEDULED -> IN_FLIGHT: "đến next_attempt_at"
+IN_FLIGHT -> PENDING: "lease hết hạn"
+DEAD -> RETRY_SCHEDULED: "replay được phê duyệt"
+DELIVERED -> done
+```
+
+`Attempt` nên append-only để phục vụ audit. `Delivery` là snapshot trạng thái hiện tại để query nhanh. Không ghi đè lịch sử attempt bằng một cột `last_error` duy nhất.
+
+## Triage một delivery lỗi trước khi đọc sâu từng kịch bản
+
+Khi support đưa một `event_id`, đường chẩn đoán nên nhất quán:
+
+```d2 title="6. Triage một delivery lỗi trước khi đọc sâu từng kịch bản"
+direction: down
+A: "Tra event_id"
+B: "Có event trong outbox?" {shape: diamond}
+C: "Kiểm tra transaction tạo event"
+D: "Đã tạo delivery?" {shape: diamond}
+E: "Kiểm tra relay, broker và subscription fan-out"
+F: "Delivery đang ở state nào?" {shape: diamond}
+G: "Kiểm tra queue age, quota và dispatcher"
+H: "Worker crash hoặc fencing lỗi"
+I: "Đọc attempt gần nhất và next_attempt_at"
+J: "Đọc error taxonomy và retry budget"
+K: "Kiểm tra receiver dedupe và business processing"
+A -> B
+B -> C: "Không"
+B -> D: "Có"
+D -> E: "Không"
+D -> F: "Có"
+F -> G: "PENDING lâu"
+F -> H: "IN_FLIGHT quá lease"
+F -> I: "RETRY_SCHEDULED"
+F -> J: "DEAD"
+F -> K: "DELIVERED nhưng customer nói thiếu"
+```
+
+Bảng lookup nhanh phải nằm trước các kịch bản để người vận hành biết nên nhảy đến đâu:
+
+| Triệu chứng | Khả năng cao | Metric / dữ liệu xác nhận | Kịch bản |
+| --- | --- | --- | --- |
+| Business state có nhưng không có event | Dual-write hoặc transaction boundary sai | Outbox row, application trace | 1 |
+| Nhiều attempts cùng `event_id` | Kết quả HTTP không chắc chắn | Timeout, reset, worker crash sau POST | 2 hoặc 4 |
+| Một endpoint backlog tăng, endpoint khác bình thường | Receiver outage / rate limit | `429`, `5xx`, timeout, breaker state | 3 |
+| Nhiều rows `IN_FLIGHT` quá `leased_until` | Worker chết hoặc mất DB connectivity | Lease age, pod restart, worker logs | 4 |
+| Delivery vào `DEAD` ngay | Permanent error hoặc payload/config sai | `4xx`, policy version, response excerpt | 5 |
+| Request chạm private IP hoặc signature fail hàng loạt | SSRF attempt / secret rotation lỗi | DNS result, egress deny, signature version | 6 |
+
+<Callout type="warn" title="Cẩn thận">
+Support không nên “retry thử” trước khi biết delivery đã ở state nào. Một retry thủ công có thể lặp side effect ở receiver hoặc biến endpoint đang phục hồi thành quá tải lần nữa.
+</Callout>
+
+## Kịch bản 1 — Business transaction đã commit nhưng webhook event biến mất
+
+### Nhận diện
+
+Order đã chuyển sang `PAID`, nhưng không tìm thấy `event_id` trong outbox, broker hay webhook store. Trace thường dừng ngay sau DB commit hoặc cho thấy publish broker lỗi.
+
+### Nguyên nhân phổ biến
+
+- Application commit business state rồi mới publish sang broker bằng một network call riêng.
+- Process crash trong khoảng giữa DB commit và publish.
+- Publish thành công nhưng business transaction rollback, tạo ra event không phản ánh source of truth.
+- Code chỉ `catch` lỗi publish; process kill hoặc machine failure không chạy được nhánh retry.
+
+### Mitigate ngay
+
+Chạy reconciliation có giới hạn: tìm business records đã commit nhưng thiếu outbox event, tạo lại event bằng stable business key, rồi publish qua đường bình thường. Không quét toàn bộ database không throttle trong giờ cao điểm.
+
+Nếu lỗi xuất hiện sau một deployment, pause rollout và rollback producer trước khi backlog inconsistency tăng thêm.
+
+### Fix đúng
+
+Dùng **Transactional Outbox**: update business state và insert outbox row trong cùng local database transaction.
+
+```sql
+BEGIN;
+
+UPDATE orders
+SET status = 'PAID', version = version + 1
+WHERE id = :order_id
+  AND status = 'PENDING_PAYMENT';
+
+INSERT INTO outbox_events (
+    event_id,
+    aggregate_id,
+    aggregate_version,
+    event_type,
+    payload,
+    occurred_at
+) VALUES (
+    :event_id,
+    :order_id,
+    :aggregate_version,
+    'order.paid',
+    CAST(:payload AS jsonb),
+    now()
+);
+
+COMMIT;
+```
+
+Relay có thể poll hoặc dùng Change Data Capture (CDC) để đọc transaction log. Nếu relay publish thành công rồi crash trước khi đánh dấu outbox row đã xử lý, nó sẽ publish lại. Vì vậy outbox đóng cửa sổ **mất event**, nhưng downstream vẫn phải idempotent.
+
+Pattern này cũng xuất hiện trong pipeline CQRS; xem [CQRS với Outbox, at-least-once và projection idempotent](/system-design/04-cqrs) tại đúng failure boundary tương tự.
+
+**Takeaway:** atomicity phải nằm giữa business state và outbox trong cùng database; không thể tạo atomicity bằng `try/catch` quanh DB và Kafka.
+
+## Kịch bản 2 — Receiver đã xử lý nhưng sender vẫn retry
+
+### Nhận diện
+
+Sender ghi timeout hoặc connection reset, nhưng customer khẳng định business action đã xảy ra. Cùng `event_id` xuất hiện ở nhiều attempts; receiver có thể tạo duplicate invoice, shipment hoặc notification.
+
+### Nguyên nhân phổ biến
+
+- Receiver commit xong nhưng response `200` bị mất trên network.
+- Sender nhận `2xx` rồi crash trước khi update delivery thành `DELIVERED`.
+- Load balancer đóng connection sau khi request đã tới application.
+- Manual replay tạo `event_id` mới cho cùng business fact, khiến receiver không nhận ra duplicate.
+
+### Mitigate ngay
+
+Giữ nguyên `event_id` khi retry hoặc resend cùng một business fact. Thông báo customer bật deduplication trước khi bulk replay những event có side effect quan trọng.
+
+Nếu receiver chưa idempotent, replay theo batch nhỏ và reconcile business records sau mỗi batch. Không thể loại bỏ hoàn toàn rủi ro chỉ từ phía sender.
+
+### Fix đúng
+
+Contract phải nói rõ **at-least-once**. Sender gửi các identity khác nhau cho từng lớp:
+
+```http
+Webhook-Id: evt_01JQ8YV8K9
+Webhook-Delivery-Id: del_01JQ8YW3H2
+Webhook-Attempt: 3
+Webhook-Timestamp: 1773561000
+```
+
+- `Webhook-Id` giữ nguyên qua retry và normal replay.
+- `Webhook-Delivery-Id` định danh cặp event-endpoint.
+- Attempt number tăng ở mỗi HTTP request.
+
+Receiver deduplicate bằng unique constraint trong **cùng transaction** với side effect:
+
+```sql
+BEGIN;
+
+INSERT INTO processed_webhook_events (provider, event_id, processed_at)
+VALUES ('our-platform', :event_id, now())
+ON CONFLICT DO NOTHING;
+
+-- Chỉ chạy mutation nếu INSERT phía trên thực sự tạo row mới.
+UPDATE merchant_orders
+SET paid = true
+WHERE external_order_id = :order_id;
+
+COMMIT;
+```
+
+Implementation phải kiểm tra affected row của `INSERT`. Nếu bằng `0`, receiver trả `2xx` nhưng không chạy mutation lần nữa. Dùng Redis `SETNX` riêng lẻ cho critical side effect có thể sai: dedupe key thành công nhưng DB mutation thất bại sẽ khiến retry bị bỏ qua.
+
+Dedupe key phải được giữ ít nhất lâu hơn automatic retry window cộng manual replay window. Nếu platform cho replay sau 30 ngày nhưng receiver xóa key sau 24 giờ, duplicate business effect vẫn có thể xảy ra.
+
+**Takeaway:** sender không thể biết chắc receiver đã commit hay chưa; stable ID và atomic dedupe ở receiver mới làm retry an toàn.
+
+## Kịch bản 3 — Một endpoint down làm backlog toàn hệ thống tăng
+
+### Nhận diện
+
+Một endpoint có tỷ lệ timeout, `429` hoặc `5xx` cao; số request in-flight của nó tăng; backlog của tenant đó rất lớn. Nếu isolation kém, `oldest_pending_age` của endpoint khỏe cũng tăng theo.
+
+### Nguyên nhân phổ biến
+
+- Global FIFO đưa hàng trăm nghìn jobs của một tenant lên đầu queue.
+- Worker pool chung không có per-endpoint concurrency limit.
+- Retry chạy ngay lập tức hoặc theo lịch cố định, tạo thundering herd.
+- Worker gọi `Thread.sleep` để chờ retry, làm slot bị giữ vô ích.
+- Circuit breaker đặt global thay vì theo endpoint.
+
+### Mitigate ngay
+
+Mở circuit breaker cho endpoint lỗi, giảm concurrency/rate của tenant đó và reserve capacity cho live traffic của endpoint khỏe. Delivery không bị drop; chúng được schedule sang tương lai.
+
+Tôn trọng `Retry-After` khi receiver trả `429`. Nếu backlog tiếp tục tăng, pause admission của bulk replay và giảm broker consumption về mức worker fleet có thể xử lý bền vững.
+
+### Fix đúng
+
+Dispatcher dùng logical lanes thay vì tạo một queue vật lý cho mỗi customer:
+
+```d2 title="Quota từ global đến endpoint"
+direction: right
+n0: "Global concurrency"
+n1: "Per-tenant concurrency / token bucket"
+n2: "Per-endpoint concurrency / token bucket"
+n0 -> n1 -> n2
+```
+
+Ví dụ minh họa, không phải default:
+
+```text
+Global in-flight: 2.000
+Mỗi tenant: tối đa 50
+Mỗi endpoint: tối đa 5
+Retry traffic: tối đa 20% fleet
+Replay traffic: tối đa 10% fleet
+```
+
+Fair scheduling có thể dùng round-robin, Deficit Round Robin hoặc weighted fairness theo product tier. Invariant cần giữ là tenant A backlog lớn không làm queue age của tenant B tăng vô hạn. Đây là cùng tư duy scale theo bottleneck và backpressure trong [lộ trình scale từ 1.000 lên 50.000 users](/system-design/03-scale-1k-to-50k-users), không phải chỉ tăng replica theo CPU.
+
+HTTP result phải được phân loại thay vì retry mọi non-`200`:
+
+| Kết quả | Xử lý mặc định | Lý do |
+| --- | --- | --- |
+| `2xx` | `DELIVERED` | Receiver đã chấp nhận |
+| `3xx` | Không follow; config error | Redirect mở thêm SSRF và ownership ambiguity |
+| `400`, `405`, `413`, `422` | Không retry tự động | Payload hoặc contract không tự sửa theo thời gian |
+| `401`, `403` | Pause/retry rất hạn chế, notify | Secret hoặc permission cần sửa |
+| `404` | Retry ngắn theo contract | Có thể là deploy tạm thời, nhưng retry dài thường lãng phí |
+| `408`, `425`, `429` | Retry | Transient hoặc receiver đang backpressure |
+| `5xx` | Retry | Server-side failure thường tạm thời |
+| DNS/connect/TLS timeout | Retry có giới hạn | Network hoặc certificate có thể phục hồi |
+| `410` | Disable/dead theo contract | Receiver thông báo endpoint không còn tồn tại |
+
+Backoff dùng full jitter:
+
+```text
+maxDelay = min(cap, base × 2^(attempt - 1))
+delay    = random(0, maxDelay)
+```
+
+Nếu có `Retry-After`, lần tiếp theo không được sớm hơn giá trị hợp lệ đó, nhưng vẫn cần cap theo retention và retry window.
+
+Worker chỉ ghi lịch rồi trả slot:
+
+```sql
+UPDATE webhook_deliveries
+SET status = 'RETRY_SCHEDULED',
+    next_attempt_at = :next_attempt_at,
+    last_error_category = :category
+WHERE delivery_id = :delivery_id
+  AND status = 'IN_FLIGHT'
+  AND leased_by = :worker_id;
+```
+
+Circuit breaker theo endpoint có ba trạng thái:
+
+```d2 title="Fix đúng"
+direction: right
+CLOSED -> OPEN: "failure rate vượt ngưỡng"
+OPEN -> HALF_OPEN: "hết cooldown"
+HALF_OPEN -> CLOSED: "probes thành công"
+HALF_OPEN -> OPEN: "probe thất bại"
+```
+
+Breaker bảo vệ fleet; retry quản lý lifecycle từng delivery. Hai cơ chế bổ sung cho nhau, không thay thế nhau.
+
+**Takeaway:** queue bảo đảm durability, còn fairness, quota, jitter và circuit breaker mới bảo đảm isolation.
+
+## Kịch bản 4 — Worker chết khi delivery đang `IN_FLIGHT`
+
+### Nhận diện
+
+Nhiều rows ở `IN_FLIGHT` lâu hơn request timeout. Pod restart hoặc mất network đúng lúc các attempts bắt đầu, nhưng không có kết quả cuối cùng. Một số delivery chỉ được gửi lại sau khi operator sửa state bằng tay.
+
+### Nguyên nhân phổ biến
+
+- Worker claim job nhưng không có lease expiry.
+- Queue acknowledgement xảy ra trước khi delivery state được cập nhật an toàn.
+- Worker cũ ghi kết quả sau khi lease đã được worker mới claim.
+- Lease ngắn hơn total HTTP timeout, làm hai workers cùng gửi một delivery.
+
+### Mitigate ngay
+
+Requeue các rows có `leased_until < now()` theo batch nhỏ. Giữ nguyên event và delivery identity; chấp nhận rằng request cũ có thể đã tới receiver nên duplicate vẫn có thể xảy ra.
+
+Tạm tăng lease nếu telemetry cho thấy request hợp lệ thường hoàn thành sau lease hiện tại. Đây chỉ là mitigation; lease quá dài lại làm recovery chậm.
+
+### Fix đúng
+
+Claim bằng lease có điều kiện:
+
+```sql
+UPDATE webhook_deliveries
+SET status = 'IN_FLIGHT',
+    leased_by = :worker_id,
+    leased_until = now() + interval '30 seconds',
+    attempt_count = attempt_count + 1
+WHERE delivery_id = :delivery_id
+  AND (
+      status IN ('PENDING', 'RETRY_SCHEDULED')
+      OR (status = 'IN_FLIGHT' AND leased_until < now())
+  )
+RETURNING *;
+```
+
+Lease 30 giây chỉ hợp lý nếu lớn hơn total HTTP timeout 10 giây cộng thời gian ghi DB và network jitter. Request dài hơn cần lease dài hơn hoặc heartbeat có giới hạn.
+
+Khi complete, worker dùng fencing condition để chỉ owner hiện tại được cập nhật:
+
+```sql
+UPDATE webhook_deliveries
+SET status = 'DELIVERED',
+    delivered_at = now(),
+    leased_by = NULL,
+    leased_until = NULL
+WHERE delivery_id = :delivery_id
+  AND status = 'IN_FLIGHT'
+  AND leased_by = :worker_id;
+```
+
+Nếu affected rows bằng `0`, worker đã mất quyền sở hữu và không được ghi đè state. Tốt hơn nữa, dùng `lease_token` tăng dần thay vì chỉ `worker_id` để phân biệt hai lần claim của cùng một process identity.
+
+**Takeaway:** lease giúp recovery khi worker chết; fencing ngăn worker cũ ghi đè worker mới; cả hai vẫn không loại bỏ duplicate HTTP.
+
+## Kịch bản 5 — Poison delivery vào `DEAD`, support muốn replay hàng loạt
+
+### Nhận diện
+
+Delivery thất bại lặp lại với cùng lỗi `4xx`, payload không hợp schema hoặc endpoint đã bị xóa. `DEAD` tăng nhanh sau một deployment. Support chuẩn bị replay hàng trăm nghìn events ngay khi customer báo đã sửa endpoint.
+
+### Nguyên nhân phổ biến
+
+- Retry policy không phân biệt lỗi permanent và transient.
+- Schema hoặc secret mới được rollout nhưng customer chưa cập nhật.
+- DLQ chỉ chứa raw message, không có event/delivery/attempt history.
+- Replay publish thẳng vào queue ưu tiên cao, bỏ qua endpoint limiter.
+- Replay tạo event ID mới dù vẫn là business fact cũ.
+
+### Mitigate ngay
+
+Dừng auto-retry cho error category rõ ràng là permanent. Xác nhận endpoint bằng một test event, sau đó replay canary một batch nhỏ qua normal dispatcher.
+
+Giới hạn tốc độ replay và giữ capacity riêng cho live traffic. Cho operator xem trước số deliveries, event types, payload age và estimated drain time trước khi xác nhận.
+
+### Fix đúng
+
+Một delivery chuyển `DEAD` khi đạt điều kiện nào đến trước:
+
+```text
+attempt_count >= max_attempts
+OR now - first_attempt_at >= max_retry_age
+OR event đã hết giá trị business / retention
+OR lỗi được phân loại permanent
+```
+
+Replay là một operation có governance:
+
+```text
+1. Actor có RBAC chọn filter và nhập reason.
+2. Hệ thống hiển thị count, endpoint health và estimated traffic.
+3. Tạo replay job có audit ID.
+4. Giữ nguyên event_id và delivery_id nếu resend cùng fact.
+5. Tạo attempt mới với timestamp và signature mới.
+6. Đi qua fair dispatcher, limiter và circuit breaker.
+7. Theo dõi progress, error rate; cho phép pause/cancel.
+```
+
+`DEAD` không phải một “bãi rác Kafka”. Nó cần owner, alert, attempt history, retention và runbook. Nếu payload đã bị xóa theo privacy policy, dashboard phải nói rõ không thể replay thay vì dựng lại payload từ current state rồi giả vờ đó là event cũ.
+
+**Takeaway:** replay là production traffic có rủi ro, không phải thao tác copy message; nó cần admission control và audit như một deployment.
+
+## Kịch bản 6 — Endpoint hợp lệ về cú pháp nhưng là một SSRF target
+
+### Nhận diện
+
+Customer đăng ký URL trỏ tới loopback, private subnet, link-local address hoặc cloud metadata service. Một hostname public resolve sang IP private ở lần delivery; hoặc endpoint trả redirect sang internal service. Ở chiều ngược lại, customer báo signature fail sau khi secret rotation.
+
+### Nguyên nhân phổ biến
+
+- Chỉ validate URL bằng regex lúc đăng ký.
+- Tin hostname mà không kiểm tra IP sau DNS resolution.
+- HTTP client tự follow redirect.
+- Worker có network route tới database, control plane hoặc metadata endpoint.
+- HMAC chỉ ký parsed JSON thay vì raw bytes.
+- Dùng một global secret cho mọi tenants hoặc rotate secret không có overlap.
+
+### Mitigate ngay
+
+Disable endpoint đáng ngờ, thu hồi egress credential nếu cần và kiểm tra access logs của metadata/internal services. Chặn ngay private, loopback, link-local và metadata ranges ở egress firewall/proxy, không chỉ trong application.
+
+Với signature failure hàng loạt, dừng rotation, cho verifier chấp nhận cả key cũ và mới trong overlap window, rồi kiểm tra canonical bytes trước khi replay.
+
+### Fix đúng
+
+SSRF (Server-Side Request Forgery) cần nhiều lớp:
+
+```text
+Khi đăng ký endpoint
+- Chỉ cho HTTPS.
+- Parse bằng URL library chuẩn; cấm userinfo.
+- Resolve DNS và reject private, loopback, link-local, multicast, metadata ranges.
+- Có thể yêu cầu ownership verification bằng challenge.
+
+Mỗi lần delivery
+- Resolve lại và validate mọi A/AAAA result.
+- Kết nối tới đúng IP đã validate, vẫn verify TLS hostname.
+- Không tự follow redirect; nếu bắt buộc thì validate lại từng hop.
+- Giới hạn port, response bytes, connect timeout và total timeout.
+
+Network layer
+- Worker đi qua egress proxy/NAT có allow policy.
+- Không có route tới cluster control plane, database hoặc metadata service.
+- Log quyết định deny mà không làm lộ secret/payload.
+```
+
+TLS bảo vệ kênh truyền nhưng không chứng minh body đến từ provider. Nền tảng [SSL/TLS](/security/02-ssl-tls) và [HMAC khác gì hashing/encryption](/security/01-encoding-vs-encryption) là hai lớp khác nhau.
+
+Canonical content nên gồm event identity, timestamp và **raw body**:
+
+```text
+signed_content = event_id + "." + timestamp + "." + raw_body
+signature      = HMAC-SHA256(endpoint_secret, signed_content)
+```
+
+Headers:
+
+```http
+Webhook-Id: evt_01JQ8YV8K9
+Webhook-Timestamp: 1773561000
+Webhook-Signature: v1=13c8f6...
+```
+
+Receiver verify theo thứ tự:
+
+```text
+1. Đọc raw bytes, chưa parse rồi serialize lại.
+2. Kiểm tra timestamp nằm trong tolerance đã document.
+3. Chọn key theo version/key ID.
+4. Tính HMAC trên đúng canonical content.
+5. So sánh bằng constant-time API.
+6. Deduplicate event_id.
+7. Durable enqueue hoặc commit rồi mới trả 2xx.
+```
+
+Secret riêng theo endpoint, được encrypt bằng KMS hoặc envelope encryption. Rotation có overlap; một request có thể mang chữ ký của key cũ và mới trong thời gian chuyển đổi.
+
+<Callout type="warn" title="Cảnh báo bảo mật">
+HMAC bảo vệ receiver khỏi request giả mạo. SSRF-safe egress bảo vệ sender khỏi URL độc hại. Có một lớp không đồng nghĩa đã có lớp còn lại.
+</Callout>
+
+**Takeaway:** URL của customer là untrusted input; application validation chỉ giảm rủi ro, network egress policy mới là hàng rào cuối.
+
+## HTTP contract phải đủ rõ để hai bên cùng implement
+
+Payload mẫu:
+
+```json
+{
+  "id": "evt_01JQ8YV8K9",
+  "type": "order.paid",
+  "schemaVersion": 1,
+  "occurredAt": "2026-03-15T10:30:00Z",
+  "data": {
+    "orderId": "ord_123",
+    "amount": 1250000,
+    "currency": "VND"
+  }
+}
+```
+
+Contract nên document:
+
+- Mọi accepted `2xx`, không chỉ `200`, đều là success.
+- Receiver nên verify, dedupe, durable enqueue rồi trả `2xx` nhanh.
+- Sender có connect timeout và total timeout rõ ràng.
+- Redirect mặc định không được follow.
+- Response body chỉ được đọc/lưu tối đa một kích thước nhỏ và phải redact.
+- Event có `schemaVersion`; field mới là additive khi có thể.
+- Duplicate và out-of-order là tình huống hợp lệ theo contract.
+- Retry window, replay window và dedupe retention phải khớp nhau.
+
+Snapshot payload nên phản ánh fact tại thời điểm event xảy ra. Nếu worker chỉ lưu `orderId` rồi fetch current order sau ba ngày, event `order.paid` có thể mang trạng thái hiện tại là `refunded`, làm mất ý nghĩa lịch sử.
+
+## Ordering: chỉ bảo đảm ở boundary business thật sự cần
+
+Kafka giữ order trong một partition, nhưng HTTP requests concurrent vẫn có thể hoàn tất ngược thứ tự. Retry còn làm event cũ quay lại sau event mới.
+
+Ba lựa chọn:
+
+| Semantics | Ưu điểm | Giá phải trả |
+| --- | --- | --- |
+| Không guarantee order | Throughput và isolation tốt nhất | Receiver cần version hoặc đọc current state |
+| Order theo endpoint | Contract dễ hiểu | Một poison event chặn toàn endpoint |
+| Order theo `(endpoint_id, aggregate_id)` | Cùng order có thứ tự, order khác chạy song song | Scheduler và recovery phức tạp hơn |
+
+Default hợp lý là không hứa global order. Với event type cần strict order, thêm `aggregate_id` và `aggregate_version`, rồi chỉ cho một delivery in-flight trong lane `(endpoint_id, aggregate_id)`.
+
+```d2 title="14. Ordering: chỉ bảo đảm ở boundary business thật sự cần"
+direction: right
+O1: "Order A v1"
+O2: "Order A v2"
+O3: "Order A v3"
+P1: "Order B v1"
+P2: "Order B v2"
+O1 -> O2
+O2 -> O3
+P1 -> P2
+```
+
+Hai lane A và B chạy song song. Nếu A v1 retry, A v2 chờ; B không bị chặn. Đây là trade-off head-of-line blocking có chủ đích, không phải “Kafka đã lo ordering”.
+
+## Observability: support phải lần được một delivery end-to-end
+
+Mỗi log/trace cần correlation keys:
+
+```text
+event_id
+delivery_id
+attempt_id
+tenant_id
+endpoint_id
+worker_id
+policy_version
+lease_token
+```
+
+Không dùng endpoint URL đầy đủ làm metric label vì cardinality cao và có thể chứa dữ liệu nhạy cảm. Dashboard nên aggregate theo tenant/endpoint ID đã chuẩn hóa.
+
+Các metric quan trọng:
+
+| Metric | Điều nó trả lời |
+| --- | --- |
+| `outbox_oldest_unpublished_age` | Business event có bị kẹt trước broker không? |
+| `delivery_oldest_pending_age` | Hệ thống có theo kịp SLO không? |
+| `first_attempt_latency` | Event khỏe được bắt đầu gửi nhanh không? |
+| `attempt_latency` theo phase | Chậm ở DNS, connect, TLS hay receiver? |
+| `success_rate` theo endpoint | Endpoint nào đang suy giảm? |
+| `retry_rate` theo category | Lỗi nào đang khuếch đại traffic? |
+| `dead_delivery_rate` | Contract, payload hay endpoint nào gây poison? |
+| `in_flight` theo endpoint | Quota/fairness có hoạt động không? |
+| `lease_expired_total` | Worker crash hoặc timeout/lease đang lệch? |
+| `replay_queue_age` | Replay có lấn live traffic không? |
+
+SLO nên tách ít nhất ba lớp:
+
+```text
+Platform durability SLO
+- Event đã commit không bị mất.
+
+Healthy-endpoint first-attempt SLO
+- Ví dụ 99% bắt đầu attempt đầu trong 5 giây.
+
+Delivery outcome reporting SLO
+- Attempt result và trạng thái support hiển thị trong một khoảng xác định.
+```
+
+Không đo availability của customer như lỗi availability của chính platform. Tuy nhiên nếu dispatcher để một endpoint hỏng kéo endpoint khỏe trễ theo, đó là lỗi của platform.
+
+## Test failure path, không chỉ load test happy path
+
+Một test plan production-grade cần có:
+
+```text
+Durability
+- Kill process sau business commit nhưng trước relay publish.
+- Cho relay publish thành công rồi crash trước khi mark outbox.
+- Redeliver cùng broker message nhiều lần.
+
+Ambiguous outcome
+- Receiver commit rồi drop response.
+- Worker nhận 2xx rồi crash trước khi update delivery.
+- Hai workers cạnh tranh sau khi lease hết.
+
+Isolation
+- 10% endpoints timeout đủ 10 giây.
+- Một tenant tạo 50% toàn bộ backlog.
+- Bulk replay chạy đồng thời với live traffic.
+
+Retry
+- 429 với Retry-After dạng seconds và HTTP-date.
+- 5xx outage hai giờ rồi phục hồi.
+- Retry policy đổi version khi deliveries cũ vẫn pending.
+
+Security
+- IPv4/IPv6 private, loopback, link-local và metadata addresses.
+- DNS rebinding và redirect sang private IP.
+- Signature sai raw bytes, timestamp cũ và secret rotation overlap.
+
+Recovery
+- Mất ready queue rồi rebuild từ delivery store.
+- Database failover khi workers đang in-flight.
+- Restore backup và kiểm tra RPO/RTO thực tế.
+```
+
+Success criterion không chỉ là “không crash”. Phải chứng minh endpoint khỏe giữ SLO, duplicate không lặp side effect, replay không starvation live traffic và recovery không tạo retry storm.
+
+## Ownership, chi phí và vòng đời sản phẩm
+
+Một delivery hoạt động đúng trong thử nghiệm chưa đủ để vận hành thành sản phẩm. Cần người sở hữu contract, dữ liệu và quy trình phục hồi; nếu không, việc replay hoặc đổi schema dễ trở thành thay đổi không ai chịu trách nhiệm end-to-end.
+
+**Định lượng business impact.** Phân loại event theo mức quan trọng. `payment.settled` có retry/reconciliation khác `user.typing`; không nên áp một retention và retry policy cho mọi event.
+
+**Đặt ownership rõ ràng.** Platform team sở hữu delivery SLO và egress security; domain team sở hữu schema; Support sở hữu quy trình replay; Security phê duyệt network boundary; Product định nghĩa retention và customer contract.
+
+**Thiết kế governance.** Bulk replay, secret access và payload inspection cần RBAC, audit, approval threshold và break-glass procedure. Schema breaking change cần compatibility check và staged rollout.
+
+**Theo dõi cost theo tenant.** Chi phí không chỉ là request thành công mà còn gồm attempt amplification, payload retention, response logs, egress, support và endpoint xấu giữ connection lâu. Có thể cần quota hoặc pricing theo deliveries/attempts/storage.
+
+**Ưu tiên build hay buy.** Nếu webhook không tạo lợi thế cạnh tranh, managed platform có thể giảm thời gian xây dashboard, retry scheduler và SDK. Quyết định phải tính total cost of ownership, data residency, compliance, egress control và khả năng thoát khỏi vendor.
+
+**Lập lộ trình thay vì over-engineer.** Với 116 deliveries/giây trung bình, có thể bắt đầu PostgreSQL HA + managed queue + bounded worker fleet. Chỉ thêm Kafka, CDC, distributed fair scheduler hoặc multi-region active-active khi SLO, peak và failure data chứng minh cần.
+
+## Từ cơ chế đến một lần delivery cụ thể
+
+Giả sử `order.paid` có `event_id=evt_demo_42` cần gửi tới hai endpoint. Endpoint A trả `204`; endpoint B đã commit nhưng response bị mất. Delivery tới A kết thúc, còn B vẫn là kết quả chưa chắc chắn. Retry B phải giữ event identity cũ để receiver nhận ra cùng business fact, nhưng tạo attempt và chữ ký có timestamp mới.
+
+Nếu Support bấm replay, đó vẫn là giao lại fact cũ chứ không phải yêu cầu charge payment lần nữa. UI cần phân biệt replay delivery với tạo business command mới. Nếu thật sự muốn chạy lại hành động nghiệp vụ, phải có command mới, quyền riêng và audit tương ứng.
+
+Khi kiểm thử, cố tình ngắt connection sau receiver commit rồi gửi lại. Kết quả cần chứng minh là chỉ một business mutation ở receiver và có đủ attempt evidence ở sender, không phải chỉ thấy sender cuối cùng nhận `200`.
+
+## Bài liên quan
+
+- [CQRS là gì, khi nào nên dùng và triển khai an toàn?](/system-design/04-cqrs) — mở rộng Transactional Outbox, at-least-once, ordering và idempotent consumer.
+- [Scale từ 1.000 lên 50.000 users](/system-design/03-scale-1k-to-50k-users) — cách capacity theo bottleneck, queue age và backpressure thay vì chỉ nhìn CPU.
+- [Column nullable có sử dụng index được không?](/database/02-index-on-nullable-column) — giải thích partial index cho outbox và hàng đợi delivery chưa xử lý.
+- [Phân biệt Encoding, Encryption và Hashing](/security/01-encoding-vs-encryption) — nền tảng để chọn HMAC đúng cho webhook signature.
+- [SSL/TLS hoạt động như thế nào?](/security/02-ssl-tls) — hiểu certificate, hostname verification và mTLS trong đường delivery HTTPS.
+- [SQL vs NoSQL: chọn database như thế nào?](/database/01-sql-vs-nosql) — đánh giá storage theo consistency, access pattern và năng lực vận hành.

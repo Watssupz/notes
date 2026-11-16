@@ -1,0 +1,211 @@
+---
+title: "Chẩn đoán độ trễ theo vùng: từ waterfall đến kiến trúc dữ liệu"
+description: "Phân biệt DNS, TCP, TLS, TTFB và rendering; kiểm tra CDN, request nối tiếp và multi-region mà không suy đoán nguyên nhân từ vị trí địa lý."
+---
+
+Giả sử cùng một trang mở trong khoảng 60 ms ở Singapore nhưng mất 6 giây với người dùng tại Mỹ. Hai số này chưa đủ để kết luận thiếu CDN hay database quá chậm. Thậm chí chúng có thể đang đo hai thứ khác nhau: thời gian API trả byte đầu tiên và thời gian trang render xong.
+
+Cách xử lý là tạo phép đo có thể so sánh, xác định phần chờ nằm ở đâu rồi mới chọn giải pháp. Bài này dùng tình huống giả định trên để giải thích quy trình; không có phép đo production nào được ngầm coi là đã thực hiện.
+
+## Mục lục
+
+- [Định nghĩa thứ đang chậm](#định-nghĩa-thứ-đang-chậm)
+  - [Latency của request khác thời gian trang dùng được](#latency-của-request-khác-thời-gian-trang-dùng-được)
+  - [RTT là chi phí của một lượt đi và về](#rtt-là-chi-phí-của-một-lượt-đi-và-về)
+- [Thu thập waterfall từ đúng vị trí](#thu-thập-waterfall-từ-đúng-vị-trí)
+- [Đọc CDN bằng cache policy và bằng chứng thực tế](#đọc-cdn-bằng-cache-policy-và-bằng-chứng-thực-tế)
+  - [Có CDN không đồng nghĩa response đã cache](#có-cdn-không-đồng-nghĩa-response-đã-cache)
+  - [Chỉ cache khi cache key biểu diễn đủ các biến thể](#chỉ-cache-khi-cache-key-biểu-diễn-đủ-các-biến-thể)
+- [Request nối tiếp khuếch đại RTT](#request-nối-tiếp-khuếch-đại-rtt)
+- [Connection reuse, HTTP và TLS](#connection-reuse-http-và-tls)
+- [Multi-region phải đưa cả dữ liệu vào thiết kế](#multi-region-phải-đưa-cả-dữ-liệu-vào-thiết-kế)
+  - [Replica lag và read-your-write](#replica-lag-và-read-your-write)
+  - [Routing, failover và chi phí](#routing-failover-và-chi-phí)
+- [Xác nhận cải thiện và ngăn tái diễn](#xác-nhận-cải-thiện-và-ngăn-tái-diễn)
+- [Tài liệu tham khảo và bài liên quan](#tài-liệu-tham-khảo-và-bài-liên-quan)
+
+## Định nghĩa thứ đang chậm
+
+### Latency của request khác thời gian trang dùng được
+
+**TTFB**, time to first byte, là thời gian từ khi client bắt đầu request đến khi nhận byte đầu tiên. Nó gồm các phần chờ trước khi có response, không chỉ thời gian server chạy handler.
+
+Trang có TTFB thấp vẫn có thể dùng được rất muộn vì tải JavaScript lớn, main thread bận hoặc phải gọi thêm API. Ngược lại, API chậm không nhất thiết khiến mọi nội dung trên trang đều xuất hiện muộn nếu giao diện có thể render từng phần.
+
+Trước khi debug, ghi rõ URL, method, tài khoản/tenant demo, thiết bị, browser, network và metric đang so sánh. Tách cold connection khỏi reused connection; tách browser cache lạnh khỏi cache ấm. Một lần refresh từ laptop khác vùng không phải benchmark có kiểm soát.
+
+### RTT là chi phí của một lượt đi và về
+
+**RTT**, round-trip time, đo thời gian một thông điệp đi tới phía kia rồi phản hồi quay lại. Nếu giả định RTT tới origin là 150 ms, mỗi lượt trao đổi nối tiếp qua đường đó phải trả thêm chi phí mạng. Con số 150 ms chỉ là giả định minh họa, không phải hằng số cho tuyến Singapore–Mỹ.
+
+Khoảng cách giải thích một phần latency. Nó không tự giải thích chênh lệch 60 ms thành 6 giây: còn có connection setup, loss, retransmission, queue, dependency chậm và công việc phía browser. Cần đo từng phần thay vì gán toàn bộ cho tốc độ ánh sáng.
+
+## Thu thập waterfall từ đúng vị trí
+
+Waterfall là danh sách các request theo thời điểm bắt đầu và kết thúc. Trong DevTools Network hoặc WebPageTest, kiểm tra HTML đầu tiên, assets và các API xuất hiện sau khi JavaScript chạy.
+
+```d2 title="Khoanh vùng chậm trước khi chọn cách sửa" interactive=false
+direction: down
+report: "Trang chậm tại một vùng"
+measure: "Đo request và browser waterfall"
+first: "Chờ byte đầu lâu?" {shape: diamond}
+network: "DNS, connection, CDN, origin trace"
+render: "Assets, API phụ thuộc, JavaScript, render"
+report -> measure -> first
+first -> network: Có
+first -> render: Không
+```
+
+Sơ đồ là nhánh điều tra ban đầu, không phải kết luận rằng TTFB cao luôn do backend. Service Worker, proxy, browser queue và connection setup cũng có thể nằm trên đường đi trước byte đầu.
+
+Với `curl`, chạy cùng URL từ hai máy thử ở hai vùng. Command sau chỉ đọc tài nguyên demo; thay URL bằng endpoint bạn được phép kiểm tra:
+
+```bash
+curl --silent --show-error --output /dev/null \
+  --write-out 'dns=%{time_namelookup}\ntcp=%{time_connect}\ntls=%{time_appconnect}\nfirst_byte=%{time_starttransfer}\ntotal=%{time_total}\nhttp=%{http_version}\nremote_ip=%{remote_ip}\n' \
+  https://www.example.com/
+```
+
+Các giá trị timing trên là **mốc tích lũy tính từ lúc bắt đầu**, không phải các duration để cộng trực tiếp. Với một HTTPS request mới không redirect hay proxy đặc biệt, có thể đọc gần đúng:
+
+| Khoảng cần xem | Hiệu hai mốc |
+| --- | --- |
+| DNS | `time_namelookup` |
+| TCP sau DNS | `time_connect - time_namelookup` |
+| TLS sau TCP | `time_appconnect - time_connect` |
+| Chờ request/response sau TLS | `time_starttransfer - time_appconnect` |
+| Nhận phần response còn lại | `time_total - time_starttransfer` |
+
+Khoảng sau TLS vẫn có thể gồm gửi request, network, server queue và xử lý. Không đặt tên nó là “server processing time” nếu chưa có trace phía origin. `curl` cũng không chạy JavaScript, nên không thay thế phép đo render từ browser.
+
+## Đọc CDN bằng cache policy và bằng chứng thực tế
+
+### Có CDN không đồng nghĩa response đã cache
+
+CDN có thể terminate TLS ở edge nhưng vẫn phải lấy response từ origin ở xa. Khi điều tra, lấy response headers, CDN cache status, cache key và request trace qua origin. Một cache miss đơn lẻ là bình thường; miss liên tục với cùng tài nguyên mới đáng điều tra.
+
+Phân biệt các directive sau:
+
+| Directive | Ý nghĩa thực dụng |
+| --- | --- |
+| `no-store` | Yêu cầu cache không lưu response |
+| `no-cache` | Có thể lưu, nhưng phải validate trước khi tái sử dụng theo quy tắc HTTP |
+| `private` | Không cho shared cache lưu; browser cache vẫn có thể có vai trò |
+| `s-maxage=60` | Freshness lifetime cho shared cache, khi policy của CDN cho phép |
+| `immutable` | Nội dung không thay đổi trong freshness lifetime; phù hợp asset có content hash |
+
+Không coi `Set-Cookie` là một quy tắc cấm cache giống nhau ở mọi CDN. Hành vi phụ thuộc sản phẩm và policy. Một cấu hình cache sai còn có thể phát lại header hay dữ liệu riêng tư cho người dùng khác.
+
+### Chỉ cache khi cache key biểu diễn đủ các biến thể
+
+Với JavaScript có hash trong tên file, có thể dùng policy dài hạn:
+
+```http
+Cache-Control: public, max-age=31536000, immutable
+```
+
+Với API công khai trả cùng dữ liệu cho mọi người, có thể cân nhắc:
+
+```http
+Cache-Control: public, s-maxage=60, stale-while-revalidate=30
+```
+
+Đây là hai response riêng, không phải hai dòng cấu hình để gắn chung mọi endpoint. Với dữ liệu đăng nhập nhạy cảm, policy có thể là:
+
+```http
+Cache-Control: private, no-store
+```
+
+Không loại cookie hay `Authorization` khỏi cache key chỉ để tăng hit rate. Trước tiên phải chứng minh response không phụ thuộc identity. Hãy thử hai tài khoản demo, hai tenant và hai ngôn ngữ; cache không được trả nhầm biến thể ngay cả khi hit rate rất cao.
+
+`Vary` mô tả header ảnh hưởng biến thể, nhưng CDN có thể dùng cache-key configuration riêng. Kiểm tra cả HTTP headers và cấu hình sản phẩm đang dùng; đừng suy ra cấu hình chỉ từ một dòng `Vary`.
+
+## Request nối tiếp khuếch đại RTT
+
+Giả sử browser gọi `/profile`, chờ xong mới gọi `/orders`, rồi mới gọi `/notifications`. Nếu ba request độc lập nhưng bị viết nối tiếp, critical path — chuỗi công việc quyết định thời điểm hoàn tất — phải chờ cả ba.
+
+Ví dụ dưới đây chỉ cho thấy khác biệt về dependency, không bảo đảm một mức tăng tốc cụ thể:
+
+```javascript
+// Chỉ chạy song song khi ba lời gọi không phụ thuộc dữ liệu của nhau.
+const [profile, orders, notifications] = await Promise.all([
+  fetch('/api/profile').then(checkResponse),
+  fetch('/api/orders').then(checkResponse),
+  fetch('/api/notifications').then(checkResponse),
+]);
+
+function checkResponse(response) {
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+}
+```
+
+Chạy song song chuyển thời gian chờ từ gần tổng các request sang gần request chậm nhất, cộng các overhead. Nhưng nó tăng concurrency và có thể gây tải đột biến xuống backend. Cần giới hạn fan-out, deadline và hành vi partial failure; `Promise.all` không tự hủy request còn lại khi một request reject.
+
+Nếu service tại Singapore gọi dependency cũng tại Singapore, request của user Mỹ không khiến từng backend call tự có RTT Singapore–Mỹ. Chỉ những cạnh thật sự vượt tuyến xa mới trả chi phí đó. Dùng distributed trace để đặt dependency đúng vị trí địa lý trước khi tính thời gian.
+
+## Connection reuse, HTTP và TLS
+
+HTTP/1.1 có keep-alive; không phải mỗi resource đều mở TCP connection mới. HTTP/2 multiplex nhiều request trên connection, còn HTTP/3 dùng QUIC để thay đổi cách quản lý transport và loss. Hiệu quả phụ thuộc số origin, connection reuse, packet loss và cách browser schedule request.
+
+Với TCP connection mới, full TLS 1.3 thường cần một RTT ở TLS layer, chưa kể TCP setup. Resumption có thể giảm công việc handshake nhưng không đồng nghĩa 0-RTT tự bật. TLS 1.3 early data có replay risk và không phù hợp để bật vô điều kiện cho mutation.
+
+Trước khi thêm protocol hoặc đổi Nginx, đo số connection mới, negotiated HTTP/TLS version và thời gian connection setup. Giảm domain sharding, tránh redirect không cần thiết và giữ connection reuse thường dễ thử hơn thay kiến trúc dữ liệu.
+
+Mình ưu tiên bỏ các vòng đi-về không cần thiết trước khi triển khai thêm region. Nếu origin xử lý mất 5 giây do lock wait, thay HTTP/1.1 bằng HTTP/3 không giải quyết được nguyên nhân chính.
+
+## Multi-region phải đưa cả dữ liệu vào thiết kế
+
+Đặt application server tại Mỹ không đủ nếu mọi query của server đó vẫn chạy tới database primary ở Singapore. Bạn chỉ chuyển nơi thực hiện lời gọi, chưa loại bỏ dependency xuyên vùng.
+
+Sơ đồ dưới đây tách read chấp nhận dữ liệu cũ khỏi write cần về primary. Nó không hứa mọi request tại Mỹ sẽ có latency tương đương request tại Singapore.
+
+```d2 title="Đưa read gần người dùng nhưng giữ write boundary rõ" interactive=false
+direction: right
+user: "Client tại Mỹ"
+app: "Application tại Mỹ"
+replica: "Read replica tại Mỹ" {shape: cylinder}
+primary: "Primary tại Singapore" {shape: cylinder}
+user -> app
+app -> replica: "Read chấp nhận lag"
+app -> primary: "Write và read cần state mới nhất"
+primary -> replica: "Replication bất đồng bộ"
+```
+
+### Replica lag và read-your-write
+
+**Replication lag** là độ trễ để bản sao bắt kịp thay đổi ở nguồn. Nếu user sửa địa chỉ rồi lập tức đọc từ replica chưa bắt kịp, họ có thể thấy địa chỉ cũ.
+
+Các lựa chọn gồm đọc primary cho flow đó, trả kết quả vừa commit ngay trong command response, hoặc dùng version để biết replica đã đủ mới. Chọn theo yêu cầu nghiệp vụ; không gọi mọi dữ liệu profile hay catalog là “stale vài giây cũng được” nếu chưa có product contract.
+
+### Routing, failover và chi phí
+
+Latency routing cần health check và kế hoạch khi một region mất. DNS còn có cache/TTL, nên thay record không làm toàn bộ client chuyển ngay lập tức. Failover application và failover database cũng không phải một thao tác duy nhất.
+
+Cross-region replicas thêm replication bandwidth, chi phí vận hành và bài toán recovery. Nếu dữ liệu cần multi-writer, phải giải quyết ownership, conflict và invariant; không chỉ thêm một database thứ hai. Chọn multi-region khi yêu cầu latency, availability hoặc data residency biện minh được cho chi phí đó.
+
+## Xác nhận cải thiện và ngăn tái diễn
+
+Sau mỗi thay đổi, chạy lại cùng nhóm phép đo: cold/warm cache, fresh/reused connection, tài khoản demo và vùng truy cập. So percentile thay vì chỉ một request nhanh nhất. Đo cả lỗi, throughput và chi phí, không tối ưu latency bằng cách trả dữ liệu sai hoặc bỏ bớt công việc mà không thông báo.
+
+Kết hợp hai nguồn quan sát:
+
+- **Synthetic monitoring**: request/browser test được chạy chủ động từ các location đã chọn. Nó phát hiện endpoint hoặc flow bị hỏng ngay cả khi vùng đó ít traffic.
+- **Real User Monitoring**: phép đo từ browser người dùng thật, được lấy mẫu và bảo vệ dữ liệu riêng tư. Nó cho thấy khác biệt theo thiết bị, network, browser và geography.
+
+Label region của server không phải location của người dùng. ALB target latency cũng không đo DNS, TLS từ browser hay render. Dashboard cần phân biệt các góc nhìn này để không bỏ sót vấn đề tại một vùng.
+
+Trước khi đề xuất thêm region, hãy lưu một waterfall, một trace tương ứng và cache evidence cho request chậm. Sau đó viết rõ phần thời gian nào thay đổi sẽ loại bỏ được. Đây là tiêu chí để chọn giải pháp, không phải số lượng thành phần trong sơ đồ.
+
+## Tài liệu tham khảo và bài liên quan
+
+- [curl write-out variables](https://curl.se/docs/manpage.html#-w).
+- [MDN Cache-Control](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cache-Control).
+- [WebPageTest](https://www.webpagetest.org/).
+- [TLS 1.3: RFC 8446](https://www.rfc-editor.org/rfc/rfc8446).
+
+<Cards>
+  <Card title="TLS handshake và trust boundary" href="/security/02-ssl-tls" />
+  <Card title="CORS và đường đi của request" href="/web/01-cors" />
+  <Card title="Scale dựa trên phép đo" href="/system-design/03-scale-1k-to-50k-users" />
+</Cards>

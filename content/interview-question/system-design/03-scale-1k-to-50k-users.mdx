@@ -1,0 +1,241 @@
+---
+title: "Scale từ 1.000 lên 50.000 users: tìm và gỡ bottleneck"
+description: "Chuyển số user thành workload, đo capacity, thiết kế stateless app, connection budget, cache, read replica, queue và rollout theo SLO."
+---
+
+Giả sử sản phẩm sắp tăng từ 1.000 lên 50.000 users. Chưa thể kết luận phải thêm 50 lần số server: 50.000 tài khoản ít hoạt động tạo workload khác hoàn toàn 50.000 người cùng xem livestream hay cập nhật vị trí.
+
+Việc đầu tiên là chuyển dự báo người dùng thành request, kết nối, dữ liệu và tác vụ cụ thể. Sau đó bạn mới quyết định cần app replica, database mạnh hơn, cache hay queue. Bài này đưa ra một quy trình đo và lựa chọn; các số minh họa không phải sizing production đã kiểm chứng.
+
+## Mục lục
+
+- [Chuyển user count thành workload](#chuyển-user-count-thành-workload)
+  - [Tài khoản, active users và concurrency là ba số khác nhau](#tài-khoản-active-users-và-concurrency-là-ba-số-khác-nhau)
+  - [Ước lượng theo endpoint và thời điểm cao tải](#ước-lượng-theo-endpoint-và-thời-điểm-cao-tải)
+- [Đặt SLO và tìm bottleneck thật](#đặt-slo-và-tìm-bottleneck-thật)
+- [Tối ưu trong một node trước khi đổi topology](#tối-ưu-trong-một-node-trước-khi-đổi-topology)
+- [Scale-out application bằng trạng thái có ownership rõ](#scale-out-application-bằng-trạng-thái-có-ownership-rõ)
+  - [Stateless không có nghĩa không tồn tại state](#stateless-không-có-nghĩa-không-tồn-tại-state)
+  - [Autoscaling cần thời gian và giới hạn downstream](#autoscaling-cần-thời-gian-và-giới-hạn-downstream)
+- [Database connection budget và query optimization](#database-connection-budget-và-query-optimization)
+  - [Tính tổng pool trên mọi process](#tính-tổng-pool-trên-mọi-process)
+  - [Tìm query gây tổng chi phí lớn](#tìm-query-gây-tổng-chi-phí-lớn)
+- [Read replica chỉ giải quyết phần đọc có thể tách](#read-replica-chỉ-giải-quyết-phần-đọc-có-thể-tách)
+- [Cache giảm phần đọc lặp lại, không xóa bài toán correctness](#cache-giảm-phần-đọc-lặp-lại-không-xóa-bài-toán-correctness)
+- [Queue tách thời điểm xử lý, không tạo capacity miễn phí](#queue-tách-thời-điểm-xử-lý-không-tạo-capacity-miễn-phí)
+- [Sharding và microservices cần lý do riêng](#sharding-và-microservices-cần-lý-do-riêng)
+- [Rollout theo giả thuyết và đo lại](#rollout-theo-giả-thuyết-và-đo-lại)
+- [Tài liệu tham khảo và bài liên quan](#tài-liệu-tham-khảo-và-bài-liên-quan)
+
+## Chuyển user count thành workload
+
+### Tài khoản, active users và concurrency là ba số khác nhau
+
+**Active user** là người có hoạt động trong một cửa sổ thời gian đã định nghĩa. **Concurrency** là lượng công việc đang tồn tại đồng thời, chẳng hạn request đang xử lý hoặc WebSocket đang mở. Đừng dùng chúng thay cho requests per second — số request mỗi giây.
+
+Ví dụ giả định có 50.000 người đang dùng ứng dụng, mỗi người tạo trung bình một request trong 20 giây:
+
+```text
+Throughput trung bình = 50.000 / 20 = 2.500 requests/giây
+```
+
+Nếu request mất trung bình 200 ms trong trạng thái ổn định, Little's Law cho ước lượng:
+
+```text
+Requests đang xử lý ≈ throughput × thời gian trung bình
+                    ≈ 2.500 × 0,2 = 500
+```
+
+500 không phải số database connections cần mở. Request có thể dùng CPU, chờ cache, chờ database hoặc chờ dịch vụ khác trong những khoảng khác nhau. Cũng không nhân RPS với p99 để thay cho quan hệ dựa trên thời gian trung bình này.
+
+### Ước lượng theo endpoint và thời điểm cao tải
+
+Một request xem catalog có thể nhẹ hơn một request tạo báo cáo hàng nghìn lần. Hãy tách workload thay vì dùng một con số RPS tổng.
+
+| Nhóm | Dữ liệu cần lấy | Bottleneck có thể gặp |
+| --- | --- | --- |
+| Đọc catalog | RPS, kích thước response, mức stale chấp nhận được | Database read, cache, network |
+| Checkout | Write rate, conflict rate, dependency latency | Lock, transaction, payment |
+| Search | Query shape, cardinality, index | CPU, scan, search backend |
+| Upload/import | File size, concurrent jobs, rows | Bandwidth, parser, database write |
+| Realtime | Connections, subscriptions, events/giây | File descriptors, fan-out, outbound buffers |
+
+Bổ sung peak-to-average, burst duration, tăng trưởng dataset và retry amplification. Retry amplification là phần tải tăng thêm do các lần thử lại; nó thường rõ nhất khi hệ thống đang lỗi, tức đúng lúc capacity thiếu nhất.
+
+## Đặt SLO và tìm bottleneck thật
+
+**SLO**, service level objective, là mục tiêu đo được cho chất lượng dịch vụ. Ví dụ giả định: 99% request đọc sản phẩm hoàn tất trong 500 ms và tỷ lệ lỗi dưới một ngưỡng đã thống nhất. Endpoint xuất báo cáo chạy nền cần SLO khác checkout.
+
+Quan sát latency, traffic, errors và saturation. **Saturation** mô tả mức tài nguyên đang hết chỗ hoặc phải xếp hàng: thread pool đầy, connection pool chờ lâu, disk queue tăng. CPU thấp không chứng minh hệ thống còn dư capacity nếu mọi request đang chờ database lock.
+
+```d2 title="Scale theo tài nguyên gây chờ" interactive=false
+direction: down
+measure: "Load test và production metrics"
+find: "Tài nguyên nào gây chờ?" {shape: diamond}
+app: "CPU / app concurrency"
+db: "Database query / lock / I/O"
+network: "Payload / network / geography"
+external: "Dependency / background work"
+measure -> find
+find -> app
+find -> db
+find -> network
+find -> external
+```
+
+Mỗi nhánh dẫn tới một nhóm biện pháp khác nhau. Thêm app replicas không làm một query đang thiếu index nhanh hơn; thậm chí còn tạo thêm concurrent queries xuống database.
+
+Load test phải có dữ liệu đại diện, cache lạnh/ấm và burst đủ dài để thấy pool/queue tăng. Chỉ thử trên môi trường bạn được phép tạo tải. `EXPLAIN ANALYZE` thực thi query, còn load test có thể gây write thật; không dùng production làm môi trường thử ngẫu hứng.
+
+## Tối ưu trong một node trước khi đổi topology
+
+Vertical scaling là tăng CPU, RAM hoặc I/O capacity của node. Nó có thể mua thời gian nhanh nếu workload thật sự bị giới hạn bởi tài nguyên đó. Nhưng thêm RAM không sửa được query sai, lock giữ quá lâu hay một external API chậm.
+
+Trước scale-out, kiểm tra những chi phí tránh được: N+1 queries, index không phù hợp, response dư field, gọi dependency nối tiếp và transaction bao cả HTTP call. N+1 là tình huống một query lấy danh sách rồi lại chạy thêm query cho từng item.
+
+Mình ưu tiên tối ưu query hoặc transaction có bằng chứng gây nghẽn trước thay đổi kiến trúc. Nhưng không đợi tối ưu mọi thứ mới thêm node: yêu cầu availability có thể cần nhiều replicas ngay cả khi một node đủ throughput.
+
+Vertical scaling có giới hạn phần cứng, chi phí và có thể cần restart/failover. Ghi rõ capacity sau thay đổi cùng kế hoạch khi một node không còn đủ, thay vì coi nâng máy là hướng vô hạn.
+
+## Scale-out application bằng trạng thái có ownership rõ
+
+### Stateless không có nghĩa không tồn tại state
+
+App stateless nghĩa là một request không bắt buộc quay lại đúng instance giữ state riêng của request trước. State bền vững vẫn tồn tại, nhưng nằm ở nơi các instance truy cập được và có hợp đồng rõ.
+
+```d2 title="Application replicas dùng state chung" interactive=false
+direction: right
+lb: "Load balancer"
+a: "App A"
+b: "App B"
+session: "Shared session store"
+db: PostgreSQL {
+  shape: cylinder
+  icon: /interview-question/postgresql.svg
+}
+lb -> a
+lb -> b
+a -> session
+b -> session
+a -> db
+b -> db
+```
+
+Session có thể ở shared store hoặc được thiết kế theo token phù hợp. Redis không phải lựa chọn bắt buộc cho mọi ứng dụng. Local file, in-memory job và WebSocket connection state cũng cần được xem xét khi app replicas tăng.
+
+Sticky session là một cơ chế routing, không phải durability. Nó có thể phù hợp trong một số workload nhưng cần hiểu tác động khi node chết, autoscale hoặc phân phối user không đều. Nếu mất node đồng nghĩa mất workflow, affinity chưa giải quyết được bài toán.
+
+### Autoscaling cần thời gian và giới hạn downstream
+
+Autoscaler phản ứng sau khi metric thay đổi; node mới còn cần schedule, khởi động và warm-up. Nó không hấp thụ burst tức thời vô hạn. Cần headroom, readiness check và giới hạn request đang xử lý.
+
+CPU là metric hợp lý cho workload CPU-bound. Với API chủ yếu chờ I/O, request concurrency hoặc queue wait có thể phản ánh saturation tốt hơn. Với worker, tuổi job cũ nhất thường quan trọng hơn chỉ CPU.
+
+Không tăng `maxReplicas` mà bỏ qua database connection budget. Scale-out app có thể làm database mất ổn định nhanh hơn trước.
+
+## Database connection budget và query optimization
+
+### Tính tổng pool trên mọi process
+
+Giả sử 8 app replicas, mỗi pool tối đa 20 connections, và 4 workers mỗi pool 10 connections:
+
+```text
+Tổng cấu hình = 8 × 20 + 4 × 10 = 200 connections
+```
+
+Database còn cần chỗ cho admin, migrations, monitoring và dự phòng sự cố. Trong rolling deploy, số process có thể tăng tạm thời; budget phải tính cả cửa sổ này.
+
+Pool lớn không đồng nghĩa throughput lớn. Nó có thể làm nhiều queries tranh CPU, I/O và locks hơn. Đo pool wait, active queries và database saturation để chọn giới hạn; không áp một công thức theo CPU cores như đáp án cho mọi database.
+
+Pooler như PgBouncer có thể giảm số server-side connections. Tuy nhiên, transaction pooling ảnh hưởng tính năng dựa vào session state. Kiểm tra driver, prepared statements và usage thực tế trước khi đổi mode.
+
+### Tìm query gây tổng chi phí lớn
+
+`pg_stat_statements`, khi đã được cài và cấu hình, giúp xác định query tốn nhiều tổng thời gian hoặc được gọi quá nhiều. Một query 10 ms chạy hàng trăm nghìn lần có thể quan trọng hơn một query 2 giây hiếm gặp.
+
+Dùng `EXPLAIN`, statistics và workload thật để kiểm tra index/query rewrite. Đọc cả lock wait và transaction duration; query nhìn nhanh khi chạy riêng vẫn có thể chờ rất lâu dưới concurrency.
+
+## Read replica chỉ giải quyết phần đọc có thể tách
+
+Replica nhận dữ liệu từ primary. Với replication bất đồng bộ, nó có thể chậm hơn nguồn. Đưa mọi `SELECT` sang replica có thể khiến user không thấy đơn vừa tạo hoặc quyết định nghiệp vụ dựa trên inventory cũ.
+
+Phân loại query theo hợp đồng đọc:
+
+| Loại đọc | Nơi đọc gợi ý |
+| --- | --- |
+| Dashboard chấp nhận lag | Replica nếu đo được freshness |
+| Đọc ngay sau write quan trọng | Primary hoặc cơ chế chờ version đủ mới |
+| Kiểm tra invariant trước mutation | Cùng consistency boundary của write |
+| Báo cáo nặng | Replica/warehouse riêng nếu isolation thực sự đủ |
+
+Annotation `@Transactional(readOnly = true)` không tự tạo read/write routing. Việc lấy connection, proxy transaction và lazy connection phải khớp với routing implementation. Kiểm thử server thực sự nhận query thay vì suy ra chỉ từ annotation.
+
+Replica không giải quyết write bottleneck và vẫn tiêu thụ tài nguyên để replay write. Khi primary nghẽn do lock contention, thêm read replica có thể không tạo lợi ích đáng kể.
+
+## Cache giảm phần đọc lặp lại, không xóa bài toán correctness
+
+Nếu giả định 90% lookup của một tập query được phục vụ từ cache, số lookup rơi xuống database cho tập đó còn khoảng 10%. Điều này không có nghĩa tổng database load hay latency giảm đúng 10 lần: cache miss còn có chi phí khác, và write/queries không cache vẫn tồn tại.
+
+Chọn cache key có tenant, identity hoặc version khi response phụ thuộc những yếu tố đó. Định nghĩa TTL, invalidation và hành vi khi cache down. Cache dữ liệu quyền truy cập cần quy tắc revoke; không đánh đồng nó với catalog công khai.
+
+Trước khi rollout, thử cold cache và hot-key expiry. Nếu database chỉ sống được khi hit rate luôn trên 99%, mất một cache node có thể trở thành sự cố toàn hệ thống. Thêm single-flight, rate limit hoặc degraded mode trước khi cần dùng tới chúng.
+
+## Queue tách thời điểm xử lý, không tạo capacity miễn phí
+
+Gửi email, xử lý ảnh hay import có thể chuyển ra khỏi request path. API ghi nhận công việc rồi trả trạng thái; worker xử lý sau. Queue hấp thụ burst nhưng backlog vẫn tăng nếu tốc độ nhận lớn hơn tốc độ xử lý trong thời gian dài.
+
+Sơ đồ dưới đây dùng outbox để tránh khoảng trống giữa commit đơn hàng và gửi công việc. Outbox là bản ghi cần phát được lưu cùng transaction với dữ liệu nghiệp vụ.
+
+```d2 title="Ghi nghiệp vụ trước, gửi công việc đáng tin cậy sau" interactive=false
+direction: right
+api: "Order API"
+db: "Database: order và outbox" {shape: cylinder}
+relay: "Outbox relay"
+queue: "Durable queue"
+worker: "Email worker"
+api -> db: "Một local transaction"
+db -> relay: "Đọc event đã commit"
+relay -> queue
+queue -> worker: "Có thể redeliver"
+```
+
+Relay có thể publish trùng nếu crash giữa gửi và đánh dấu đã gửi. Worker phải idempotent, tức thử lại cùng công việc không tạo thêm effect ngoài ý muốn. Email provider hay payment API cần idempotency riêng nếu effect nằm ngoài database của worker.
+
+Giới hạn concurrency theo downstream capacity; queue length giảm nhanh nhưng database online sập không phải cải thiện. Đặt SLO theo queue age và thời gian hoàn tất, có retry budget, dead-letter handling và fairness giữa tenant.
+
+## Sharding và microservices cần lý do riêng
+
+**Sharding** chia dữ liệu lên nhiều nơi sở hữu khác nhau để tăng capacity hoặc đáp ứng placement requirement. Nó mang theo key selection, query fan-out, cross-shard transaction và migration. Không có user-count threshold nào chứng minh chắc chắn cần hoặc không cần sharding.
+
+Tương tự, microservices có thể giúp ownership và independent deployment, nhưng tăng network failure, tracing và contract management. Số lượng engineer không phải ngưỡng kỹ thuật tự động. Tách service khi boundary và nhu cầu triển khai/scale độc lập đủ rõ, không chỉ vì sản phẩm đạt 50.000 users.
+
+Các ràng buộc như data residency hoặc một workload cực nặng có thể biện minh cho thiết kế phân tán sớm. Ngược lại, modular monolith có thể tiếp tục phù hợp ở traffic lớn nếu capacity và quy trình vận hành đáp ứng. Kết luận phải dựa vào workload và yêu cầu, không dựa vào một ví dụ thành công của công ty khác.
+
+## Rollout theo giả thuyết và đo lại
+
+Mỗi thay đổi cần một giả thuyết có thể kiểm tra. Ví dụ: “Pool wait chiếm phần lớn request time; giảm query count sẽ tăng throughput trước khi thêm app replicas.” Chọn một nhóm endpoint, đo baseline, thay đổi nhỏ rồi so kết quả.
+
+Quy trình thực dụng:
+
+1. Ghi baseline latency/error/saturation và dataset, cache state, traffic mix.
+2. Thử thay đổi trên môi trường có workload đại diện.
+3. Canary một phần traffic, có rollback và capacity cho đường cũ.
+4. Kiểm tra mất một node, dependency chậm và retry storm trong phạm vi thử an toàn.
+5. Đo lại bottleneck; gỡ một nút nghẽn thường làm lộ nút tiếp theo.
+
+Cần thấy cả service-level metric lẫn metric theo endpoint/tenant. Average toàn fleet có thể che một tenant bị nghẽn hoặc một shard nóng. Threshold alert phải gắn với SLO và thời gian xử lý sự cố của đội, không sao chép một mức CPU cố định cho mọi workload.
+
+Đầu ra của capacity planning nên là một bảng có workload dự báo, capacity đã thử, giới hạn downstream và trigger cho bước tiếp theo. Đó là cơ sở để tăng từ 1.000 lên 50.000 users một cách có kiểm soát; không phải một roadmap bắt buộc mọi hệ thống đều lần lượt thêm Redis, replica rồi Kafka.
+
+## Tài liệu tham khảo và bài liên quan
+
+- [Google SRE: Monitoring Distributed Systems](https://sre.google/sre-book/monitoring-distributed-systems/).
+- [Kubernetes Horizontal Pod Autoscaling](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/).
+- [PostgreSQL pg_stat_statements](https://www.postgresql.org/docs/current/pgstatstatements.html).
+- [PgBouncer configuration](https://www.pgbouncer.org/config.html).
+
+<Cards>
+  <Card title="Chọn cache và thiết kế cache failure" href="/caching/01-redis-vs-memcached" />
+  <Card title="Latency theo vùng" href="/system-design/02-geo-latency-60ms-vs-6s" />
+  <Card title="CQRS và read model" href="/system-design/04-cqrs" />
+</Cards>

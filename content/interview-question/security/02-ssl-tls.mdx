@@ -1,0 +1,898 @@
+---
+title: "SSL/TLS: từ nền tảng đến triển khai HTTPS và mTLS"
+description: "Hiểu mã hóa, certificate, CA, TLS 1.3 handshake và ranh giới bảo vệ; thực hành HTTPS/mTLS bằng OpenSSL, kiểm tra và vận hành certificate."
+---
+
+Giả sử bạn gửi một request chuyển tiền qua Wi-Fi công cộng. Bạn không muốn người cùng mạng đọc được token, sửa số tiền hoặc giả làm API để nhận request. Đổi `http://` thành `https://` giải quyết phần đường truyền của bài toán đó bằng TLS — nhưng chỉ khi client kiểm tra đúng danh tính server.
+
+Bài này đi từ một kết nối HTTPS đơn giản đến hệ thống có reverse proxy và nhiều service. Sau phần giải thích, bạn sẽ tự tạo một CA cho lab, chạy HTTPS trên máy, thử kết nối thành công lẫn thất bại, rồi mở rộng sang mTLS. Không cần biết toán mật mã trước; chỉ cần quen HTTP và terminal.
+
+<Callout type="info" title="Phạm vi">
+Phần handshake dùng TLS 1.3, xác thực server bằng certificate và trao đổi khóa ECDHE làm ví dụ chính. Đây không phải mô tả mọi biến thể TLS: session resumption, PSK và 0-RTT được tách riêng ở phần sau. Các certificate trong lab chỉ phục vụ học tập, không dùng cho production.
+</Callout>
+
+## Mục lục
+
+- [Từ HTTP đến một kết nối được bảo vệ](#từ-http-đến-một-kết-nối-được-bảo-vệ)
+  - [SSL, TLS và HTTPS](#ssl-tls-và-https)
+  - [Ba thuộc tính của secure channel](#ba-thuộc-tính-của-secure-channel)
+  - [Những gì vẫn nằm ngoài TLS](#những-gì-vẫn-nằm-ngoài-tls)
+- [Ba công việc mật mã khác nhau](#ba-công-việc-mật-mã-khác-nhau)
+  - [Mã hóa đối xứng để bảo vệ dữ liệu](#mã-hóa-đối-xứng-để-bảo-vệ-dữ-liệu)
+  - [Key agreement để tạo bí mật chung](#key-agreement-để-tạo-bí-mật-chung)
+  - [Digital signature để chứng minh danh tính](#digital-signature-để-chứng-minh-danh-tính)
+  - [Các loại key không được đánh đồng](#các-loại-key-không-được-đánh-đồng)
+- [Certificate gắn danh tính với public key](#certificate-gắn-danh-tính-với-public-key)
+  - [Nội dung của một certificate](#nội-dung-của-một-certificate)
+  - [SAN và quy tắc khớp hostname](#san-và-quy-tắc-khớp-hostname)
+  - [Private key, CSR và quá trình cấp certificate](#private-key-csr-và-quá-trình-cấp-certificate)
+  - [PEM, DER và PKCS12](#pem-der-và-pkcs12)
+- [CA, certificate chain và trust store](#ca-certificate-chain-và-trust-store)
+  - [Root, intermediate và leaf](#root-intermediate-và-leaf)
+  - [Client kiểm tra nhiều điều độc lập](#client-kiểm-tra-nhiều-điều-độc-lập)
+  - [Public CA, private CA và self-signed](#public-ca-private-ca-và-self-signed)
+- [TLS 1.3 handshake từng bước](#tls-13-handshake-từng-bước)
+  - [ClientHello công bố khả năng của client](#clienthello-công-bố-khả-năng-của-client)
+  - [ServerHello chốt lựa chọn và key share](#serverhello-chốt-lựa-chọn-và-key-share)
+  - [Key schedule sinh key theo mục đích](#key-schedule-sinh-key-theo-mục-đích)
+  - [Certificate và CertificateVerify xác thực server](#certificate-và-certificateverify-xác-thực-server)
+  - [Finished xác nhận handshake](#finished-xác-nhận-handshake)
+- [Record layer bảo vệ HTTP sau handshake](#record-layer-bảo-vệ-http-sau-handshake)
+  - [Một request không nhất thiết là một record](#một-request-không-nhất-thiết-là-một-record)
+  - [Forward Secrecy giới hạn thiệt hại khi lộ key](#forward-secrecy-giới-hạn-thiệt-hại-khi-lộ-key)
+- [Version, cipher suite, SNI và ALPN](#version-cipher-suite-sni-và-alpn)
+  - [TLS 1.2 và TLS 1.3](#tls-12-và-tls-13)
+  - [Đọc đúng tên cipher suite](#đọc-đúng-tên-cipher-suite)
+  - [SNI chọn virtual host, ALPN chọn protocol](#sni-chọn-virtual-host-alpn-chọn-protocol)
+- [Connection reuse, resumption và 0-RTT](#connection-reuse-resumption-và-0-rtt)
+  - [Tái sử dụng connection trước khi tối ưu handshake](#tái-sử-dụng-connection-trước-khi-tối-ưu-handshake)
+  - [Resumption thiết lập một connection mới](#resumption-thiết-lập-một-connection-mới)
+  - [Early data có rủi ro replay](#early-data-có-rủi-ro-replay)
+- [TLS termination trong hệ thống nhiều chặng](#tls-termination-trong-hệ-thống-nhiều-chặng)
+  - [Terminate tại reverse proxy](#terminate-tại-reverse-proxy)
+  - [Re-encryption tạo hai secure channel](#re-encryption-tạo-hai-secure-channel)
+  - [Passthrough giữ TLS đến application](#passthrough-giữ-tls-đến-application)
+- [mTLS xác thực cả client lẫn server](#mtls-xác-thực-cả-client-lẫn-server)
+  - [Phần bổ sung trong handshake](#phần-bổ-sung-trong-handshake)
+  - [Authentication không thay authorization](#authentication-không-thay-authorization)
+  - [Keystore và truststore trong Java](#keystore-và-truststore-trong-java)
+- [Lab HTTPS trên localhost bằng OpenSSL](#lab-https-trên-localhost-bằng-openssl)
+  - [Chuẩn bị thư mục riêng](#chuẩn-bị-thư-mục-riêng)
+  - [Tạo CA dành riêng cho lab](#tạo-ca-dành-riêng-cho-lab)
+  - [Cấp certificate cho localhost](#cấp-certificate-cho-localhost)
+  - [Kiểm tra certificate trước khi chạy server](#kiểm-tra-certificate-trước-khi-chạy-server)
+  - [Chạy HTTPS và gọi bằng curl](#chạy-https-và-gọi-bằng-curl)
+  - [Quan sát lỗi trust và hostname](#quan-sát-lỗi-trust-và-hostname)
+- [Mở rộng lab sang mTLS](#mở-rộng-lab-sang-mtls)
+  - [Cấp client certificate](#cấp-client-certificate)
+  - [Yêu cầu client trình certificate](#yêu-cầu-client-trình-certificate)
+  - [Đối chiếu kết nối có và không có client identity](#đối-chiếu-kết-nối-có-và-không-có-client-identity)
+- [Triển khai và quản lý vòng đời certificate](#triển-khai-và-quản-lý-vòng-đời-certificate)
+  - [Cấu hình HTTPS ở reverse proxy](#cấu-hình-https-ở-reverse-proxy)
+  - [Renewal phải đi đến certificate đang được phục vụ](#renewal-phải-đi-đến-certificate-đang-được-phục-vụ)
+  - [Rotate CA theo thứ tự trust trước, identity sau](#rotate-ca-theo-thứ-tự-trust-trước-identity-sau)
+  - [Xử lý private key bị lộ](#xử-lý-private-key-bị-lộ)
+- [Chẩn đoán lỗi TLS theo từng lớp](#chẩn-đoán-lỗi-tls-theo-từng-lớp)
+  - [Xác định đúng endpoint và runtime](#xác-định-đúng-endpoint-và-runtime)
+  - [Kiểm tra bằng OpenSSL và curl](#kiểm-tra-bằng-openssl-và-curl)
+  - [Phân loại triệu chứng và cách sửa](#phân-loại-triệu-chứng-và-cách-sửa)
+- [Checklist đưa HTTPS vào vận hành](#checklist-đưa-https-vào-vận-hành)
+- [Tài liệu chuẩn và bài liên quan](#tài-liệu-chuẩn-và-bài-liên-quan)
+
+## Từ HTTP đến một kết nối được bảo vệ
+
+Với HTTP không có TLS, một bên có khả năng quan sát đường truyền có thể đọc request, gồm cookie, header `Authorization` và body. Một bên kiểm soát đường truyền còn có thể sửa response, chẳng hạn chèn JavaScript vào trang bạn tải. TCP truyền bytes có thứ tự, nhưng không chứng minh người ở đầu kia là server mà bạn muốn gặp.
+
+TLS bổ sung một secure channel — kênh truyền được bảo vệ giữa hai endpoint. **Endpoint** ở đây là nơi TLS thực sự chạy và giải mã dữ liệu. Nó có thể là application server, cũng có thể là CDN hoặc reverse proxy đứng trước application.
+
+### SSL, TLS và HTTPS
+
+SSL là tiền thân của TLS. SSL 2.0 và SSL 3.0 đã lỗi thời; tên gọi “cài SSL” còn phổ biến, nhưng hệ thống hiện đại thực tế cần cấu hình TLS.
+
+HTTPS là HTTP được bảo vệ bằng TLS. Với HTTP/1.1 và HTTP/2 phổ biến, client thiết lập TCP rồi thực hiện TLS handshake trước khi gửi HTTP. HTTP/3 dùng QUIC trên UDP; QUIC tích hợp TLS 1.3 để thiết lập bảo mật, không phải HTTP đặt lên một TLS record stream trên TCP như hai trường hợp trước.
+
+TLS cũng được dùng ngoài web, ví dụ kết nối database hoặc message broker. Vì vậy, TLS là cơ chế bảo vệ kênh; HTTPS là một cách dùng cơ chế đó cho HTTP.
+
+### Ba thuộc tính của secure channel
+
+Hình dung client gửi JSON `{"amount":100000}` tới đúng API thanh toán. TLS cần giải quyết ba việc khác nhau:
+
+| Thuộc tính | Ý nghĩa trong ví dụ |
+| --- | --- |
+| Confidentiality — tính bí mật | Người nghe lén không đọc được token và số tiền từ application data. |
+| Integrity — tính toàn vẹn | Nếu ciphertext bị sửa, bên nhận phát hiện và không chấp nhận dữ liệu đã bị thay đổi. |
+| Authentication — xác thực peer | Client kiểm tra peer là endpoint có credential hợp lệ cho API mình định gọi. |
+
+Chỉ mã hóa là chưa đủ. Nếu client không kiểm tra identity, attacker có thể dựng một TLS connection với client và một connection khác với server thật. Dữ liệu vẫn được mã hóa trên từng connection, nhưng attacker đọc được plaintext ở giữa. Đây là một dạng **man-in-the-middle**, thường viết tắt MITM.
+
+Trong HTTPS thông thường, TLS xác thực server. Nó không tự biết người dùng là ai; application vẫn cần session, token hoặc cơ chế đăng nhập khác.
+
+### Những gì vẫn nằm ngoài TLS
+
+Với `https://api.example.com/payments?currency=VND`, HTTP path, query, headers và body được bảo vệ trên TLS hop. Tuy nhiên, địa chỉ IP đích, kích thước và thời điểm các gói tin vẫn có thể quan sát được. DNS và SNI truyền thống cũng có thể để lộ hostname; DoH/DoT và ECH giải quyết những phần khác nhau của bài toán metadata, không phải mặc định của mọi kết nối HTTPS.
+
+Sau khi endpoint giải mã request, token lại có thể xuất hiện trong bộ nhớ, access log hoặc trace. Đó là lý do không đặt secret trong query string: HTTPS bảo vệ khi truyền, nhưng URL còn có thể được lưu trong history và log.
+
+Một phishing site cũng có thể sở hữu certificate hợp lệ cho domain của nó. TLS không kiểm tra ý định chủ website và không sửa XSS, SQL injection hay lỗi phân quyền. Kết luận cần giữ là: **TLS bảo vệ kênh tới một identity đã được kiểm tra, không chứng nhận toàn bộ ứng dụng an toàn.**
+
+## Ba công việc mật mã khác nhau
+
+Để hiểu handshake, bạn cần tách việc mã hóa dữ liệu, tạo bí mật chung và chứng minh danh tính. Chúng dùng những loại key khác nhau; gom tất cả thành “public key mã hóa, private key giải mã” sẽ dẫn đến mô hình sai về TLS 1.3.
+
+### Mã hóa đối xứng để bảo vệ dữ liệu
+
+**Symmetric encryption**, hay mã hóa đối xứng, dùng secret key mà hai bên cùng biết. Sau khi handshake thiết lập được key material, TLS dùng thuật toán như AES-GCM hoặc ChaCha20-Poly1305 để bảo vệ lượng lớn dữ liệu HTTP.
+
+Hai thuật toán này thuộc nhóm **AEAD** — Authenticated Encryption with Associated Data. Chúng mã hóa nội dung và tạo authentication tag để kiểm tra tính toàn vẹn. Nếu attacker sửa ciphertext mà không tạo được tag hợp lệ, record sẽ bị từ chối.
+
+TLS còn dùng **nonce**, giá trị phải không lặp lại với cùng key theo yêu cầu của thuật toán. Thư viện TLS quản lý nonce và giới hạn sử dụng key; application không tự gắn nonce vào từng HTTP request.
+
+### Key agreement để tạo bí mật chung
+
+Client và server chưa biết nhau trước đó, nên chưa có sẵn shared secret. Gửi thẳng một AES key qua mạng sẽ làm mất mục đích bảo mật.
+
+Trong ví dụ ECDHE, mỗi bên tạo một cặp key tạm thời. ECDHE là Diffie–Hellman trên đường cong elliptic với key **ephemeral**, nghĩa là được tạo cho lần trao đổi thay vì dùng làm identity lâu dài. Hai bên trao đổi phần public, giữ phần private ở máy mình và tính ra cùng một shared secret.
+
+| Bên tính | Input giữ riêng | Input nhận từ mạng | Kết quả |
+| --- | --- | --- | --- |
+| Client | Ephemeral private key của client | Public key share của server | Shared secret |
+| Server | Ephemeral private key của server | Public key share của client | Cùng shared secret đó |
+
+Người nghe lén thấy hai public shares, nhưng với thuật toán và tham số an toàn, không khả thi để tính shared secret chỉ từ chúng. Bảng này là mô hình khái niệm, không phải công thức để bạn tự triển khai ECDHE.
+
+Key agreement một mình chưa xác thực peer. Attacker chủ động vẫn có thể thay public shares và trao đổi key riêng với từng phía nếu không có bước xác thực gắn vào handshake.
+
+### Digital signature để chứng minh danh tính
+
+**Digital signature**, hay chữ ký số, cho phép bên giữ private key ký một thông điệp. Bên khác dùng public key tương ứng để kiểm tra chữ ký.
+
+Trong TLS 1.3 dùng certificate, server ký dữ liệu gắn với handshake hiện tại. Client kiểm tra public key đó có thuộc về identity mong đợi hay không, rồi kiểm tra chữ ký. Nhờ vậy, việc thiết lập shared secret được gắn với server đã xác thực.
+
+Đừng gọi chữ ký là “mã hóa bằng private key rồi giải mã bằng public key”. Signature algorithm có quy tắc ký/verify riêng; mô tả kia không đúng cho các thuật toán như ECDSA và làm lẫn xác thực với giữ bí mật.
+
+### Các loại key không được đánh đồng
+
+| Loại key | Ai giữ | Dùng làm gì |
+| --- | --- | --- |
+| CA private key | Hệ thống cấp certificate | Ký certificate theo policy của CA. |
+| Certificate private key của server | TLS endpoint hoặc hệ thống quản lý key của endpoint | Chứng minh sở hữu identity key trong handshake. |
+| Ephemeral private key | Mỗi phía của lần key exchange | Tính shared secret cho lần trao đổi. |
+| Traffic keys | Hai endpoint của connection | Mã hóa và xác thực TLS records theo từng chiều. |
+
+Một server có thể giữ certificate private key qua nhiều connection. Điều đó không có nghĩa tất cả connection dùng chung một AES key. TLS sinh traffic keys theo connection, giai đoạn và chiều truyền.
+
+## Certificate gắn danh tính với public key
+
+Client đã nhận public key, nhưng vẫn cần biết key đó có thực sự đại diện cho `api.example.com` hay không. **Certificate** là tài liệu có chữ ký liên kết public key với identity cùng các giới hạn sử dụng.
+
+Có thể hình dung certificate như một giấy xác nhận do bên cấp ký. Tuy nhiên, cầm bản sao giấy xác nhận chưa đủ chứng minh bạn là chủ thể: TLS còn yêu cầu chứng minh đang giữ private key. Đó là chỗ phép so sánh với giấy tờ đời thường dừng lại.
+
+### Nội dung của một certificate
+
+Certificate X.509 dùng cho server thường chứa các thông tin sau:
+
+| Trường hoặc extension | Ví dụ và ý nghĩa |
+| --- | --- |
+| Subject | Thông tin chủ thể của certificate. Không dùng Common Name thay SAN để xác thực DNS identity hiện đại. |
+| Subject Alternative Name — SAN | `DNS:api.example.com`, hoặc một địa chỉ kiểu `IP` nếu certificate đại diện cho IP. |
+| Subject Public Key Info | Public key và thuật toán của key. |
+| Issuer | Tên bên phát hành certificate. |
+| Serial number | Số định danh certificate trong phạm vi issuer. |
+| `notBefore`, `notAfter` | Thời điểm bắt đầu và kết thúc hiệu lực. |
+| Basic Constraints | Certificate có được làm CA hay không, cùng giới hạn nếu có. |
+| Key Usage, Extended Key Usage | Mục đích sử dụng, ví dụ `digitalSignature`, `serverAuth`, `clientAuth`. |
+| Signature | Chữ ký của issuer trên phần nội dung certificate. |
+
+**Certificate không chứa private key.** Certificate public có thể được chia sẻ, kiểm tra và gửi cho client. Private key phải được bảo vệ riêng; việc gửi certificate cho mọi client không làm lộ key đó.
+
+### SAN và quy tắc khớp hostname
+
+Nếu URL là `https://api.example.com`, client lấy `api.example.com` làm identity cần kiểm tra. Client không được chấp nhận một tên khác chỉ vì server trình certificate cho tên đó.
+
+Theo RFC 9525, DNS identity được kiểm tra qua SAN kiểu `dNSName`, không fallback sang Common Name. Khi wildcard được hỗ trợ, `*` phải là toàn bộ label ngoài cùng bên trái và chỉ khớp một label:
+
+| SAN | Tên cần kiểm tra | Kết quả |
+| --- | --- | --- |
+| `api.example.com` | `api.example.com` | Khớp. |
+| `*.example.com` | `api.example.com` | Khớp. |
+| `*.example.com` | `example.com` | Không khớp. |
+| `*.example.com` | `a.b.example.com` | Không khớp. |
+| `DNS:api.example.com` | IP `192.0.2.10` | Không khớp chỉ vì DNS resolve về IP đó. |
+
+Nếu thực sự kết nối bằng IP làm identity, certificate cần SAN kiểu `iPAddress` tương ứng. Với service có IP thay đổi, dùng DNS name ổn định thường dễ quản lý hơn đưa từng IP vào certificate.
+
+### Private key, CSR và quá trình cấp certificate
+
+Quá trình cấp phổ biến bắt đầu ở phía chủ endpoint:
+
+1. Tạo key pair, giữ private key ở nơi được phép sử dụng nó.
+2. Tạo **CSR**, Certificate Signing Request, chứa public key và thông tin đề nghị cấp. CSR được ký bằng private key tương ứng.
+3. Gửi CSR cho CA. CA kiểm tra request và thực hiện xác minh theo policy.
+4. CA tạo certificate với SAN, thời hạn và extensions được chấp nhận, rồi ký certificate bằng CA private key.
+5. Endpoint cài certificate, intermediate chain cần thiết và cấu hình sử dụng private key của mình.
+
+Chữ ký CSR chứng minh requester giữ private key tương ứng. Nó **không chứng minh quyền kiểm soát domain**; người khác cũng có thể tự tạo CSR ghi `api.example.com`.
+
+Với public DV certificate — Domain Validation — CA còn xác minh quyền kiểm soát domain, ví dụ qua HTTP hoặc DNS challenge. ACME là giao thức tự động hóa việc xin và gia hạn certificate; HTTP-01 và DNS-01 là hai loại challenge thường gặp. DNS-01 hữu ích khi cần wildcard, nhưng credential sửa DNS phải được giới hạn quyền và bảo vệ kỹ.
+
+OV/EV bổ sung xác minh tổ chức theo policy. Chúng không tự khiến thuật toán mã hóa traffic mạnh hơn DV certificate.
+
+### PEM, DER và PKCS12
+
+Tên file không đủ để biết bên trong chứa gì. `.crt`, `.cer` hay `.pem` có thể được dùng theo quy ước khác nhau giữa các công cụ.
+
+| Format | Đặc điểm | Lưu ý |
+| --- | --- | --- |
+| PEM | Text có nhãn như `BEGIN CERTIFICATE`, phần thân Base64 | Có thể chứa certificate hoặc private key tùy nhãn. Base64 không phải mã hóa bảo mật. |
+| DER | Biểu diễn binary | Cần chỉ rõ format cho công cụ khi không tự nhận diện được. |
+| PKCS12, thường `.p12` hoặc `.pfx` | Container có thể chứa private key, certificate và chain | Coi file là secret nếu nó chứa private key, kể cả khi có password. |
+| JKS | Keystore format trong hệ Java | Kiểm tra entry thực tế; không mặc định file chỉ chứa public certificates. |
+
+`fullchain.pem` thường là leaf certificate rồi đến intermediate certificates. Đây là quy ước nội dung, không phải một thuật toán mã hóa. Tránh đưa private key vào bundle chỉ dùng để phân phối trust.
+
+## CA, certificate chain và trust store
+
+CA là Certificate Authority — bên có quyền cấp certificate trong một hệ thống tin cậy. Chữ ký của CA chỉ hữu ích khi client có căn cứ độc lập để tin CA đó.
+
+### Root, intermediate và leaf
+
+**Leaf** là certificate của endpoint, chẳng hạn `api.example.com`. **Intermediate CA** ký leaf hoặc CA cấp dưới. **Root CA** là điểm neo tin cậy, thường có certificate self-signed và được phân phối qua trust store.
+
+Sơ đồ dưới thể hiện hướng cấp certificate. Mũi tên là quan hệ ký, không phải thứ tự truyền gói tin:
+
+```d2 title="CA cấp certificate và client giữ trust anchor" interactive=false
+direction: down
+root: "Root CA"
+intermediate: "Intermediate CA"
+leaf: "Leaf certificate\napi.example.com"
+store: "Trust store của client\nRoot được cài qua kênh tin cậy"
+root -> intermediate: "Ký certificate CA"
+intermediate -> leaf: "Ký certificate server"
+store -> root: "Tin cậy sẵn" {style.stroke-dash: 3}
+```
+
+Server thường gửi leaf và intermediate certificates cần thiết. Client dựng một **certification path**, tức chuỗi certificate có chữ ký hợp lệ và đáp ứng constraints, tới trust anchor mà nó đã tin.
+
+Root không trở nên đáng tin chỉ vì tự ký, cũng không vì server gửi kèm nó. Attacker cũng có thể tạo một root tự ký. Quyết định tin root phải đến từ trust store được quản lý độc lập với connection đang kiểm tra.
+
+Tách root và intermediate giúp hạn chế dùng root private key trong hoạt động cấp thường ngày. Nếu intermediate bị compromise, việc xử lý có thể giới hạn ở nhánh đó thay vì phải thay toàn bộ root trust ngay lập tức.
+
+### Client kiểm tra nhiều điều độc lập
+
+Một certificate còn hạn vẫn có thể sai hostname. Một certificate đúng hostname vẫn có thể do CA không được trust cấp. Client cần kiểm tra đồng thời nhiều điều:
+
+- Dựng được path tới trust anchor được chấp nhận và kiểm tra chữ ký của từng certificate trên path.
+- Thời gian hiện tại nằm trong khoảng hiệu lực của các certificate liên quan.
+- CA constraints, key usage, extended key usage và thuật toán đáp ứng policy.
+- Identity mong đợi khớp SAN phù hợp trên leaf certificate.
+- Peer chứng minh giữ private key trong handshake; certificate public đơn lẻ không đủ.
+- Các yêu cầu bổ sung của runtime, chẳng hạn revocation và Certificate Transparency, được đáp ứng theo policy của nó.
+
+**Revocation** là thu hồi certificate trước khi hết hạn. CRL là danh sách thu hồi; OCSP là giao thức hỏi trạng thái certificate. Cách kiểm tra, cache và xử lý khi không truy vấn được trạng thái phụ thuộc client. Không nên giả định mọi browser và mọi SDK đều có hành vi giống nhau, hoặc thu hồi sẽ lập tức ngắt mọi connection đang tồn tại.
+
+Browser mở được không chứng minh container hoặc JVM cũng sẽ mở được. Chúng có thể dùng trust store khác nhau; browser còn có thể có intermediate đã cache mà runtime khác thiếu. Hãy kiểm tra từ đúng runtime gặp lỗi.
+
+### Public CA, private CA và self-signed
+
+Public CA phù hợp khi người dùng Internet cần kết nối mà không phải cài trust riêng. Private CA phù hợp với workload, thiết bị hoặc hệ thống nội bộ khi tổ chức kiểm soát việc cấp identity và phân phối trust bundle.
+
+Self-signed không đồng nghĩa với “giả”. Root CA thường self-signed; một certificate tự ký cho lab cũng có thể được tin nếu bạn chủ động cấu hình trust qua kênh an toàn. Điều không an toàn là nhận certificate từ một connection chưa xác thực rồi tự động tin nó để làm mất cảnh báo.
+
+Mặc định, mình chọn public CA cho website công khai. Với service nội bộ cần private PKI — hạ tầng quản lý CA, certificate và trust — chỉ dùng khi có cả quy trình cấp, renew, phân phối trust và thu hồi; không chỉ có một script tạo certificate.
+
+## TLS 1.3 handshake từng bước
+
+**Handshake** là giai đoạn hai endpoint thương lượng tham số, xác thực peer và thiết lập key material. Sơ đồ dưới mô tả full handshake qua TCP, không dùng resumption hoặc client certificate. Nó nhóm các message liên quan để dễ đọc, không biểu diễn ranh giới packet thực tế.
+
+```d2 title="TLS 1.3 full handshake"
+shape: sequence_diagram
+client: "Client"
+server: "Server"
+client -> server: "ClientHello\nVersions, cipher suites, key share, SNI, ALPN"
+server -> server: "Chọn tham số\nTạo ephemeral key và tính shared secret"
+server -> client: "ServerHello\nVersion, cipher suite, server key share"
+client -> client: "Tính shared secret\nDerive handshake traffic keys"
+server -> client: "EncryptedExtensions\nCertificate\nCertificateVerify\nFinished\nĐược mã hóa bằng handshake keys"
+client -> client: "Kiểm tra chain, SAN, chữ ký và Finished"
+client -> server: "Finished\nĐược mã hóa bằng handshake key"
+client <-> server: "HTTP application data\nĐược mã hóa bằng application keys"
+```
+
+Điểm dễ nhầm là vị trí của certificate: trong TLS 1.3, các handshake message sau `ServerHello` đã được mã hóa. Client vẫn chưa nên coi server là đáng tin chỉ vì đã tính được handshake keys; nó còn phải hoàn tất các kiểm tra xác thực.
+
+### ClientHello công bố khả năng của client
+
+Client gửi các TLS versions, cipher suites và nhóm key exchange mà nó hỗ trợ. Trong ví dụ ECDHE, `key_share` là phần public của cặp key tạm thời do client tạo. Client cũng thông báo các signature algorithms mà nó có thể chấp nhận.
+
+Các extension có thể gồm SNI để chọn virtual host và ALPN để thương lượng application protocol. Chúng giúp server chọn đúng cách phục vụ connection; chúng không tự thay certificate validation.
+
+`ClientHello` không chứa một AES session key được mã hóa bằng certificate public key. Nó được gửi trước khi client nhận certificate trong full handshake này.
+
+### ServerHello chốt lựa chọn và key share
+
+Server chọn version, cipher suite và key share phù hợp, rồi gửi `ServerHello`. Với public share của phía kia cùng ephemeral private key của mình, mỗi bên tính được cùng shared secret.
+
+Nếu chưa có key share phù hợp nhưng vẫn có nhóm chung có thể dùng, server có thể gửi `HelloRetryRequest` để yêu cầu client thử lại với nhóm phù hợp. Nếu không có version hoặc thuật toán chung được phép dùng, handshake thất bại; không có bước an toàn nào là “bỏ xác thực để thử tiếp”.
+
+Trong packet capture, một số trường legacy vẫn mang giá trị version cũ để tương thích thiết bị trung gian. Hãy xem version đã thương lượng, không kết luận chỉ từ một trường legacy trong `ClientHello`.
+
+### Key schedule sinh key theo mục đích
+
+Shared secret không được dùng trực tiếp làm một AES key duy nhất cho toàn bộ connection. TLS 1.3 dùng **HKDF**, hàm dẫn xuất key dựa trên HMAC, để sinh các secrets và key phù hợp từng giai đoạn.
+
+Quá trình dẫn xuất còn gắn với **handshake transcript**, tức nội dung các handshake messages theo thứ tự đã trao đổi. Trong tính toán thực tế, TLS dùng hash của transcript. Điều này ràng buộc key và các bằng chứng xác thực với chính lần thương lượng đang diễn ra.
+
+Các kết quả cần phân biệt gồm handshake traffic keys và application traffic keys. Mỗi nhóm có key riêng cho chiều client gửi và chiều server gửi. Những secret phục vụ resumption hoặc exporter cũng có mục đích riêng; application không nên lấy một secret nội bộ của TLS rồi dùng tùy ý.
+
+### Certificate và CertificateVerify xác thực server
+
+Message `Certificate` đưa leaf certificate và chain tới client. Client kiểm tra trust, hostname và policy như phần trước.
+
+Message `CertificateVerify` chứa chữ ký trên dữ liệu được xây dựng từ transcript cùng context quy định của TLS. Server tạo chữ ký bằng private key tương ứng với public key trên certificate. Client kiểm tra chữ ký để biết peer hiện tại có quyền sử dụng private key đó.
+
+Việc copy certificate của server thật vì thế không đủ để giả mạo full handshake mới. Certificate là bằng chứng liên kết identity với public key; chữ ký handshake là bằng chứng sở hữu private key ở connection hiện tại. Cần cả hai.
+
+### Finished xác nhận handshake
+
+`Finished` chứa mã xác thực được tính từ transcript bằng key đã dẫn xuất. Nó xác nhận bên gửi có key material phù hợp và giúp phát hiện transcript không nhất quán.
+
+Client kiểm tra các authentication messages của server trước khi chấp nhận server, rồi gửi `Finished` của mình. Server kiểm tra message đó trước khi coi client đã hoàn tất handshake. Trong flow cơ bản của bài, application data được trao đổi sau các bước này; TLS cũng cho phép server gửi application data sau server Finished theo các điều kiện của giao thức.
+
+Một lần full TLS 1.3 handshake thông thường cần khoảng một network round trip ở TLS layer trước khi client có thể gửi application data không phải early data. DNS, TCP setup, retry và xử lý certificate vẫn có thể cộng thêm thời gian.
+
+## Record layer bảo vệ HTTP sau handshake
+
+Sau handshake, **record layer** chia bytes ứng dụng thành các TLS records và bảo vệ chúng bằng traffic keys đã thiết lập. Application làm việc với HTTP request/response; thư viện TLS xử lý việc đóng gói và bảo vệ records.
+
+### Một request không nhất thiết là một record
+
+Một JSON body lớn có thể nằm trong nhiều TLS records. Ngược lại, bytes từ nhiều lần ghi của application có thể được gom lại. Vì vậy, không nên đọc packet capture theo giả định “một packet bằng một request HTTP”.
+
+Với TLS 1.3 qua TCP, record protection dùng AEAD. Bên nhận kiểm tra authentication tag trước khi chấp nhận plaintext. Nonce được xây dựng theo quy tắc TLS từ IV và sequence number theo chiều truyền; đây là việc của thư viện TLS, không phải trường trong JSON.
+
+TLS có cơ chế `KeyUpdate` để cập nhật application traffic secrets. Đừng hiểu nó là thay certificate hoặc làm lại toàn bộ handshake; identity key và traffic keys có vòng đời khác nhau.
+
+### Forward Secrecy giới hạn thiệt hại khi lộ key
+
+Giả sử attacker lưu packet capture hôm nay, rồi một tháng sau lấy được certificate private key của server. Với ECDHE đúng cách và ephemeral secrets cũ đã được xóa, chỉ certificate private key đó không đủ để giải mã các connection đã ghi lại. Thuộc tính này gọi là **Forward Secrecy**.
+
+Nó không bảo vệ nếu attacker đã lấy được traffic secrets, key log hoặc plaintext ở endpoint. Nó cũng không làm lộ identity key trở nên vô hại: attacker có key còn hợp lệ có thể giả mạo endpoint trong những điều kiện kết nối phù hợp.
+
+Kết luận thực hành: vẫn phải bảo vệ và rotate certificate private key. Forward Secrecy hạn chế một loại thiệt hại, không thay incident response.
+
+## Version, cipher suite, SNI và ALPN
+
+Một connection thành công cần hai bên chọn được tập tham số chung. Bạn nên hiểu từng loại tham số trước khi copy một danh sách cipher từ cấu hình khác.
+
+### TLS 1.2 và TLS 1.3
+
+| Khía cạnh | TLS 1.2 | TLS 1.3 |
+| --- | --- | --- |
+| Full handshake thông thường | Thường 2 RTT ở TLS layer | Thường 1 RTT ở TLS layer |
+| Record protection | Có cả lựa chọn cũ và AEAD, tùy cấu hình | Chỉ AEAD |
+| Static RSA key exchange | Từng được hỗ trợ | Không dùng |
+| Certificate của server trong full handshake | Thường truyền trước khi có record encryption | Được mã hóa sau ServerHello |
+| Tên cipher suite | Có thể gồm key exchange và authentication | Tách khỏi key exchange và signature negotiation |
+
+TLS 1.2 có thể dùng ECDHE cùng AEAD; không phải mọi TLS 1.2 connection đều dùng RSA key exchange hoặc thiếu Forward Secrecy. Ngược lại, giữ version 1.2 nhưng bật tùy tiện mọi thuật toán cũ cũng không phải một policy an toàn.
+
+Mặc định ưu tiên TLS 1.3. Chỉ giữ TLS 1.2 với cấu hình hiện đại khi compatibility thực tế cần; tắt SSL và TLS 1.0/1.1. Khi rollout policy mới, đo tỷ lệ handshake lỗi theo client thay vì chỉ thử trên browser mới nhất.
+
+### Đọc đúng tên cipher suite
+
+Ví dụ `TLS_AES_128_GCM_SHA256` trong TLS 1.3 cho biết dùng AES-128-GCM để bảo vệ records và SHA-256 làm hash trong key schedule. Nó **không** nói server certificate phải dùng RSA hay ECDSA, cũng không chỉ định nhóm ECDHE.
+
+Vì vậy, server certificate dùng RSA vẫn có thể đi cùng ECDHE và AES-GCM trong TLS 1.3. RSA trong trường hợp đó phục vụ signature, không có nghĩa client gửi một encrypted session key theo static RSA key exchange.
+
+### SNI chọn virtual host, ALPN chọn protocol
+
+**SNI**, Server Name Indication, giúp server biết client muốn tới hostname nào trước khi chọn certificate. Một IP có thể phục vụ nhiều domain, nên thiếu SNI có thể khiến server trả certificate mặc định của domain khác.
+
+**Hostname verification** là việc khác: sau khi nhận certificate, client so identity mong đợi với SAN. Gửi SNI đúng không có nghĩa đã xác thực hostname.
+
+**ALPN**, Application-Layer Protocol Negotiation, giúp thương lượng application protocol, ví dụ `h2` hoặc `http/1.1`. Nếu chỉ hỗ trợ HTTP/1.1, một server test không nên quảng bá `h2` rồi trả bytes theo HTTP/1.1. Chọn protocol phải khớp khả năng thật của endpoint.
+
+## Connection reuse, resumption và 0-RTT
+
+Không phải mỗi HTTP request đều cần một TLS handshake mới. Trước khi tối ưu mật mã, hãy xem application có đang mở rồi đóng connection cho từng request hay không.
+
+### Tái sử dụng connection trước khi tối ưu handshake
+
+HTTP keep-alive và connection pooling cho phép dùng lại TCP/TLS connection đã thiết lập. HTTP/2 còn có thể mang nhiều streams trên cùng connection.
+
+Với một backend gọi API liên tục, dùng HTTP client có pool đúng cách thường là bước đầu tiên hợp lý. Resumption không sửa được việc application tạo client mới cho mỗi request và làm mất connection pool.
+
+### Resumption thiết lập một connection mới
+
+Khi connection cũ đã đóng, TLS 1.3 có thể dùng session ticket và secret liên quan để resume. **PSK**, Pre-Shared Key, là secret đã có trước lần handshake mới; trong resumption, nó được dẫn xuất từ connection trước, không phải password người dùng.
+
+Resumption tạo connection mới và traffic keys mới, không tiếp tục sequence number của connection cũ. Nó có thể giảm công việc xác thực bằng certificate. Khi kết hợp PSK với ephemeral key exchange mới, connection mới còn có Forward Secrecy từ phần trao đổi mới đó.
+
+Cần phân biệt reuse và resumption khi đo: reuse không có handshake mới; resumption vẫn có handshake mới nhưng theo flow rút gọn. Quản lý session tickets, thời hạn và ticket keys cũng là một phần của security policy.
+
+### Early data có rủi ro replay
+
+**0-RTT early data** cho phép client dùng thông tin từ session trước để gửi một ít application data ngay cùng giai đoạn mở connection mới. Đổi lại, early data không có cùng bảo đảm chống replay như application data thông thường sau handshake.
+
+Giả sử một request tạo đơn hàng được nhận lại hai lần. Attacker không cần đọc ciphertext nếu có thể phát lại early data theo cách hệ thống chấp nhận. Kết quả có thể là hai hành động nghiệp vụ cho một ý định của người dùng.
+
+Đừng coi mọi `GET` đều replay-safe chỉ vì method tên là GET; một endpoint triển khai sai có thể tạo side effect. Với payment, tạo đơn hoặc thay đổi tài khoản, mặc định không chấp nhận early data. Nếu cần 0-RTT, phải thiết kế cả anti-replay và kiểm soát nghiệp vụ, không chỉ bật một tùy chọn ở proxy.
+
+## TLS termination trong hệ thống nhiều chặng
+
+Giả sử đường đi là browser, reverse proxy rồi application. **TLS termination** là nơi endpoint giải mã TLS và xử lý dữ liệu ở dạng plaintext. Mỗi connection TLS chỉ bảo vệ chặng giữa hai endpoint của nó.
+
+### Terminate tại reverse proxy
+
+Sơ đồ dưới chỉ rõ chặng nào được bảo vệ và nơi plaintext có thể xuất hiện:
+
+```d2 title="TLS kết thúc ở reverse proxy, không tự kéo dài tới application" interactive=false
+direction: down
+browser: "Browser"
+proxy: "Reverse proxy\nGiải mã TLS và xử lý HTTP"
+app: "Application\nNhận HTTP plaintext"
+logs: "Log và trace\nCần redact dữ liệu nhạy cảm"
+browser -> proxy: "HTTPS — TLS hop 1"
+proxy -> app: "HTTP trong mạng backend"
+proxy -> logs: "Dữ liệu sau giải mã"
+app -> logs: "Dữ liệu ứng dụng"
+```
+
+Đặt certificate ở proxy giúp tập trung renewal và HTTP routing. Tuy nhiên, HTTP trên chặng proxy–application không tự được bảo vệ chỉ vì chặng browser–proxy là HTTPS.
+
+Chọn HTTP nội bộ phải là quyết định có threat model rõ ràng: ai quan sát được mạng backend, workload nào truy cập được nó và policy yêu cầu gì. “Cùng private network” không đồng nghĩa mọi workload trong mạng đều đáng tin.
+
+### Re-encryption tạo hai secure channel
+
+Proxy có thể gọi application bằng HTTPS. Khi đó có hai TLS connections riêng: browser–proxy và proxy–application. Proxy vẫn đọc được plaintext ở giữa; đây không phải một TLS connection xuyên suốt.
+
+Đối với chặng backend, cần xác định proxy có kiểm tra CA và hostname của application hay không. Một số sản phẩm có policy validation khác HTTPS client thông thường; không suy ra hành vi chỉ từ nhãn “HTTPS target”. Nếu proxy không xác thực backend identity theo yêu cầu, encryption một mình chưa giải quyết được giả mạo backend.
+
+Nếu proxy chuyển user hoặc client identity qua HTTP headers, application chỉ nên tin các headers do proxy tin cậy tạo ra. Proxy phải loại giá trị giả mạo từ request đầu vào, và backend không được mở đường gọi vòng qua proxy.
+
+### Passthrough giữ TLS đến application
+
+Với TLS passthrough, thành phần trung gian chuyển tiếp traffic mà không terminate connection đó. Application hoặc ingress phía sau giữ certificate private key và thực hiện TLS.
+
+Đổi lại, thành phần trung gian không đọc được HTTP path và body của connection để thực hiện các tính năng layer 7 thông thường. Mình chọn passthrough khi cần TLS kết thúc ở workload cụ thể; chọn termination ở proxy khi cần HTTP routing/WAF và chấp nhận proxy là một endpoint được tin cậy. Hai lựa chọn có trust boundary khác nhau, không phải một cái luôn an toàn hơn trong mọi thiết kế.
+
+## mTLS xác thực cả client lẫn server
+
+Trong HTTPS thường, client xác thực server còn server có thể chưa biết client là workload nào. **mTLS**, mutual TLS, thêm xác thực client bằng certificate.
+
+Ví dụ service `orders` gọi `payments`. `payments` có thể chỉ chấp nhận connection từ workload được private CA cấp identity phù hợp. Người gọi còn phải chứng minh giữ private key tương ứng, không chỉ gửi một chuỗi tên service.
+
+### Phần bổ sung trong handshake
+
+Trong full TLS 1.3 handshake dùng client authentication, server gửi `CertificateRequest`. Client đáp lại bằng certificate chain và `CertificateVerify`, rồi gửi `Finished`. Server kiểm tra chain, certificate purpose và bằng chứng sở hữu private key của client theo policy.
+
+Nếu bắt buộc client certificate mà client không cung cấp hoặc certificate không được chấp nhận, server không được coi connection là đã xác thực. Việc chỉ bật “yêu cầu nếu có” khác với “bắt buộc”; cần kiểm tra đúng mode trong cấu hình.
+
+### Authentication không thay authorization
+
+Một certificate hợp lệ có thể chứng minh “đây là workload orders do CA nội bộ cấp”. Nó chưa chứng minh workload đó được hoàn tiền cho mọi khách hàng.
+
+Application vẫn phải map certificate identity thành principal — chủ thể dùng để kiểm tra quyền — rồi áp dụng authorization theo action và resource. Không lấy tùy tiện mọi giá trị Subject CN làm quyền admin. Identity nên có format, issuer policy và cách kiểm tra được định nghĩa rõ, ví dụ SAN URI theo hệ thống workload identity của tổ chức.
+
+mTLS và OAuth/token có thể cùng tồn tại: mTLS xác thực workload ở transport, token biểu diễn user hoặc delegated scope. Nếu fleet không có automation cấp/renew certificate, đưa mTLS vào quá sớm có thể tạo hàng loạt outage khi credential hết hạn. Hãy xây vòng đời identity cùng lúc với việc bật giao thức.
+
+### Keystore và truststore trong Java
+
+Java thường dùng hai khái niệm dễ nhầm:
+
+| Khái niệm | Nội dung điển hình | Câu hỏi nó giải quyết |
+| --- | --- | --- |
+| Keystore cho identity | Private key và certificate chain của mình | Mình trình identity nào cho peer? |
+| Truststore | Trust anchors mà mình chấp nhận | Mình tin certificate do ai cấp? |
+
+Đây là vai trò cấu hình, không phải kết luận chỉ dựa vào đuôi file. Một keystore format có thể chứa nhiều loại entry; cần kiểm tra entry thực tế và cách runtime sử dụng nó.
+
+Server HTTPS cần identity key và chain. Java client dùng HTTPS thông thường cần trust phù hợp; client dùng mTLS còn cần identity của chính nó. Import server leaf vào một truststore để hết lỗi có thể vô tình tạo pinning mong manh; ưu tiên sửa đúng chain và phân phối đúng CA theo policy.
+
+Khi chẩn đoán JVM, xác định process dùng default truststore hay custom truststore. Nếu cần debug JSSE, bật `-Djavax.net.debug=ssl,handshake,trustmanager` có kiểm soát trong môi trường phù hợp. Log có thể nhiều và chứa certificate/identity nội bộ; thu thập tối thiểu, không bật tràn lan trên production.
+
+## Lab HTTPS trên localhost bằng OpenSSL
+
+Lab này giúp tách ba kết quả: kết nối được tới port, tin CA và khớp hostname. Bạn cần OpenSSL 3.x, curl có hỗ trợ HTTPS và hai terminal Bash trên máy cá nhân. Port `8443` phải đang trống.
+
+Tất cả server trong lab chỉ bind vào `127.0.0.1`. Không cần cài CA vào trust store của hệ điều hành; mỗi lệnh client sẽ nhận CA bằng tham số riêng.
+
+### Chuẩn bị thư mục riêng
+
+Chạy ở terminal thứ nhất:
+
+```bash
+umask 077
+LAB_DIR=$(mktemp -d "${TMPDIR:-/tmp}/tls-lab.XXXXXX")
+cd "$LAB_DIR"
+printf 'Thư mục lab: %s\n' "$LAB_DIR"
+openssl version
+curl --version
+```
+
+Ghi lại đường dẫn được in ra. Ở terminal thứ hai, `cd` tới cùng đường dẫn đó. Các file được tạo dưới đây đều nằm trong thư mục tạm này.
+
+<Callout type="warn" title="Private key của lab">
+Lab tạo private key không có passphrase để tránh phải cấu hình thêm cơ chế nhập secret cho server test. Đây là lựa chọn cho lab cô lập, không phải khuyến nghị lưu key production. Không commit, upload hoặc tái sử dụng các key này; CA của lab cũng không được cài vào máy người khác.
+</Callout>
+
+### Tạo CA dành riêng cho lab
+
+Tạo EC private key cho CA, rồi tạo root certificate có thời hạn bảy ngày:
+
+```bash
+openssl genpkey -algorithm EC \
+  -pkeyopt ec_paramgen_curve:P-256 \
+  -out root-ca.key
+
+openssl req -new -x509 -sha256 -days 7 \
+  -key root-ca.key \
+  -subj "/CN=TLS Lab Root CA" \
+  -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  -out root-ca.crt
+```
+
+`CA:TRUE` cho phép certificate đóng vai trò CA. `pathlen:0` không cho phép có intermediate CA không tự cấp bên dưới CA này; lab vì vậy cấp leaf trực tiếp từ root để giữ số bước nhỏ. Production thường tách root khỏi intermediate cấp certificate thường ngày.
+
+`root-ca.crt` là public certificate sẽ đưa cho verifier. `root-ca.key` là secret có quyền ký identity trong lab; không đưa file key cho client để “thêm trust”.
+
+### Cấp certificate cho localhost
+
+Server dùng một RSA key riêng. Việc CA dùng EC còn leaf dùng RSA là hợp lệ: thuật toán ký certificate và thuật toán của public key trong leaf không phải cùng một thứ.
+
+```bash
+openssl genpkey -algorithm RSA \
+  -pkeyopt rsa_keygen_bits:2048 \
+  -out server.key
+
+openssl req -new -key server.key \
+  -subj "/CN=localhost" \
+  -out server.csr
+
+cat > server.ext <<'EXT'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:localhost,IP:127.0.0.1
+EXT
+
+openssl x509 -req -in server.csr \
+  -CA root-ca.crt -CAkey root-ca.key -CAcreateserial \
+  -days 2 -sha256 -extfile server.ext \
+  -out server.crt
+```
+
+SAN chứa cả DNS `localhost` lẫn IP `127.0.0.1`, nên lab có thể kiểm tra hai kiểu identity. `serverAuth` nêu mục đích server; `CA:FALSE` không cho leaf trở thành CA. Các extensions được CA đưa vào certificate khi ký, không được quyết định chỉ bởi tên Subject của CSR.
+
+Certificate này dùng được cho bài test TLS 1.3 dù có RSA public key. RSA phục vụ chứng minh identity; việc thiết lập shared secret trong handshake không trở lại thành static RSA key exchange.
+
+### Kiểm tra certificate trước khi chạy server
+
+Xem nội dung, rồi xác thực chain, purpose và hostname:
+
+```bash
+openssl x509 -in server.crt -noout \
+  -subject -issuer -dates -ext subjectAltName
+
+openssl verify -CAfile root-ca.crt \
+  -purpose sslserver -verify_hostname localhost \
+  server.crt
+```
+
+Lệnh verify thành công sẽ báo `server.crt: OK`. Nó kiểm tra certificate từ file; chưa chứng minh process đang phục vụ certificate đó và chưa kiểm tra server có private key phù hợp.
+
+Để đối chiếu public key của certificate với private key, tính fingerprint trên cùng biểu diễn DER:
+
+```bash
+openssl x509 -in server.crt -pubkey -noout \
+  | openssl pkey -pubin -outform DER \
+  | openssl dgst -sha256
+
+openssl pkey -in server.key -pubout -outform DER \
+  | openssl dgst -sha256
+```
+
+Hai digest phải giống nhau. Cách này dùng được cho nhiều loại key, không chỉ RSA; nó không thay các bước kiểm tra trust và hostname.
+
+### Chạy HTTPS và gọi bằng curl
+
+Ở terminal thứ nhất, chạy server test và để process hoạt động:
+
+```bash
+openssl s_server -accept 127.0.0.1:8443 \
+  -cert server.crt -key server.key \
+  -tls1_3 -www
+```
+
+`-www` trả một trang chẩn đoán đơn giản. Đây không phải web server production.
+
+Ở terminal thứ hai, trong cùng thư mục lab:
+
+```bash
+curl --noproxy '*' --fail --show-error \
+  --cacert root-ca.crt \
+  https://localhost:8443/
+```
+
+curl kiểm tra certificate bằng CA bạn chỉ định và kiểm tra identity `localhost` từ URL. Khi thành công, nó nhận trang chẩn đoán của OpenSSL. `--noproxy '*'` đảm bảo lab local không vô tình đi qua proxy được cấu hình trong môi trường.
+
+Muốn chỉ kiểm tra TLS handshake với thông tin rõ ràng hơn:
+
+```bash
+openssl s_client -connect 127.0.0.1:8443 \
+  -servername localhost \
+  -CAfile root-ca.crt \
+  -verify_hostname localhost \
+  -verify_return_error \
+  -tls1_3 -brief </dev/null
+```
+
+Output thành công cần thể hiện TLS 1.3 và verification OK. Cipher cụ thể phụ thuộc thư viện và cấu hình; đừng hard-code một tên cipher làm tiêu chí duy nhất. Lệnh `s_client` trên không gửi HTTP request, nên không nhận trang giống curl.
+
+### Quan sát lỗi trust và hostname
+
+Đầu tiên bỏ CA của lab khỏi lệnh curl:
+
+```bash
+curl --noproxy '*' --fail --show-error \
+  https://localhost:8443/
+```
+
+Trên máy chưa trust CA này, kết nối phải bị từ chối ở bước certificate verification. Port đang mở và server hỗ trợ TLS vẫn không đủ để client chấp nhận identity.
+
+Tiếp theo giữ CA đúng nhưng cố ý dùng hostname sai. `--resolve` chỉ định địa chỉ kết nối mà vẫn giữ hostname trong URL để kiểm tra:
+
+```bash
+curl --noproxy '*' --fail --show-error \
+  --cacert root-ca.crt \
+  --resolve wrong.example:8443:127.0.0.1 \
+  https://wrong.example:8443/
+```
+
+Lần này chain có CA đúng, nhưng `wrong.example` không nằm trong SAN nên phải thất bại vì hostname. Hai thử nghiệm phân biệt được lỗi trust với lỗi identity; nội dung thông báo chi tiết có thể khác giữa các TLS backends của curl.
+
+<Callout type="warn" title="Không sửa bằng cách tắt verification">
+Không thêm `-k`, `--insecure`, TrustAll hoặc tắt hostname verification để biến bài test lỗi thành bài test thành công. Những lựa chọn đó bỏ đi bảo đảm bạn đang kết nối đúng peer — chính là điều lab đang kiểm tra.
+</Callout>
+
+## Mở rộng lab sang mTLS
+
+Đến đây client đã xác thực server. Ta giữ nguyên CA của lab và cấp thêm một identity riêng cho client để thấy server từ chối caller thiếu certificate.
+
+### Cấp client certificate
+
+Ở terminal thứ hai, trong thư mục lab:
+
+```bash
+openssl genpkey -algorithm EC \
+  -pkeyopt ec_paramgen_curve:P-256 \
+  -out client.key
+
+openssl req -new -key client.key \
+  -subj "/CN=demo-client" \
+  -out client.csr
+
+cat > client.ext <<'EXT'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=clientAuth
+subjectAltName=URI:urn:tls-lab:client:demo
+EXT
+
+openssl x509 -req -in client.csr \
+  -CA root-ca.crt -CAkey root-ca.key -CAserial root-ca.srl \
+  -days 2 -sha256 -extfile client.ext \
+  -out client.crt
+
+openssl verify -CAfile root-ca.crt \
+  -purpose sslclient client.crt
+```
+
+`clientAuth` chỉ ra mục đích client authentication. SAN URI là identity minh họa do lab định nghĩa; OpenSSL test server không tự map URI này thành quyền gọi API.
+
+Trong hệ thống thật, client thường tạo và giữ private key của nó, còn CA ký request theo quy trình cấp quyền. Việc lab tạo mọi file trong một thư mục không có nghĩa CA cần giữ private key của mọi client.
+
+### Yêu cầu client trình certificate
+
+Dừng server HTTPS ở terminal thứ nhất bằng `Ctrl+C`, rồi chạy:
+
+```bash
+openssl s_server -accept 127.0.0.1:8443 \
+  -cert server.crt -key server.key \
+  -CAfile root-ca.crt \
+  -Verify 1 -verify_return_error \
+  -tls1_3 -www
+```
+
+`-Verify` viết hoa yêu cầu client cung cấp certificate; `-verify_return_error` làm verification error trở thành lỗi thay vì tiếp tục để phục vụ chẩn đoán. Độ sâu `1` phù hợp chain lab đơn giản, không phải giá trị áp cho mọi private PKI.
+
+Ở server, `-cert` và `-key` xác định **identity của server**. `-CAfile` xác định **CA mà server tin khi kiểm tra client**. Cùng một CA đang được dùng cho cả hai phía chỉ để lab ngắn; production có thể tách CA hoặc trust policy theo vai trò.
+
+### Đối chiếu kết nối có và không có client identity
+
+Gọi lại khi chưa có client certificate:
+
+```bash
+curl --noproxy '*' --fail --show-error \
+  --cacert root-ca.crt \
+  https://localhost:8443/
+```
+
+Server mTLS phải từ chối caller này; tùy TLS backend, lỗi có thể hiện khi gửi hoặc nhận dữ liệu sau các message đầu của handshake. Không lấy việc nhìn thấy server certificate làm kết luận rằng toàn bộ handshake đã thành công.
+
+Sau đó cung cấp identity riêng của client:
+
+```bash
+curl --noproxy '*' --fail --show-error \
+  --cacert root-ca.crt \
+  --cert client.crt --key client.key \
+  https://localhost:8443/
+```
+
+Lần này cả hai phía có cơ sở kiểm tra peer và request nhận được trang chẩn đoán. Ba tham số có vai trò khác nhau: `--cacert` là trust để xác thực server; `--cert` và `--key` là identity client trình cho server.
+
+Kết thúc lab, dừng server bằng `Ctrl+C`. Thư mục chỉ chứa dữ liệu lab có thể được xóa sau khi bạn kiểm tra lại đúng đường dẫn; không lưu các private key vào repository. Không có CA nào cần gỡ khỏi OS trust store vì bài không yêu cầu cài trust toàn hệ thống.
+
+## Triển khai và quản lý vòng đời certificate
+
+Tạo được certificate mới chỉ là một bước. Một cấu hình HTTPS vận hành được còn cần đúng chain, quyền đọc key, reload an toàn và quan sát certificate thực sự được phục vụ.
+
+### Cấu hình HTTPS ở reverse proxy
+
+Ví dụ sau là phần server block cho Nginx terminate TLS và chuyển HTTP tới application trên cùng máy. Nó giả định DNS, certificate production, file permissions và cấu hình Nginx nền đã được chuẩn bị; đây không phải cấu hình đem chạy nguyên xi từ lab:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name api.example.com;
+
+    ssl_certificate     /etc/nginx/tls/fullchain.pem;
+    ssl_certificate_key /etc/nginx/tls/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location / {
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass http://127.0.0.1:8080;
+    }
+}
+```
+
+`fullchain.pem` phải chứa leaf trước, rồi intermediate chain cần thiết. `privkey.pem` phải khớp leaf certificate và chỉ được đọc bởi chủ thể cần thiết. Chặng từ Nginx tới application ở đây vẫn là HTTP; nếu backend nằm trên máy khác, phải đánh giá lại trust boundary thay vì chỉ đổi địa chỉ.
+
+Đoạn cấu hình giữ TLS 1.2 cho compatibility. Nó không mô tả đầy đủ cipher policy, rate limit hay HTTP hardening; chọn policy theo phiên bản Nginx/OpenSSL thực tế và kiểm tra client population. Trước reload, chạy config test của Nginx; sau reload, kiểm tra bằng connection mới từ bên ngoài.
+
+### Renewal phải đi đến certificate đang được phục vụ
+
+Một job ACME báo cấp certificate thành công nhưng proxy chưa reload vẫn có thể tiếp tục trình certificate cũ. Hãy phân biệt **issued**, **deployed** và **served**:
+
+1. CA cấp certificate mới với thời hạn và SAN đúng.
+2. Hệ thống phân phối certificate, chain và key phù hợp tới đúng endpoint.
+3. Endpoint reload hoặc thay listener an toàn.
+4. Probe bên ngoài mở connection mới, kiểm tra serial/fingerprint, SAN và expiry thực sự nhận được.
+5. Quan sát tất cả replicas, IP families và vùng triển khai liên quan; một node còn certificate cũ vẫn có thể gây lỗi ngắt quãng.
+
+Theo dõi cả renewal failures và thời gian còn lại của certificate đang serve. Ngưỡng cảnh báo phải cho đủ thời gian xử lý theo vòng đời thực tế; không đợi sát hết hạn mới báo. Kiểm tra riêng client certificates và private intermediate CA, không chỉ certificate public trên cổng 443.
+
+### Rotate CA theo thứ tự trust trước, identity sau
+
+Khi chuyển private CA từ A sang B, client chỉ tin A sẽ từ chối leaf do B cấp. Cần triển khai overlap có kiểm soát:
+
+1. Phân phối trust bundle chứa cả A và B tới mọi verifier cần thiết.
+2. Xác nhận các verifier đã nạp trust mới, gồm cả process lâu sống.
+3. Phát hành và triển khai leaf certificates từ B, kiểm tra connection mới ở cả hai chiều nếu dùng mTLS.
+4. Giữ khoảng thời gian rollback phù hợp và kiểm kê credential cũ còn dùng.
+5. Chỉ gỡ A khi không còn dependency hợp lệ cần nó và policy cho phép.
+
+Đổi identity trước khi đổi trust dễ gây outage giữa rollout. Ngược lại, giữ CA cũ vô thời hạn làm trust rộng hơn cần thiết. Với CA bị compromise, overlap thông thường có thể không chấp nhận được; phải chọn kế hoạch khẩn cấp theo mức rủi ro.
+
+### Xử lý private key bị lộ
+
+Nếu certificate private key bị lộ, thay certificate nhưng vẫn dùng key cũ là chưa đủ. Cần tạo key mới, cấp/deploy certificate mới, thu hồi certificate cũ khi cơ chế hỗ trợ và loại key khỏi mọi nơi đã phân phối.
+
+Đồng thời điều tra nguồn lộ: repository, backup, image, secret store permissions hay endpoint compromise. Nếu process còn bị attacker kiểm soát, key mới cũng có thể tiếp tục bị lấy.
+
+Thu hồi certificate không bảo đảm mọi client biết ngay và không tự đóng mọi connection hiện có. Kiểm tra cả session/ticket policy và nhu cầu buộc tạo lại connections khi xử lý sự cố. Đừng công khai private key hoặc TLS key log để “nhờ debug”; key log có thể cho phép giải mã traffic tương ứng.
+
+## Chẩn đoán lỗi TLS theo từng lớp
+
+Một request lỗi chưa chắc là lỗi certificate. Hãy đi từ network tới TLS rồi HTTP, vì mỗi lớp cần bằng chứng và cách sửa khác nhau.
+
+### Xác định đúng endpoint và runtime
+
+Trước khi đổi cấu hình, ghi lại hostname, port, thời điểm, client/runtime version và đường đi thật. Xác định DNS đang trả IP nào, có proxy/CDN hay không, TLS terminate ở đâu và lỗi nằm ở hop nào.
+
+Nếu browser hoạt động còn Java service lỗi, thử từ cùng container, network và truststore của Java service. Chạy curl ở laptop chỉ chứng minh đường đi từ laptop; nó không phủ nhận lỗi trên runtime khác.
+
+Không gửi token, cookie, private key hoặc body chứa dữ liệu người dùng khi thu thập bằng chứng. Certificate public không phải secret, nhưng có thể chứa hostname và identity nội bộ cần hạn chế chia sẻ.
+
+### Kiểm tra bằng OpenSSL và curl
+
+Dưới đây là mẫu cho endpoint minh họa `api.example.com`; thay bằng endpoint bạn có quyền kiểm tra. `ca-bundle.pem` phải là bundle do tổ chức phân phối qua kênh tin cậy, không phải certificate vừa lấy từ một server chưa xác thực:
+
+```bash
+openssl s_client -connect api.example.com:443 \
+  -servername api.example.com \
+  -CAfile ca-bundle.pem \
+  -verify_hostname api.example.com \
+  -verify_return_error \
+  -showcerts </dev/null
+```
+
+| Option | Điều nó kiểm soát |
+| --- | --- |
+| `-connect` | Địa chỉ network và port để mở connection. |
+| `-servername` | SNI để server chọn virtual host/certificate. |
+| `-CAfile` | CA certificates dùng cho việc kiểm tra trust. |
+| `-verify_hostname` | Identity DNS cần khớp với certificate. |
+| `-verify_return_error` | Dừng khi certificate verification lỗi, thay vì chỉ in cảnh báo rồi tiếp tục. |
+| `-showcerts` | In danh sách certificates server thực sự gửi; đây không tự động là một verified chain. |
+
+Đọc cả kết quả verification và exit status. Công cụ chẩn đoán như `s_client` có thể tiếp tục sau verification errors nếu không được cấu hình fail; nhìn thấy một cipher suite được chọn chưa chứng minh server authentication thành công.
+
+Muốn kiểm tra một IP cụ thể nhưng vẫn giữ hostname/SNI đúng, dùng curl với `--resolve`:
+
+```bash
+curl --verbose --connect-timeout 5 --max-time 15 \
+  --cacert ca-bundle.pem \
+  --resolve api.example.com:443:192.0.2.10 \
+  https://api.example.com/health
+```
+
+`192.0.2.10` là IP tài liệu, không phải endpoint chạy thật. Nếu môi trường dùng proxy, xác định rõ proxy có tham gia request này hay không; thử nghiệm đường đi trực tiếp và đường đi qua proxy trả lời hai câu khác nhau.
+
+Không thay URL bằng IP rồi chỉ thêm `Host` header để kiểm tra HTTPS virtual host. TLS handshake diễn ra trước HTTP header; cách đó có thể làm SNI hoặc reference identity sai.
+
+### Phân loại triệu chứng và cách sửa
+
+| Triệu chứng | Tầng cần kiểm tra | Hướng xử lý |
+| --- | --- | --- |
+| DNS không resolve | DNS, search domain, resolver | Sửa resolution và xác nhận đúng record; chưa có TLS handshake. |
+| Timeout hoặc connection refused | Routing, firewall, listener | Kiểm tra port và đường mạng trước certificate. |
+| `wrong version number` | Protocol trên port | Có thể đang gửi TLS tới listener HTTP hoặc sai proxy mode; kiểm tra listener thật. |
+| Không có protocol/cipher chung | TLS policy và client capabilities | Kiểm tra version, groups, signature và cipher; không bật lại SSL cũ tùy tiện. |
+| `unable to get local issuer certificate`, `PKIX path building failed` | Chain hoặc truststore | Kiểm tra intermediate server gửi và trust anchors runtime đang dùng. |
+| Hostname mismatch | URL/SNI/SAN | Gọi đúng identity hoặc cấp SAN đúng; không tắt hostname verification. |
+| Certificate expired hoặc chưa có hiệu lực | Served certificate, clock | Kiểm tra cả thời hạn, node đang serve và đồng hồ hệ thống. |
+| Client certificate required, `unknown_ca`, `bad_certificate` | mTLS ở phía verifier | Kiểm tra đúng chiều trust, client chain, purpose và certificate/key. |
+| HTTP 401/403 sau TLS thành công | Application authentication/authorization | Kiểm tra token, principal, policy hoặc gateway; không mặc định là lỗi mã hóa TLS. |
+
+Các thông báo trên là dấu hiệu, không phải chẩn đoán duy nhất. Ví dụ `unknown_ca` cần đọc cùng phía phát alert để biết server không tin client hay client không tin server.
+
+Sau khi sửa, kiểm tra lại bằng client ban đầu và connection mới. Đối chiếu mọi endpoint liên quan, giữ verification bật và theo dõi lỗi sau rollout; một lần curl thành công không chứng minh mọi replica đã được cập nhật.
+
+## Checklist đưa HTTPS vào vận hành
+
+- [ ] Đã vẽ rõ TLS endpoints và những chặng còn plaintext; chọn termination, re-encryption hoặc passthrough có lý do.
+- [ ] TLS 1.3 được ưu tiên; TLS 1.2 chỉ giữ theo compatibility policy; SSL và TLS 1.0/1.1 đã tắt.
+- [ ] Certificate có SAN đúng, purpose đúng, chain đầy đủ và private key khớp; client kiểm tra trust lẫn identity.
+- [ ] Private keys có quyền truy cập tối thiểu, không nằm trong Git, image công khai hoặc log; dùng managed key/HSM khi yêu cầu phù hợp.
+- [ ] Renewal bao gồm issuance, deployment, reload và probe certificate đang serve; đã thử failure/recovery thay vì chỉ chờ cron.
+- [ ] Nếu có mTLS, identity được map vào authorization rõ ràng; client certificate lifecycle được theo dõi riêng.
+- [ ] Trust bundle và CA rotation có inventory, overlap/rollback và tiêu chí gỡ trust cũ.
+- [ ] Log/trace redact token, cookie và dữ liệu nhạy cảm; không bật TLS key logging trong vận hành thông thường.
+- [ ] 0-RTT không được bật cho nghiệp vụ không replay-safe; connection pooling được kiểm tra trước khi tối ưu handshake.
+- [ ] HTTP redirect, cookie `Secure`, HSTS và mixed content được đánh giá riêng: chúng bổ sung cho HTTPS, không thay certificate validation.
+
+HSTS yêu cầu browser dùng HTTPS cho host theo policy đã học hoặc preload. Nếu bật `includeSubDomains`, mọi subdomain thuộc phạm vi phải sẵn sàng HTTPS; không bật theo quán tính. Redirect HTTP sang HTTPS không bảo vệ lần truy cập HTTP đầu tiên khỏi một attacker trên đường truyền nếu client chưa có HSTS phù hợp.
+
+Bước triển khai tiếp theo nên là kiểm tra một đường đi thật của ứng dụng: ghi rõ hostname, từng TLS hop, truststore của verifier và người chịu trách nhiệm renewal. Nếu chưa xác định được một trong bốn thứ đó, hãy hoàn thiện nó trước khi coi HTTPS đã vận hành xong.
+
+## Tài liệu chuẩn và bài liên quan
+
+Các nguồn dưới đây giúp kiểm tra chi tiết giao thức và option thực tế. Policy browser, thời hạn certificate và API của từng sản phẩm có thể thay đổi; khi triển khai cần đối chiếu version đang dùng.
+
+- [RFC 9846 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc9846): bản cập nhật tương thích ngược của TLS 1.3, thay RFC 8446; xem Protocol Overview, Authentication Messages, Key Schedule và 0-RTT.
+- [RFC 9525 — Service Identity in TLS](https://www.rfc-editor.org/rfc/rfc9525): reference identity, SAN và quy tắc wildcard.
+- [RFC 5280 — X.509 PKI](https://www.rfc-editor.org/rfc/rfc5280): certificate extensions và certification path validation.
+- [RFC 8555 — ACME](https://www.rfc-editor.org/rfc/rfc8555): tự động cấp certificate và domain validation challenges.
+- [OpenSSL s_client](https://docs.openssl.org/3.0/man1/openssl-s_client/) và [verification options](https://docs.openssl.org/3.0/man1/openssl-verification-options/): phân biệt connection, SNI, trust và identity verification.
+- [OpenSSL req](https://docs.openssl.org/3.0/man1/openssl-req/) và [s_server](https://docs.openssl.org/3.0/man1/openssl-s_server/): đối chiếu lệnh tạo request/certificate và server test trong lab.
+- [Nginx HTTPS configuration](https://nginx.org/en/docs/http/configuring_https_servers.html): certificate chains và cấu hình HTTPS tại reverse proxy.
+- [Spring Boot SSL](https://docs.spring.io/spring-boot/reference/features/ssl.html): cấu hình identity/trust bundles trong ứng dụng Spring Boot.
+
+<Cards>
+  <Card title="Encoding, Encryption và Hashing" href="/security/01-encoding-vs-encryption/" description="Phân biệt biểu diễn dữ liệu, mã hóa, hash và HMAC trước khi áp dụng vào thiết kế." />
+  <Card title="Xử lý sự cố production" href="/behavioral/01-production-server-down/" description="Đặt lỗi TLS vào quy trình chẩn đoán đường đi request và phục hồi dịch vụ." />
+</Cards>

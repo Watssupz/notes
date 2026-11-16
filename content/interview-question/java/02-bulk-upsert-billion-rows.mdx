@@ -1,0 +1,306 @@
+---
+title: "Bulk upsert: đưa một triệu bản ghi vào bảng lớn an toàn"
+description: "Thiết kế PostgreSQL staging, validation, deduplication, batch merge và checkpoint; xử lý concurrent writes, index, retry và recovery từ Java."
+---
+
+Giả sử bạn nhận một file CSV gồm một triệu đơn hàng cần đồng bộ vào bảng đang có một tỷ rows. Một số đơn đã tồn tại, số còn lại cần được thêm mới. Trong lúc đó, người dùng vẫn cập nhật đơn từ API bình thường.
+
+Khó khăn không chỉ là viết `INSERT ... ON CONFLICT`. Pipeline phải phân biệt file lỗi với conflict nghiệp vụ, biết batch nào đã commit và không để dữ liệu cũ trong file ghi đè thay đổi mới từ API. Bài này dùng PostgreSQL và giải thích phần điều phối từ Java; schema minh họa dành cho database lab riêng, không phải migration để chạy thẳng vào production.
+
+## Mục lục
+
+- [Chốt hợp đồng dữ liệu trước khi tối ưu tốc độ](#chốt-hợp-đồng-dữ-liệu-trước-khi-tối-ưu-tốc-độ)
+  - [Business key và nguồn quyết định phiên bản](#business-key-và-nguồn-quyết-định-phiên-bản)
+  - [Commit từng batch khác all-or-nothing](#commit-từng-batch-khác-all-or-nothing)
+- [Tách file parsing khỏi business write](#tách-file-parsing-khỏi-business-write)
+- [Load vào staging bằng COPY](#load-vào-staging-bằng-copy)
+  - [Chọn raw staging và typed staging theo cách báo lỗi](#chọn-raw-staging-và-typed-staging-theo-cách-báo-lỗi)
+  - [COPY giảm round trip chứ không bỏ qua mọi kiểm tra](#copy-giảm-round-trip-chứ-không-bỏ-qua-mọi-kiểm-tra)
+- [Validate và deduplicate trước merge](#validate-và-deduplicate-trước-merge)
+- [Merge theo keyset và commit checkpoint cùng dữ liệu](#merge-theo-keyset-và-commit-checkpoint-cùng-dữ-liệu)
+  - [Không dùng OFFSET cho các batch sau](#không-dùng-offset-cho-các-batch-sau)
+  - [Cursor đi theo row đã xét, không đi theo affected rows](#cursor-đi-theo-row-đã-xét-không-đi-theo-affected-rows)
+  - [Retry sau crash không đồng nghĩa chạy mọi side effect lần nữa](#retry-sau-crash-không-đồng-nghĩa-chạy-mọi-side-effect-lần-nữa)
+- [Điều phối transaction từ Java và Spring](#điều-phối-transaction-từ-java-và-spring)
+- [Concurrent writes và deadlock](#concurrent-writes-và-deadlock)
+- [Index, WAL và partition swap](#index-wal-và-partition-swap)
+  - [Giữ unique index cần cho conflict detection](#giữ-unique-index-cần-cho-conflict-detection)
+  - [Partition swap là một quy trình riêng](#partition-swap-là-một-quy-trình-riêng)
+- [Quan sát, throttle và nghiệm thu](#quan-sát-throttle-và-nghiệm-thu)
+- [Tài liệu tham khảo và bài liên quan](#tài-liệu-tham-khảo-và-bài-liên-quan)
+
+## Chốt hợp đồng dữ liệu trước khi tối ưu tốc độ
+
+### Business key và nguồn quyết định phiên bản
+
+**Business key** là khóa nhận diện cùng một đối tượng qua nhiều lần nhập. Với hệ thống multi-tenant, chỉ `order_id` có thể chưa đủ; khóa thường phải gồm cả tenant. Một constraint tương ứng ở database là hàng rào chống duplicate cuối cùng.
+
+Ví dụ dưới đây giả định `(tenant_id, order_id)` là business key. `source_version` là version tăng đơn điệu do cùng nguồn dữ liệu quản lý. Version 12 mới hơn version 11; nhập lại version 12 không được gây thêm thay đổi.
+
+Timestamp không phải lúc nào cũng thay được version. Hai máy có clock lệch hoặc hai thay đổi cùng timestamp có thể khiến so sánh `updated_at` chọn sai winner. Nếu API và file là hai nguồn độc lập, Product phải quyết định quyền ưu tiên hoặc cơ chế báo conflict trước khi viết upsert.
+
+### Commit từng batch khác all-or-nothing
+
+Commit từng batch cho phép resume và giữ transaction ngắn, nhưng người đọc có thể thấy một phần file đã áp dụng trong khi phần còn lại chưa xong. Đây là **partial visibility**, không phải atomicity của cả file.
+
+Nếu cả file phải xuất hiện cùng lúc, cân nhắc dữ liệu theo dataset version: ghi một version mới vào vùng riêng, validate đầy đủ rồi đổi con trỏ `active_version` trong transaction ngắn. Cách này phù hợp với replace snapshot hơn là một file sửa rải rác trên hàng triệu entity đang có concurrent writes.
+
+Mặc định của ví dụ là merge theo batch và chấp nhận partial visibility. Người dùng phải thấy job đang chạy, số row đã xét và kết quả lỗi; không báo cả file thành công sau batch đầu.
+
+## Tách file parsing khỏi business write
+
+**Staging table** là vùng lưu dữ liệu nhập trước khi đưa vào bảng nghiệp vụ. Nó cho phép kiểm tra, deduplicate và xử lý lại mà không cần đọc file từ đầu sau mỗi lỗi merge.
+
+```d2 title="Pipeline bulk upsert và các checkpoint" interactive=false
+direction: down
+file: "CSV bất biến và checksum"
+raw: "Raw staging" {shape: cylinder}
+validation: "Validate và chọn version"
+errors: "Error report"
+ready: "Staging hợp lệ, đã dedupe" {shape: cylinder}
+merge: "Merge một batch"
+checkpoint: "Commit dữ liệu và checkpoint"
+finish: "Đối soát và kết thúc"
+file -> raw: COPY
+raw -> validation
+validation -> errors: "Row lỗi"
+validation -> ready: "Row hợp lệ"
+ready -> merge
+merge -> checkpoint
+checkpoint -> merge: "Còn dữ liệu"
+checkpoint -> finish: "Hết dữ liệu"
+```
+
+File gốc nên có identity và checksum ổn định. Nếu người vận hành thay file trong khi job resume, checkpoint cũ không còn ý nghĩa. Job phải gắn với đúng nội dung file và đúng version của quy tắc chuyển đổi.
+
+Không giữ một transaction mở xuyên suốt download, parse và merge. Những bước đó có thể mất nhiều thời gian nhưng không cần giữ business row lock.
+
+## Load vào staging bằng COPY
+
+### Chọn raw staging và typed staging theo cách báo lỗi
+
+Nếu cần trả lỗi theo từng dòng, raw staging có thể dùng các cột text và `source_line`; bước validate sẽ chuyển chúng sang kiểu dữ liệu chính xác. Nếu `COPY` thẳng vào cột `numeric` gặp chuỗi không hợp lệ, thao tác load có thể fail trước khi ứng dụng tạo được báo cáo đầy đủ.
+
+Typed staging dưới đây biểu diễn **đầu ra đã validate và deduplicate**. Primary key bảo đảm mỗi business key chỉ xuất hiện một lần trong một job.
+
+```sql
+CREATE TABLE import_jobs (
+    job_id bigint PRIMARY KEY,
+    tenant_id bigint NOT NULL,
+    last_order_id bigint,
+    status text NOT NULL DEFAULT 'READY'
+        CHECK (status IN ('READY', 'RUNNING', 'DONE', 'FAILED'))
+);
+
+CREATE TABLE orders_import_ready (
+    job_id bigint NOT NULL REFERENCES import_jobs(job_id),
+    tenant_id bigint NOT NULL,
+    order_id bigint NOT NULL,
+    amount numeric(12, 2) NOT NULL CHECK (amount >= 0),
+    status text NOT NULL,
+    source_version bigint NOT NULL,
+    PRIMARY KEY (job_id, order_id)
+);
+
+CREATE TABLE orders (
+    tenant_id bigint NOT NULL,
+    order_id bigint NOT NULL,
+    amount numeric(12, 2) NOT NULL CHECK (amount >= 0),
+    status text NOT NULL,
+    source_version bigint NOT NULL,
+    PRIMARY KEY (tenant_id, order_id)
+);
+```
+
+Ví dụ giới hạn mỗi job vào một tenant. Khi load, backend phải kiểm tra mọi row cùng tenant với job; không tin `tenant_id` trong file là quyền được ghi vào tenant đó. Nếu một job thật sự chứa nhiều tenant, cursor và thứ tự batch phải đổi sang tuple tương ứng thay vì chỉ `order_id`.
+
+### COPY giảm round trip chứ không bỏ qua mọi kiểm tra
+
+`COPY FROM STDIN` truyền nhiều row qua một stream, thay vì gửi một HTTP/JDBC round trip cho từng row. Nó vẫn chịu các quy tắc database liên quan, gồm type conversion, check constraint và trigger trên bảng đích. Không nên quảng bá COPY như một cách bypass toàn bộ validation.
+
+Từ `psql`, `\copy` đọc file ở máy chạy client. SQL `COPY ... FROM '/path'` lại đọc file trên máy database và cần quyền tương ứng.
+
+```text
+\copy orders_import_ready(job_id, tenant_id, order_id, amount, status, source_version) FROM './ready.csv' WITH (FORMAT csv, HEADER true)
+```
+
+Với pgJDBC, lấy connection thật bằng `unwrap` thay vì cast một pooled connection:
+
+```java
+try (Connection connection = dataSource.getConnection();
+     Reader reader = Files.newBufferedReader(csvFile, StandardCharsets.UTF_8)) {
+    PGConnection pg = connection.unwrap(PGConnection.class);
+    long loaded = pg.getCopyAPI().copyIn("""
+        COPY orders_import_ready
+          (job_id, tenant_id, order_id, amount, status, source_version)
+        FROM STDIN WITH (FORMAT csv, HEADER true)
+        """, reader);
+    // loaded là số row COPY nhận, không phải số row business đã thay đổi.
+}
+```
+
+`UNLOGGED` staging có thể giảm WAL — write-ahead log dùng cho recovery — nhưng dữ liệu bảng không crash-safe và không được replicate như bảng logged thông thường. Chỉ chọn khi raw file còn bền vững và quy trình có thể dựng lại staging sau crash. Với checkpoint cần survive failover, logged staging thường dễ vận hành hơn.
+
+## Validate và deduplicate trước merge
+
+Giả sử file chứa hai row cho cùng đơn: version 11 và version 12. Phải xác định row thắng trước khi merge. PostgreSQL không cho một `INSERT ... ON CONFLICT DO UPDATE` tác động cùng target row nhiều lần trong một statement; duplicate input có thể tạo cardinality violation.
+
+Quy tắc chọn winner nên xác định hoàn toàn, chẳng hạn version lớn nhất rồi `source_line` lớn nhất khi version bằng nhau. Nếu hai row cùng version nhưng nội dung khác nhau, báo conflict có thể đúng hơn việc âm thầm chọn dòng cuối.
+
+Đừng xóa row invalid trước khi ghi error report. Pipeline nên lưu `job_id`, dòng nguồn, error code và giá trị cần sửa với policy bảo vệ dữ liệu. Sau đó mới tạo tập ready từ các row hợp lệ.
+
+| Kiểm tra | Ví dụ lỗi | Cách xử lý |
+| --- | --- | --- |
+| Định dạng | `amount = abc` | Ghi lỗi parse theo dòng |
+| Quy tắc dữ liệu | Amount âm, status ngoài allowlist | Reject hoặc giữ job chờ sửa theo contract |
+| Business key | Thiếu order ID | Không tự sinh ID mới để che lỗi |
+| Duplicate | Cùng key, cùng version, khác nội dung | Báo conflict theo policy |
+| Tenant và quyền | Row thuộc tenant khác | Reject và audit, không chỉ ghi warning |
+| Phiên bản | File cũ hơn record hiện tại | Skip hoặc báo stale input, không ghi đè |
+
+Sau khi tạo xong tập ready, coi nó là bất biến trong suốt merge. Cursor keyset sẽ sai nếu dữ liệu phía sau bị sửa hoặc chèn thêm với key nhỏ hơn checkpoint.
+
+## Merge theo keyset và commit checkpoint cùng dữ liệu
+
+### Không dùng OFFSET cho các batch sau
+
+Với `OFFSET`, batch càng về cuối càng phải đi qua nhiều row đã xử lý. **Keyset pagination** đi tiếp từ key cuối của batch trước: `order_id > last_order_id`. Index `(job_id, order_id)` hỗ trợ đường đọc này.
+
+Ví dụ sau dùng các tham số `:job_id` và `:batch_size` do caller bind. Mỗi lần gọi là một transaction. Worker đầu tiên khóa job row; worker thứ hai cho cùng job phải chờ rồi đọc lại checkpoint đã commit.
+
+```sql
+BEGIN;
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '15s';
+
+SELECT job_id FROM import_jobs WHERE job_id = :job_id FOR UPDATE;
+
+WITH batch AS MATERIALIZED (
+    SELECT s.*
+    FROM orders_import_ready s
+    JOIN import_jobs j ON j.job_id = s.job_id
+    WHERE s.job_id = :job_id
+      AND s.tenant_id = j.tenant_id
+      AND (j.last_order_id IS NULL OR s.order_id > j.last_order_id)
+    ORDER BY s.order_id
+    LIMIT :batch_size
+), applied AS (
+    INSERT INTO orders AS target
+        (tenant_id, order_id, amount, status, source_version)
+    SELECT tenant_id, order_id, amount, status, source_version
+    FROM batch
+    ORDER BY order_id
+    ON CONFLICT (tenant_id, order_id) DO UPDATE SET
+        amount = EXCLUDED.amount,
+        status = EXCLUDED.status,
+        source_version = EXCLUDED.source_version
+    WHERE target.source_version < EXCLUDED.source_version
+    RETURNING order_id
+), advanced AS (
+    UPDATE import_jobs
+    SET last_order_id = (SELECT max(order_id) FROM batch),
+        status = 'RUNNING'
+    WHERE job_id = :job_id AND EXISTS (SELECT 1 FROM batch)
+    RETURNING last_order_id
+)
+SELECT (SELECT count(*) FROM batch) AS examined,
+       (SELECT count(*) FROM applied) AS changed,
+       (SELECT last_order_id FROM advanced) AS checkpoint;
+
+COMMIT;
+```
+
+Timeouts ở đây chỉ là giá trị lab để minh họa hàng rào bảo vệ, không phải cấu hình production mặc định. Nếu bất kỳ bước nào lỗi, rollback transaction trước khi retry.
+
+### Cursor đi theo row đã xét, không đi theo affected rows
+
+Giả sử batch xét 1.000 row nhưng cả 1.000 đều có version cũ hơn dữ liệu đích. `changed = 0` nhưng `examined = 1000`: job vẫn phải tiến checkpoint qua 1.000 row đó.
+
+Nếu dùng affected-row count để tăng cursor, job có thể lặp vô hạn trên cùng dữ liệu. Ngược lại, nếu commit checkpoint trước business write, crash có thể khiến resume bỏ qua row chưa áp dụng. Câu SQL trên giữ cả hai thay đổi trong cùng transaction.
+
+Khi `examined = 0`, worker có thể chuyển job sang `DONE` trong một transaction ngắn có khóa job và kiểm tra lại không còn dữ liệu. Job runner cũng cần kiểm tra status terminal trước khi nhận việc; SQL minh họa không thay thế toàn bộ cơ chế claim, authorization và cancellation.
+
+### Retry sau crash không đồng nghĩa chạy mọi side effect lần nữa
+
+Nếu worker chết trước commit, transaction rollback. Nếu chết sau commit nhưng trước ack queue, lần chạy sau đọc checkpoint đã tiến. Điều kiện `source_version` còn ngăn cùng version tạo lại update nghiệp vụ khi một batch bị replay.
+
+Tuy nhiên, trigger hoặc tác vụ ngoài database vẫn cần đánh giá riêng. Không gọi HTTP, gửi email hay publish broker rồi nghĩ database rollback sẽ thu hồi được. Nếu merge cần phát event, ghi outbox trong cùng transaction và để relay gửi sau.
+
+## Điều phối transaction từ Java và Spring
+
+Một bẫy thường gặp là method vòng lặp gọi method `@Transactional` trong cùng object. Với Spring proxy mặc định, self-invocation đó không đi qua proxy nên annotation không tạo boundary như bạn tưởng.
+
+Có thể tách batch writer thành bean khác hoặc dùng `TransactionTemplate` trực tiếp. Trong ví dụ sau, `batchWriter.mergeAndAdvance` chạy các SQL ở trên qua cùng transaction-bound connection. `tx` phải được cấu hình với đúng transaction manager của `DataSource` đang dùng.
+
+```java
+while (true) {
+    BatchResult result = tx.execute(status ->
+        batchWriter.mergeAndAdvance(jobId, batchSize));
+
+    if (result.examined() == 0) {
+        jobService.markDoneIfExhausted(jobId);
+        break;
+    }
+    // Mọi delay/throttle nằm ngoài transaction đã commit.
+    throttle.awaitNextBatch();
+}
+```
+
+Đây là khung điều phối, không phải class hoàn chỉnh. Production runner còn cần cancellation, retry budget, job claim và log correlation. Retry deadlock phải chạy lại cả batch trong transaction mới; không tiếp tục một transaction PostgreSQL đã ở trạng thái aborted.
+
+## Concurrent writes và deadlock
+
+Điều kiện version chỉ có ý nghĩa nếu **mọi writer cùng tuân thủ một giao thức version**. Nếu API tăng version theo một cách, file dùng timestamp theo cách khác, phép so sánh số lớn hơn không còn biểu diễn “dữ liệu mới hơn”.
+
+Khi concurrent writes là bình thường, có ba lựa chọn rõ ràng: nguồn import có quyền thay thế, phát hiện stale input và báo conflict, hoặc tạo change set chờ người dùng review. Mình ưu tiên phát hiện conflict khi dữ liệu ảnh hưởng đơn hàng hay thanh toán, thay vì ngầm chọn last-write-wins.
+
+Sắp xếp batch theo cùng key giúp giảm deadlock giữa các worker. Nó không chứng minh không thể có deadlock: trigger, foreign key và writer khác có thể lấy lock theo thứ tự khác. Vẫn cần timeout, rollback và bounded retry.
+
+Nếu chạy song song, chia thành các key range không overlap và giữ checkpoint riêng mỗi range. Tăng thread count trên cùng một hot range thường chỉ tăng lock wait và I/O contention.
+
+## Index, WAL và partition swap
+
+### Giữ unique index cần cho conflict detection
+
+Upsert cần unique constraint/index phù hợp với business key. Không drop primary key để “load nhanh hơn”. Secondary indexes cũng phục vụ online queries; drop chúng có thể khiến request đọc chuyển sang quét bảng lớn.
+
+Với file một triệu row trên bảng một tỷ row, rebuild một secondary index toàn bảng có thể đắt hơn phần chi phí update index của file. Vì vậy mặc định giữ indexes, đo write amplification và throttle merge. Chỉ cân nhắc drop/rebuild trong maintenance plan đã so chi phí, thời gian và rollback.
+
+`CREATE INDEX CONCURRENTLY` giảm việc chặn thao tác ghi so với build thông thường, nhưng vẫn có locks, chờ transaction và I/O. Nó không phải thao tác “không ảnh hưởng production”.
+
+### Partition swap là một quy trình riêng
+
+Partition swap hữu ích khi thay trọn một partition hoặc dataset. Bạn dựng bản thay thế, validate constraint/index, bắt kịp write phát sinh rồi đổi attachment hoặc con trỏ phục vụ.
+
+Chỉ copy partition cũ rồi swap không bảo toàn concurrent writes xảy ra sau lúc copy. Ngoài ra, attach/detach có lock và ràng buộc uniqueness của partitioned table. Không gọi nó là zero-downtime mặc định; phải thiết kế cutover và thử trên đúng schema/version.
+
+## Quan sát, throttle và nghiệm thu
+
+Chọn batch size bằng thời gian transaction và ảnh hưởng online traffic, không bằng một số row cố định. Bắt đầu nhỏ trong môi trường thử, tăng dần khi lock wait, WAL, replica lag và p95 request còn trong budget.
+
+| Dấu hiệu | Hướng điều chỉnh |
+| --- | --- |
+| Transaction lâu, lock wait tăng | Giảm batch size, tìm hot key và blocker |
+| I/O hoặc WAL tăng mạnh | Giảm tốc giữa batch, kiểm tra index/row churn |
+| Replica lag tăng | Throttle trên primary; đọc từ replica không làm write biến mất |
+| CPU app/RAM tăng lúc parse | Stream và tách parsing khỏi merge |
+| Job không tiến nhưng không lỗi | Kiểm tra `examined`, cursor và transaction bị chờ |
+
+Theo dõi riêng `loaded`, `invalid`, `ready`, `examined` và `changed`. `changed` gồm insert và update; row stale được xét nhưng không đổi. Không dựa vào `xmax` như một API nghiệp vụ ổn định để phân loại insert/update; nếu cần thống kê chính xác, dùng audit được thiết kế rõ hoặc API `RETURNING` phù hợp với version PostgreSQL đang chạy.
+
+Bộ kiểm thử cần có file chứa duplicate, input cũ, row invalid và tenant không hợp lệ. Sau đó dừng worker ở hai điểm: trước commit và sau commit trước ack. Chạy lại phải cho cùng business state cuối cùng, checkpoint không nhảy qua dữ liệu và không lặp side effect.
+
+Với import định kỳ, so sánh batch với CDC — Change Data Capture, tức stream thay đổi từ nguồn. CDC có thể giảm độ trễ cập nhật nhưng thêm connector, log retention, ordering và vận hành. Tần suất hơn một lần mỗi ngày không tự đủ để chứng minh cần Kafka hay Debezium.
+
+## Tài liệu tham khảo và bài liên quan
+
+- [PostgreSQL COPY](https://www.postgresql.org/docs/current/sql-copy.html).
+- [PostgreSQL INSERT và ON CONFLICT](https://www.postgresql.org/docs/18/sql-insert.html).
+- [pgJDBC CopyManager](https://jdbc.postgresql.org/documentation/publicapi/org/postgresql/copy/CopyManager.html).
+- [Spring: declarative transaction và self-invocation](https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/annotations.html).
+
+<Cards>
+  <Card title="Thiết kế upload và import có resume" href="/system-design/06-resumable-excel-import" />
+  <Card title="Transaction dài và cách thu hẹp boundary" href="/database/05-long-running-transaction" />
+  <Card title="Bộ nhớ Java khi xử lý file lớn" href="/java/01-heap-vs-off-heap-vs-stack" />
+</Cards>

@@ -1,0 +1,11 @@
+{
+  "title": "Web / HTTP",
+  "pages": [
+    "01-cors",
+    "02-frontend-build-tooling",
+    "02-shared-worker-websocket",
+    "03-webpack-tu-source-den-trinh-duyet",
+    "04-module-federation-react-vue-microfrontend",
+    "05-vite-vs-webpack"
+  ]
+}

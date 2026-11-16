@@ -1,0 +1,12 @@
+{
+  "pages": [
+    "algorithms",
+    "behavioral",
+    "caching",
+    "database",
+    "java",
+    "web",
+    "security",
+    "system-design"
+  ]
+}

@@ -1,0 +1,824 @@
+---
+title: "Index trên cột nullable: từ NULL đến thiết kế và kiểm chứng"
+description: "Hiểu NULL, cách B-tree hỗ trợ tìm kiếm, selectivity, composite và partial index, UNIQUE và khác biệt giữa database; thực hành đọc EXPLAIN trên PostgreSQL 18."
+---
+
+<Callout type="info" title="Phạm vi và kiến thức nền">
+  Bài dành cho bạn đã biết `SELECT`, `WHERE` và `CREATE INDEX`. Ví dụ chính dùng
+  **PostgreSQL 18 và B-tree**. MySQL 8.4/InnoDB, SQL Server và Oracle được tách
+  riêng vì chúng không có cùng quy tắc về `NULL`. Phần lab dùng bảng tạm trong
+  một session PostgreSQL; dữ liệu là dữ liệu sinh để học, không phải benchmark.
+</Callout>
+
+## Mục lục
+
+- [Bắt đầu từ danh sách đơn chưa giao](#bắt-đầu-từ-danh-sách-đơn-chưa-giao)
+- [NULL và điều kiện lọc dữ liệu](#null-và-điều-kiện-lọc-dữ-liệu)
+  - [NULL không phải một giá trị mặc định](#null-không-phải-một-giá-trị-mặc-định)
+  - [Logic ba giá trị trong WHERE](#logic-ba-giá-trị-trong-where)
+  - [NULL trong phủ định, đếm và so sánh tham số](#null-trong-phủ-định-đếm-và-so-sánh-tham-số)
+- [B-tree xử lý key NULL như thế nào](#b-tree-xử-lý-key-null-như-thế-nào)
+  - [Entry trong index và row trong bảng](#entry-trong-index-và-row-trong-bảng)
+  - [Hai đường đọc dữ liệu của PostgreSQL](#hai-đường-đọc-dữ-liệu-của-postgresql)
+  - [Thứ tự NULL không thay đổi ý nghĩa lọc](#thứ-tự-null-không-thay-đổi-ý-nghĩa-lọc)
+- [Selectivity và quyết định dùng index](#selectivity-và-quyết-định-dùng-index)
+  - [Tỷ lệ NULL phải gắn với điều kiện đang tìm](#tỷ-lệ-null-phải-gắn-với-điều-kiện-đang-tìm)
+  - [Số row không phải chi phí duy nhất](#số-row-không-phải-chi-phí-duy-nhất)
+  - [Statistics giúp planner ước lượng dữ liệu](#statistics-giúp-planner-ước-lượng-dữ-liệu)
+- [Thiết kế index theo truy vấn thực tế](#thiết-kế-index-theo-truy-vấn-thực-tế)
+  - [Index một cột cho các phép tìm theo shipped_at](#index-một-cột-cho-các-phép-tìm-theo-shipped_at)
+  - [Composite index cho lọc kết hợp và sắp xếp](#composite-index-cho-lọc-kết-hợp-và-sắp-xếp)
+  - [Partial index cho một tập con có ý nghĩa](#partial-index-cho-một-tập-con-có-ý-nghĩa)
+  - [Planner phải chứng minh query thuộc tập được index](#planner-phải-chứng-minh-query-thuộc-tập-được-index)
+  - [Covering index và chi phí của INCLUDE](#covering-index-và-chi-phí-của-include)
+- [Thực hành trên PostgreSQL 18](#thực-hành-trên-postgresql-18)
+  - [Chuẩn bị một session và dữ liệu có kiểm soát](#chuẩn-bị-một-session-và-dữ-liệu-có-kiểm-soát)
+  - [Quan sát trước và sau index một cột](#quan-sát-trước-và-sau-index-một-cột)
+  - [So sánh full composite index với partial index](#so-sánh-full-composite-index-với-partial-index)
+  - [Thử Index Only Scan sau VACUUM](#thử-index-only-scan-sau-vacuum)
+  - [Kiểm chứng kết quả trước khi so hiệu năng](#kiểm-chứng-kết-quả-trước-khi-so-hiệu-năng)
+- [Đọc EXPLAIN mà không nhầm dấu hiệu](#đọc-explain-mà-không-nhầm-dấu-hiệu)
+  - [Index Cond, Filter và các node đọc dữ liệu](#index-cond-filter-và-các-node-đọc-dữ-liệu)
+  - [Ước lượng row, actual row và buffers](#ước-lượng-row-actual-row-và-buffers)
+  - [Seq Scan không phải kết quả thất bại](#seq-scan-không-phải-kết-quả-thất-bại)
+- [UNIQUE và NULL là một hợp đồng riêng](#unique-và-null-là-một-hợp-đồng-riêng)
+  - [PostgreSQL mặc định cho phép nhiều NULL](#postgresql-mặc-định-cho-phép-nhiều-null)
+  - [Composite uniqueness và phạm vi tenant](#composite-uniqueness-và-phạm-vi-tenant)
+  - [Unique chỉ áp dụng cho bản ghi chưa bị xóa mềm](#unique-chỉ-áp-dụng-cho-bản-ghi-chưa-bị-xóa-mềm)
+- [Khác biệt giữa các database](#khác-biệt-giữa-các-database)
+  - [Bảng đối chiếu theo đúng loại index](#bảng-đối-chiếu-theo-đúng-loại-index)
+  - [MySQL hỗ trợ IS NULL nhưng không có partial index tương đương](#mysql-hỗ-trợ-is-null-nhưng-không-có-partial-index-tương-đương)
+  - [SQL Server cần chú ý filtered index và uniqueness](#sql-server-cần-chú-ý-filtered-index-và-uniqueness)
+  - [Oracle bỏ qua bộ key toàn NULL trong B-tree thông thường](#oracle-bỏ-qua-bộ-key-toàn-null-trong-b-tree-thông-thường)
+- [Những cách tối ưu dễ làm sai bài toán](#những-cách-tối-ưu-dễ-làm-sai-bài-toán)
+  - [Thay NULL bằng sentinel chỉ để dùng index](#thay-null-bằng-sentinel-chỉ-để-dùng-index)
+  - [Bọc cột bằng COALESCE mà không xét expression index](#bọc-cột-bằng-coalesce-mà-không-xét-expression-index)
+  - [Index riêng deleted_at khi phần lớn row chưa bị xóa](#index-riêng-deleted_at-khi-phần-lớn-row-chưa-bị-xóa)
+- [Đưa index vào hệ thống đang chạy](#đưa-index-vào-hệ-thống-đang-chạy)
+  - [Cân bằng đường đọc với đường ghi](#cân-bằng-đường-đọc-với-đường-ghi)
+  - [Tạo index và theo dõi rollout](#tạo-index-và-theo-dõi-rollout)
+- [Checklist chọn phương án](#checklist-chọn-phương-án)
+- [Tài liệu chính thức và bài liên quan](#tài-liệu-chính-thức-và-bài-liên-quan)
+  - [Nguồn đối chiếu](#nguồn-đối-chiếu)
+  - [Đọc tiếp](#đọc-tiếp)
+
+## Bắt đầu từ danh sách đơn chưa giao
+
+Giả sử một hệ thống bán hàng lưu thời điểm giao hàng trong cột `shipped_at`. Đơn chưa giao có `shipped_at IS NULL`. Màn hình vận hành cần lấy 50 đơn chưa giao lâu nhất của một cửa hàng:
+
+```sql
+SELECT id, created_at
+FROM orders
+WHERE tenant_id = 42
+  AND shipped_at IS NULL
+ORDER BY created_at, id
+LIMIT 50;
+```
+
+`tenant_id` xác định cửa hàng trong hệ thống nhiều khách hàng dùng chung database. Khi bảng có hàng triệu đơn nhưng mỗi cửa hàng chỉ còn ít đơn chưa giao, bạn muốn database tìm đúng nhóm đó thay vì đọc cả lịch sử.
+
+Cột **nullable** là cột được phép chứa `NULL`. Việc cột cho phép `NULL` không tự quyết định index có dùng được hay không. Để thiết kế đúng, cần tách ba lớp:
+
+| Lớp | Điều cần xác định | Ví dụ |
+| --- | --- | --- |
+| Ý nghĩa truy vấn | Những row nào phải được trả về | `IS NULL` lấy đơn chưa giao; `= NULL` không làm được việc này |
+| Khả năng của index | Index có chứa và có cách tìm nhóm row đó không | PostgreSQL B-tree chứa cả entry có key `NULL` |
+| Lựa chọn của optimizer | Dùng index có ít việc hơn các cách khác không | Lấy gần hết bảng có thể phù hợp với quét tuần tự |
+
+**Đừng đồng nhất “index hỗ trợ điều kiện này” với “mọi truy vấn có điều kiện này sẽ dùng index”.** Bài đi theo ba lớp trên, rồi mới chọn cấu trúc cho truy vấn thực tế.
+
+## NULL và điều kiện lọc dữ liệu
+
+### NULL không phải một giá trị mặc định
+
+Với đơn hàng, một row có `shipped_at` là `NULL` mang ý nghĩa “chưa có thời điểm giao”. Nó không phải mốc thời gian `1970-01-01`, cũng không phải chuỗi rỗng.
+
+Ví dụ dữ liệu minh họa:
+
+| id | shipped_at | Cách hiểu trong mô hình này |
+| --- | --- | --- |
+| 101 | `NULL` | Chưa giao |
+| 102 | `2026-01-05 10:00:00+00` | Đã giao tại thời điểm này |
+| 103 | `NULL` | Chưa giao |
+
+Ý nghĩa nghiệp vụ phải do schema và ứng dụng thống nhất. Trong mô hình khác, `NULL` có thể là “chưa biết” hoặc “không áp dụng”. Nếu cần phân biệt “chưa giao” với “đã giao nhưng mất dữ liệu thời gian”, một cột nullable là chưa đủ; nên có trạng thái riêng hoặc ràng buộc dữ liệu rõ hơn.
+
+### Logic ba giá trị trong WHERE
+
+SQL dùng ba kết quả logic: `TRUE`, `FALSE` và `UNKNOWN`. So sánh thông thường với `NULL` cho ra `UNKNOWN`, kể cả `NULL = NULL`.
+
+Bảng dưới dùng `x` là cột số để minh họa độc lập với kiểu timestamp:
+
+| Điều kiện | `x` mang giá trị `7` | `x` là `NULL` |
+| --- | --- | --- |
+| `x = 7` | `TRUE` | `UNKNOWN` |
+| `x <> 7` | `FALSE` | `UNKNOWN` |
+| `x = NULL` | `UNKNOWN` | `UNKNOWN` |
+| `x IS NULL` | `FALSE` | `TRUE` |
+| `x IS NOT NULL` | `TRUE` | `FALSE` |
+
+`WHERE` chỉ giữ row có kết quả `TRUE`. Vì vậy, câu lệnh sau không lấy được đơn chưa giao:
+
+```sql
+SELECT id FROM orders WHERE shipped_at = NULL;
+```
+
+Câu đúng là:
+
+```sql
+SELECT id FROM orders WHERE shipped_at IS NULL;
+```
+
+Tương tự, `shipped_at <> NULL` không có nghĩa là “đã giao”. Hãy viết `shipped_at IS NOT NULL`. Sửa index không thể cứu một điều kiện SQL sai ý nghĩa.
+
+### NULL trong phủ định, đếm và so sánh tham số
+
+Phủ định không tự biến `UNKNOWN` thành `TRUE`. Chẳng hạn `NOT (x = 7)` vẫn loại row có `x IS NULL`. Nếu nghiệp vụ muốn “khác 7, bao gồm cả chưa có giá trị”, hãy diễn đạt rõ:
+
+```sql
+WHERE x <> 7 OR x IS NULL
+```
+
+`NOT IN` cũng dễ gây bất ngờ. Với `7 NOT IN (1, NULL)`, SQL phải kiểm tra cả `7 <> 1` và `7 <> NULL`. Kết quả là `UNKNOWN`, nên row bị loại. Khi loại trừ bằng một tập dữ liệu có thể chứa `NULL`, thường nên viết `NOT EXISTS` với điều kiện tương quan đúng nghiệp vụ; đừng chỉ thay index.
+
+Hai cách đếm sau cũng khác nhau:
+
+```sql
+SELECT
+  count(*) AS total_orders,
+  count(shipped_at) AS shipped_orders,
+  count(*) FILTER (WHERE shipped_at IS NULL) AS unshipped_orders
+FROM orders;
+```
+
+`count(*)` đếm mọi row. `count(shipped_at)` chỉ đếm row có `shipped_at` khác `NULL`. Cú pháp `FILTER` ở đây là PostgreSQL.
+
+Khi muốn so sánh hai giá trị và coi hai `NULL` là bằng nhau, PostgreSQL có `IS NOT DISTINCT FROM`; MySQL có toán tử `<=>`. Đây là quy tắc so sánh, không phải lời hứa về access path. Nếu mục tiêu chỉ là kiểm tra thiếu giá trị, `IS NULL` vẫn là cách viết trực tiếp nhất.
+
+## B-tree xử lý key NULL như thế nào
+
+### Entry trong index và row trong bảng
+
+Hình dung index như mục lục cuối sách: nó giúp tìm nơi cần đọc thay vì lật từng trang. Với PostgreSQL B-tree, có thể hiểu một entry là key được index cùng thông tin định vị row trong bảng.
+
+Ví dụ index trên `shipped_at` có thể được mô tả ở mức logic như sau:
+
+| Key trong index | Row tương ứng |
+| --- | --- |
+| `2026-01-05 10:00:00+00` | Đơn 102 |
+| `NULL` | Đơn 101 |
+| `NULL` | Đơn 103 |
+
+Đây **không phải bản chụp cấu trúc vật lý**. PostgreSQL có thể gộp các key trùng trong B-tree; dữ liệu cũng chịu ảnh hưởng của cơ chế quản lý nhiều phiên bản row. Điểm cần giữ là index có đủ thông tin để tìm những row thuộc nhóm `NULL`.
+
+SQL không coi `NULL = NULL` là `TRUE`, nhưng B-tree vẫn có thể có quy tắc đặt và tìm các key `NULL`. Quy tắc so sánh trong biểu thức SQL và quy tắc tổ chức index là hai việc khác nhau.
+
+### Hai đường đọc dữ liệu của PostgreSQL
+
+Sau khi nhận truy vấn, PostgreSQL có thể tìm entry trong index rồi đọc các trang dữ liệu liên quan. Một lựa chọn khác là bỏ qua index và đọc tuần tự bảng. Sơ đồ dưới đặt hai đường đọc cạnh nhau:
+
+```d2 interactive=false title="Hai access path cho điều kiện shipped_at IS NULL"
+direction: down
+query: "SELECT ...\nWHERE shipped_at IS NULL"
+pg: PostgreSQL {
+  icon: /interview-question/postgresql.svg
+  planner: "Planner\nƯớc lượng chi phí"
+  index: "B-tree index\nTìm nhóm key NULL"
+  heap: "Heap\nCác trang dữ liệu của bảng" {
+    shape: cylinder
+  }
+  planner -> index: "Chọn đường qua index"
+  index -> heap: "Đọc row cần thiết"
+  planner -> heap: "Hoặc quét tuần tự"
+}
+query -> pg.planner: "Lập execution plan"
+```
+
+**Planner**, còn gọi là query optimizer, là bộ phận chọn cách thực thi truy vấn. **Heap** là vùng lưu dữ liệu bảng của PostgreSQL; không phải cấu trúc heap trong thuật toán hàng đợi ưu tiên.
+
+Nếu chỉ vài row khớp điều kiện, tìm trong index rồi đọc chúng thường ít việc. Nếu gần hết row đều khớp, đọc bảng tuần tự có thể tránh được việc vừa đọc index vừa quay lại rất nhiều trang của bảng.
+
+Ví von mục lục dừng ở đây: database không chỉ “tìm một số trang”. Nó còn phải kiểm tra row có nhìn thấy được trong transaction hiện tại hay không, đọc các cột cần trả về, sắp xếp và áp dụng giới hạn kết quả.
+
+### Thứ tự NULL không thay đổi ý nghĩa lọc
+
+B-tree PostgreSQL hỗ trợ cả `IS NULL` lẫn `IS NOT NULL`. Mặc định, index tăng dần đặt `NULL` sau các giá trị không `NULL`, tương ứng `ASC NULLS LAST`.
+
+Bạn có thể tạo một thứ tự khác:
+
+```sql
+CREATE INDEX orders_shipped_nulls_first_idx
+ON orders (shipped_at ASC NULLS FIRST);
+```
+
+Lựa chọn này đáng quan tâm khi query cần `ORDER BY shipped_at NULLS FIRST`. Nó không phải điều kiện bắt buộc để `IS NULL` dùng được index.
+
+Không có `ORDER BY`, SQL không đảm bảo thứ tự kết quả. Đừng dựa vào việc lần thử trước index đã trả các row `NULL` trước hay sau.
+
+## Selectivity và quyết định dùng index
+
+### Tỷ lệ NULL phải gắn với điều kiện đang tìm
+
+Giả sử một bảng có một triệu row, trong đó 900.000 row chứa `NULL` ở `shipped_at`. Hai truy vấn trên cùng cột có hình dạng chi phí rất khác:
+
+| Query | Số row khớp trong giả định | Nhận xét ban đầu |
+| --- | --- | --- |
+| `WHERE shipped_at IS NULL` | 900.000 | Cần phần lớn dữ liệu |
+| `WHERE shipped_at IS NOT NULL` | 100.000 | Tập kết quả nhỏ hơn |
+| `WHERE shipped_at = TIMESTAMPTZ '2026-01-05 10:00:00+00'` | Phụ thuộc giá trị cụ thể | Có thể chỉ vài row |
+
+**Selectivity** trong bài là tỷ lệ row khớp một điều kiện. Để tránh nhầm cách gọi “cao/thấp”, mình sẽ dùng thẳng “ít row khớp” hoặc “nhiều row khớp”.
+
+Nhiều `NULL` không có nghĩa mọi query trên cột đều kém hiệu quả. Query tìm một timestamp hiếm vẫn có thể hưởng lợi từ index. Ngược lại, ít `NULL` cũng không đảm bảo index sẽ được chọn nếu bảng rất nhỏ.
+
+### Số row không phải chi phí duy nhất
+
+Hai truy vấn cùng trả 10.000 row có thể đọc số trang dữ liệu khác nhau. Nếu các row nằm gần nhau, database có thể đọc ít trang. Nếu chúng rải khắp bảng, việc đọc qua index có thể chạm gần hết bảng.
+
+Các yếu tố cần nhìn cùng nhau là:
+
+- Số row dự kiến khớp và số trang bảng phải đọc.
+- Những cột được trả về: vài cột nhỏ hay cả payload lớn.
+- Có `ORDER BY` và `LIMIT` hay không.
+- Index có cung cấp sẵn thứ tự cần dùng hay không.
+- Dữ liệu đang trong cache hay phải đọc từ storage.
+- Chi phí CPU, I/O và khả năng chạy song song mà planner đang ước lượng.
+
+Không có ngưỡng phổ quát như “trên 10% là bỏ index”. Với `ORDER BY ... LIMIT 50`, index đúng thứ tự có thể dừng sớm sau khi tìm đủ kết quả. Cùng điều kiện lọc nhưng bỏ `LIMIT` có thể dẫn tới một plan khác.
+
+### Statistics giúp planner ước lượng dữ liệu
+
+PostgreSQL thu thập **statistics**, tức thông tin tóm tắt phân bố dữ liệu, qua `ANALYZE`. Với cột nullable, `pg_stats.null_frac` cho biết tỷ lệ `NULL` ước lượng:
+
+```sql
+ANALYZE orders;
+
+SELECT attname, null_frac, n_distinct
+FROM pg_stats
+WHERE schemaname = 'public'
+  AND tablename = 'orders'
+  AND attname IN ('shipped_at', 'tenant_id');
+```
+
+`n_distinct` ước lượng số giá trị khác nhau không tính `NULL`. Statistics thường dựa trên lấy mẫu, nên không nhất thiết đúng từng row.
+
+Sau một đợt backfill làm phần lớn `shipped_at` chuyển từ `NULL` sang timestamp, statistics cũ có thể không còn đại diện. Nếu plan ước lượng sai nhiều, kiểm tra dữ liệu và chạy `ANALYZE` trước khi kết luận cấu trúc index sai.
+
+Với điều kiện kết hợp như `tenant_id = 42 AND shipped_at IS NULL`, phân bố toàn bảng có thể không phản ánh cửa hàng 42. Khi có bằng chứng về sai lệch do quan hệ giữa các cột, hãy xem xét extended statistics của PostgreSQL. Đây là bước chẩn đoán tiếp theo, không phải lý do tạo statistics cho mọi tổ hợp cột.
+
+## Thiết kế index theo truy vấn thực tế
+
+### Index một cột cho các phép tìm theo shipped_at
+
+Index đơn giản nhất là:
+
+```sql
+CREATE INDEX orders_shipped_idx ON orders (shipped_at);
+```
+
+Trong PostgreSQL, index này chứa cả đơn đã giao và chưa giao. Nó có thể hỗ trợ tìm `NULL`, tìm một timestamp và tìm theo khoảng thời gian.
+
+Nhưng với màn hình cửa hàng, index chưa trực tiếp trả lời hai yêu cầu còn lại: đúng `tenant_id` và đúng thứ tự `created_at, id`. Database có thể vẫn phải lọc thêm và sort. Đừng dừng ở “đã index cột trong WHERE”; hãy đọc cả truy vấn.
+
+### Composite index cho lọc kết hợp và sắp xếp
+
+**Composite index** là index có nhiều key. Với truy vấn mở đầu, một lựa chọn là:
+
+```sql
+CREATE INDEX orders_tenant_shipped_created_idx
+ON orders (tenant_id, shipped_at, created_at, id);
+```
+
+Các key được tổ chức theo thứ tự đã khai báo. Planner có thể giới hạn vào cửa hàng 42, rồi vào nhóm `shipped_at IS NULL` của cửa hàng đó. Bên trong nhóm này, các key tiếp theo được sắp theo `created_at, id`.
+
+Tuy nhiên, **khả năng tìm nhóm `NULL` và khả năng bỏ bước sort là hai việc riêng**. Không nên suy ra rằng PostgreSQL luôn xử lý `IS NULL` giống hệt `= một hằng số` khi nhận diện thứ tự kết quả. Trong lần chạy lab trên PostgreSQL 18.6, full composite index này được dùng để tìm đúng nhóm row, nhưng plan vẫn có `Sort`. Partial index ở phần sau tránh được bước đó.
+
+Điều cần nhớ là `NULL` không ngăn B-tree tìm kiếm trên composite key. Còn index có loại bỏ được sort hay không phải kiểm tra bằng execution plan thực tế.
+
+`id` cuối index giúp thứ tự ổn định khi nhiều đơn có cùng `created_at`. Nếu query chỉ dùng `ORDER BY created_at`, thứ tự giữa các đơn trùng thời điểm không được đảm bảo.
+
+Thứ tự key này phục vụ tốt truy vấn có `tenant_id`. Nó không mặc nhiên là lựa chọn tốt nhất cho một worker lấy đơn chưa giao trên mọi cửa hàng. Với worker đó, một index bắt đầu bằng `shipped_at` hoặc partial index theo thứ tự xử lý có thể phù hợp hơn.
+
+PostgreSQL 18 có thể dùng skip scan trong một số trường hợp thiếu điều kiện trên key đầu. Đây là cách lặp các lần tìm kiếm trên nhiều giá trị key đầu để tận dụng điều kiện phía sau. Khả năng này không biến thứ tự key thành tùy ý: hãy thiết kế theo các query quan trọng, không dựa vào một tối ưu có điều kiện.
+
+### Partial index cho một tập con có ý nghĩa
+
+Nếu màn hình chỉ cần đơn chưa giao, PostgreSQL cho phép lưu riêng tập đó bằng **partial index**, tức index chỉ chứa những row thỏa một điều kiện:
+
+```sql
+CREATE INDEX orders_unshipped_queue_idx
+ON orders (tenant_id, created_at, id)
+WHERE shipped_at IS NULL;
+```
+
+Ở đây `shipped_at` nằm trong điều kiện chọn thành viên, không cần xuất hiện trong key. Trong index này, mọi entry đều thuộc về một đơn chưa giao. Các key tập trung vào việc chọn cửa hàng và trả đúng thứ tự.
+
+So với full composite index ở trên:
+
+| Đặc điểm | Full composite index | Partial index chưa giao |
+| --- | --- | --- |
+| Row tham gia | Mọi đơn | Chỉ đơn có `shipped_at IS NULL` |
+| Key | `tenant_id, shipped_at, created_at, id` | `tenant_id, created_at, id` |
+| Query tìm đơn đã giao | Có thể hỗ trợ | Không đủ dữ liệu để trả lời |
+| Kích thước khi đơn chưa giao rất ít | Chứa cả lịch sử | Thường nhỏ hơn đáng kể |
+| Khi đơn được giao | Key liên quan thay đổi | Row không còn thuộc tập được index |
+
+Nếu phần lớn đơn đã giao và query chưa giao là một đường đọc quan trọng, mình ưu tiên thử partial index này. Nếu ứng dụng còn cần nhiều query khác theo thời điểm giao, full index có thể vẫn cần thiết. Không nên tạo cả hai chỉ vì có hai đoạn DDL mẫu.
+
+### Planner phải chứng minh query thuộc tập được index
+
+Partial index không phải một bản sao nhỏ tùy ý của bảng. Planner chỉ dùng nó khi chứng minh được mọi row mà query cần đều nằm trong tập index.
+
+Query sau phù hợp với index `WHERE shipped_at IS NULL`:
+
+```sql
+SELECT id, created_at
+FROM orders
+WHERE tenant_id = $1 AND shipped_at IS NULL
+ORDER BY created_at, id
+LIMIT 50;
+```
+
+Tham số `$1` ở `tenant_id` không làm mất điều kiện `shipped_at IS NULL`. Vì vậy, không đúng khi nói “prepared statement luôn vô hiệu hóa partial index”.
+
+Ngược lại, giả sử index có predicate `WHERE status = 'pending'`, còn query chỉ có `WHERE status = $1`. **Generic plan**, tức plan dùng chung cho nhiều giá trị tham số, không thể mặc định `$1` luôn là `'pending'`. Custom plan biết giá trị cụ thể có thể cho kết quả khác.
+
+Với query optional filter như `WHERE ($1 IS NULL OR shipped_at = $1)`, tham số `NULL` lại có nghĩa là bỏ lọc, không phải chỉ lấy đơn chưa giao. Partial index chưa giao không chứa đủ row để trả lời trường hợp đó.
+
+Cách làm thực dụng là giữ điều kiện nghiệp vụ ổn định như `shipped_at IS NULL` xuất hiện rõ trong SQL. Khi query do ORM sinh ra, kiểm tra chính SQL và bind parameters mà ứng dụng gửi, không chỉ tên method trong source code.
+
+### Covering index và chi phí của INCLUDE
+
+Nếu query chỉ trả `id, created_at`, index queue ở trên đã chứa các cột cần thiết. PostgreSQL có thể cân nhắc **Index Only Scan**, tức lấy dữ liệu từ index mà không phải đọc từng row trong heap khi điều kiện về khả năng nhìn thấy row cho phép.
+
+Nếu cần thêm `customer_email`, có thể thử:
+
+```sql
+CREATE INDEX orders_unshipped_queue_cover_idx
+ON orders (tenant_id, created_at, id)
+INCLUDE (customer_email)
+WHERE shipped_at IS NULL;
+```
+
+`INCLUDE` lưu thêm dữ liệu ở index để trả kết quả. Nó không biến `customer_email` thành key dùng để điều hướng tìm kiếm hoặc cung cấp thứ tự sort.
+
+PostgreSQL vẫn phải xác định row có hợp lệ với transaction đang đọc hay không. **Visibility map** ghi nhận những trang heap mà mọi row đều đủ điều kiện nhìn thấy theo cơ chế của PostgreSQL. Khi thông tin này chưa cho phép bỏ qua heap, `Index Only Scan` vẫn có thể báo `Heap Fetches` lớn hơn 0.
+
+Đừng thêm mọi cột vào `INCLUDE`. Index lớn hơn sẽ tốn bộ nhớ, storage và chi phí cập nhật. Với queue thay đổi liên tục, lợi ích tránh heap fetch cũng có thể ít hơn bạn kỳ vọng. Chỉ thử covering sau khi plan cho thấy việc đọc heap thực sự đáng tối ưu.
+
+## Thực hành trên PostgreSQL 18
+
+### Chuẩn bị một session và dữ liệu có kiểm soát
+
+Kết nối tới một database dành cho thử nghiệm bằng `psql`, rồi chạy các khối `lab-*.sql` dưới đây **theo thứ tự trong cùng một session**. Nếu lưu chúng vào một file, có thể chạy bằng:
+
+```bash
+psql -X -v ON_ERROR_STOP=1 -d YOUR_SCRATCH_DATABASE -f nullable-index-lab.sql
+```
+
+`YOUR_SCRATCH_DATABASE` là tên cần thay. Các bảng trong lab là `TEMP TABLE`, chỉ tồn tại trong session tạo chúng. Không chạy bằng connection pool có thể đổi connection giữa các lệnh, và không bọc toàn bộ file trong transaction vì phần cuối có `VACUUM`.
+
+```sql title="lab-01-setup.sql"
+CREATE TEMP TABLE nullable_orders (
+  id bigint PRIMARY KEY,
+  tenant_id integer NOT NULL,
+  created_at timestamptz NOT NULL,
+  shipped_at timestamptz,
+  customer_email text,
+  payload text NOT NULL
+);
+
+INSERT INTO nullable_orders
+SELECT
+  g,
+  (((g - 1) / 1000) % 100 + 1)::integer,
+  TIMESTAMPTZ '2026-01-01 00:00:00+00' + g * INTERVAL '1 second',
+  CASE WHEN g % 1000 < 5 THEN NULL
+       ELSE TIMESTAMPTZ '2026-01-02 00:00:00+00'
+            + g * INTERVAL '1 second'
+  END,
+  CASE WHEN g % 10 = 0 THEN NULL
+       ELSE 'user-' || g || '@example.test'
+  END,
+  repeat('x', 120)
+FROM generate_series(1, 200000) AS s(g);
+
+ANALYZE nullable_orders;
+
+SELECT
+  count(*) AS total_rows,
+  count(*) FILTER (WHERE shipped_at IS NULL) AS null_rows,
+  count(shipped_at) AS nonnull_rows
+FROM nullable_orders;
+```
+
+Bộ dữ liệu được sinh cố định: 200.000 row, trong đó 1.000 row có `shipped_at IS NULL` và 199.000 row có giá trị. `payload` làm row rộng hơn để việc quay lại heap không bị che khuất hoàn toàn bởi một bảng quá nhỏ.
+
+Các con số này mô tả dataset, không phải hiệu năng. Thời gian chạy phụ thuộc máy, cache và cấu hình PostgreSQL của bạn.
+
+### Quan sát trước và sau index một cột
+
+Đầu tiên xem plan khi chưa có index trên `shipped_at`:
+
+```sql title="lab-02-single-column.sql"
+EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
+SELECT id, payload
+FROM nullable_orders
+WHERE shipped_at IS NULL;
+
+CREATE INDEX nullable_orders_shipped_idx
+ON nullable_orders (shipped_at);
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
+SELECT id, payload
+FROM nullable_orders
+WHERE shipped_at IS NULL;
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
+SELECT id, payload
+FROM nullable_orders
+WHERE shipped_at IS NOT NULL;
+```
+
+Trước index, planner không có index phù hợp để tìm nhóm `NULL`. Sau index, nó có thêm access path; bạn có thể thấy `Index Scan` hoặc `Bitmap Heap Scan` cho tập 1.000 row.
+
+Query `IS NOT NULL` lấy 199.000 row và cần cả `payload`. Quét tuần tự thường hợp lý hơn trong dataset này. Đừng xem đây là lỗi hỗ trợ `IS NOT NULL`: index có thể xử lý điều kiện, nhưng cách đó có thể tốn nhiều việc hơn.
+
+Không cần ép hai query phải chọn hai node chính xác giống nhau trên mọi máy. Điều cần kiểm chứng là số row thực tế, điều kiện tìm trong index và lượng dữ liệu mà mỗi plan phải đọc.
+
+### So sánh full composite index với partial index
+
+Tiếp theo, bỏ index thử trước để nhìn từng phương án độc lập. Các lệnh `DROP INDEX` dưới đây chỉ xóa index trên bảng tạm của lab.
+
+```sql title="lab-03-composite-and-partial.sql"
+DROP INDEX nullable_orders_shipped_idx;
+
+CREATE INDEX nullable_orders_full_queue_idx
+ON nullable_orders (tenant_id, shipped_at, created_at, id);
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
+SELECT id, created_at
+FROM nullable_orders
+WHERE tenant_id = 42 AND shipped_at IS NULL
+ORDER BY created_at, id
+LIMIT 50;
+
+SELECT pg_size_pretty(pg_relation_size('nullable_orders_full_queue_idx'))
+  AS full_index_size;
+
+DROP INDEX nullable_orders_full_queue_idx;
+
+CREATE INDEX nullable_orders_partial_queue_idx
+ON nullable_orders (tenant_id, created_at, id)
+WHERE shipped_at IS NULL;
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
+SELECT id, created_at
+FROM nullable_orders
+WHERE tenant_id = 42 AND shipped_at IS NULL
+ORDER BY created_at, id
+LIMIT 50;
+
+SELECT pg_size_pretty(pg_relation_size('nullable_orders_partial_queue_idx'))
+  AS partial_index_size;
+```
+
+Ở full index, hãy tìm điều kiện `tenant_id = 42` và `shipped_at IS NULL` trong `Index Cond`. Ở partial index, `shipped_at IS NULL` có thể không xuất hiện thành điều kiện tìm kiếm hay filter riêng: nó đã là quy tắc chọn row tham gia index.
+
+Trong lần kiểm chứng trên PostgreSQL 18.6, full index có `Index Only Scan` với cả hai điều kiện trong `Index Cond`, nhưng vẫn có node `Sort` ở phía trên. Partial index dùng `Index Cond: (tenant_id = 42)` và không cần `Sort`.
+
+Partial index chỉ có `tenant_id` đứng trước `created_at, id`; query cố định key đó bằng `= 42`. Nó không phải đi qua một key `shipped_at` ở giữa để nhận diện thứ tự. Đây là một lý do thực tế để kiểm tra partial index, ngoài lợi ích giảm kích thước.
+
+Kết quả này không biến tên index thành cam kết về plan cho mọi cấu hình. Hãy quan sát node `Sort` trên phiên bản bạn chạy, thay vì cho rằng hễ cột xuất hiện trong composite index là sort tự biến mất.
+
+Cửa hàng 42 trong dataset chỉ có 10 đơn chưa giao. Vì vậy `LIMIT 50` ở đây trả 10 row, không phải 50. Để quan sát dừng sớm khi có nhiều kết quả, bạn có thể tăng dữ liệu hoặc thay đổi cách sinh `NULL`; nhớ chạy lại `ANALYZE` và ghi rõ dataset đã đổi.
+
+### Thử Index Only Scan sau VACUUM
+
+Index partial đang có chứa đủ `id, created_at`. Dùng `VACUUM` để cập nhật thông tin visibility rồi kiểm tra lại:
+
+```sql title="lab-04-visibility.sql"
+VACUUM (ANALYZE) nullable_orders;
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
+SELECT id, created_at
+FROM nullable_orders
+WHERE tenant_id = 42 AND shipped_at IS NULL
+ORDER BY created_at, id
+LIMIT 50;
+
+SELECT attname, null_frac, n_distinct
+FROM pg_stats
+WHERE schemaname = (
+    SELECT nspname FROM pg_namespace WHERE oid = pg_my_temp_schema()
+  )
+  AND tablename = 'nullable_orders'
+  AND attname IN ('shipped_at', 'tenant_id');
+```
+
+Nếu plan là `Index Only Scan`, đọc thêm `Heap Fetches`. Giá trị 0 có nghĩa lần chạy đó không phải vào heap để kiểm tra row theo đường đọc này. Nó không đảm bảo mọi lần chạy sau cũng bằng 0 khi bảng tiếp tục được cập nhật.
+
+Bảng tạm không được autovacuum xử lý như bảng thường; lab chủ động chạy `ANALYZE` và `VACUUM`. Trên bảng ứng dụng, cần theo dõi autovacuum và workload thay vì đưa một lệnh `VACUUM` thủ công vào từng request.
+
+### Kiểm chứng kết quả trước khi so hiệu năng
+
+Cuối cùng, kiểm tra lại các tập row và một thay đổi nghiệp vụ:
+
+```sql title="lab-05-correctness.sql"
+SELECT count(*) AS tenant_42_unshipped
+FROM nullable_orders
+WHERE tenant_id = 42 AND shipped_at IS NULL;
+
+BEGIN;
+
+UPDATE nullable_orders
+SET shipped_at = TIMESTAMPTZ '2026-02-01 00:00:00+00'
+WHERE id = (
+  SELECT id
+  FROM nullable_orders
+  WHERE tenant_id = 42 AND shipped_at IS NULL
+  ORDER BY created_at, id
+  LIMIT 1
+);
+
+SELECT count(*) AS remaining_unshipped
+FROM nullable_orders
+WHERE tenant_id = 42 AND shipped_at IS NULL;
+
+ROLLBACK;
+
+SELECT count(*) AS restored_unshipped
+FROM nullable_orders
+WHERE tenant_id = 42 AND shipped_at IS NULL;
+```
+
+Ba kết quả đếm theo thứ tự là `10`, `9`, `10`. Trong transaction, đơn vừa giao không còn thỏa điều kiện queue. `ROLLBACK` phục hồi trạng thái trước đó.
+
+Database tự bảo trì index khi dữ liệu thay đổi; ứng dụng không xóa entry thủ công. Với PostgreSQL, việc loại bỏ vật lý entry cũ còn liên quan đến các phiên bản row và vacuum. “Không còn thuộc kết quả” không đồng nghĩa mọi byte cũ được thu hồi ngay.
+
+Kết thúc session sẽ xóa bảng tạm và các index của nó. Không cần chạy lệnh xóa schema hoặc bảng production để dọn lab.
+
+## Đọc EXPLAIN mà không nhầm dấu hiệu
+
+### Index Cond, Filter và các node đọc dữ liệu
+
+`EXPLAIN` hiển thị execution plan dự kiến. Thêm `ANALYZE` sẽ thực sự chạy câu lệnh và ghi số liệu thực tế.
+
+<Callout type="warn" title="ANALYZE trong EXPLAIN không phải mô phỏng">
+  `EXPLAIN ANALYZE UPDATE` thực sự cập nhật dữ liệu. Các ví dụ đo plan trong lab
+  chỉ dùng `SELECT`. Ngay cả `SELECT` lớn cũng tiêu thụ tài nguyên; đừng chạy
+  tùy tiện trên production chỉ để lấy một plan đẹp.
+</Callout>
+
+Các tên node và trường quan trọng:
+
+| Dấu hiệu | Cách đọc |
+| --- | --- |
+| `Seq Scan` | Đọc tuần tự bảng rồi áp dụng điều kiện |
+| `Index Scan` | Tìm qua index và đọc row ở heap |
+| `Bitmap Index Scan` + `Bitmap Heap Scan` | Gom vị trí row từ index, sau đó đọc các trang heap liên quan |
+| `Index Only Scan` | Có thể trả dữ liệu từ index; kiểm tra thêm `Heap Fetches` |
+| `Index Cond` | Điều kiện dùng để tìm hoặc giới hạn trong index |
+| `Filter` | Điều kiện được kiểm tra sau khi access path đã đưa ra các row ứng viên |
+| `Rows Removed by Filter` | Số row ứng viên bị loại ở bước filter đó |
+| `Sort` | Một bước sắp xếp riêng; kiểm tra số row và cách sort |
+
+Nếu index chỉ có `shipped_at`, `tenant_id = 42` có thể còn là `Filter`. Nếu chuyển sang composite phù hợp, điều kiện tenant có thể đi vào `Index Cond`, giúp giảm dữ liệu phải đọc trước khi lọc.
+
+Không có `Index Cond: shipped_at IS NULL` chưa đủ để kết luận index không hỗ trợ `NULL`. Với partial index, điều kiện này có thể đã được đảm bảo bởi toàn bộ tập index.
+
+### Ước lượng row, actual row và buffers
+
+Trong một plan, `rows=...` nằm ở phần cost là số row ước lượng. `actual rows=...` là số row thực tế trung bình trên mỗi lần thực thi node; cần đọc cùng `loops` nếu node chạy nhiều lần.
+
+Nếu ước lượng chỉ 10 row nhưng thực tế hàng trăm nghìn row, optimizer đang chọn trên một mô hình dữ liệu không sát thực tế. Hãy kiểm tra statistics, phân bố từng tenant và tham số query trước khi điều chỉnh chi phí planner.
+
+`BUFFERS` giúp quan sát các block dữ liệu được truy cập. Bảng tạm trong lab thường hiện `local hit/read`, còn bảng thường dùng `shared hit/read`. `hit` nghĩa là block đã có trong buffer của PostgreSQL; `read` không tự chứng minh một lần đọc đĩa vật lý vì hệ điều hành cũng có cache.
+
+Khi so hai phương án, giữ nguyên query, dữ liệu và cột trả về. Chạy nhiều lần với điều kiện đo có ghi nhận, rồi so lượng công việc và thời gian. Không dùng một lần chạy thứ hai nhanh hơn để kết luận index mới tốt hơn: lần đầu có thể vừa làm nóng cache.
+
+### Seq Scan không phải kết quả thất bại
+
+Nếu query lấy gần hết bảng, `Seq Scan` có thể là lựa chọn tốt. Mục tiêu là ít tài nguyên và latency phù hợp, không phải xuất hiện chữ `Index` trong plan.
+
+`SET enable_seqscan = off` chỉ nên là một thử nghiệm chẩn đoán có kiểm soát để xem đường index thay thế. Nó không chứng minh planner sai và không phải cách sửa mặc định cho ứng dụng. Với bài toán nullable, hãy kiểm tra tính đúng đắn của SQL, phạm vi dữ liệu và cấu trúc index trước.
+
+## UNIQUE và NULL là một hợp đồng riêng
+
+### PostgreSQL mặc định cho phép nhiều NULL
+
+Một hệ thống có thể cho phép nhiều người chưa khai báo email, nhưng không cho phép hai email đã khai báo trùng nhau:
+
+```sql
+CREATE TABLE optional_email_users (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email text UNIQUE
+);
+
+INSERT INTO optional_email_users (email) VALUES (NULL), (NULL);
+```
+
+Trong PostgreSQL, hai lần `NULL` được chấp nhận với `UNIQUE` mặc định. Hai giá trị text bằng nhau theo quy tắc so sánh của cột thì không.
+
+Đây là quy tắc uniqueness, không có nghĩa các row `NULL` vắng khỏi B-tree. Index có thể lưu entry `NULL` nhưng không coi chúng là xung đột theo cấu hình mặc định.
+
+Từ PostgreSQL 15, có thể yêu cầu coi `NULL` là trùng nhau bằng `NULLS NOT DISTINCT`:
+
+```sql
+CREATE TABLE one_unknown_email_users (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email text UNIQUE NULLS NOT DISTINCT
+);
+```
+
+Với cột unique đơn này, chỉ một row có `email IS NULL` được chấp nhận. Trước khi chọn cấu hình, xác định nghiệp vụ thật sự muốn nhiều người chưa khai báo hay chỉ một bản ghi chưa xác định.
+
+### Composite uniqueness và phạm vi tenant
+
+Với `UNIQUE (tenant_id, external_id)` mặc định của PostgreSQL, nhiều row `(42, NULL)` có thể cùng tồn tại. Muốn tối đa một `external_id` chưa xác định cho mỗi tenant, có thể dùng:
+
+```sql
+CREATE UNIQUE INDEX tenant_external_id_unique_idx
+ON external_records (tenant_id, external_id) NULLS NOT DISTINCT;
+```
+
+Giả sử `tenant_id` là `NOT NULL`, index này chặn hai row `(42, NULL)`, nhưng vẫn cho phép `(43, NULL)`. Tính trùng lặp xét trên cả bộ key, không phải “toàn bảng chỉ được một NULL ở bất cứ đâu”.
+
+Nếu muốn ràng buộc riêng nhóm chưa có external ID, một partial unique index trên `tenant_id` với `WHERE external_id IS NULL` cũng diễn đạt được quy tắc đó. Nhưng nó không tự bảo vệ uniqueness của các external ID đã có; cần thiết kế đầy đủ phần ràng buộc còn lại.
+
+### Unique chỉ áp dụng cho bản ghi chưa bị xóa mềm
+
+Một yêu cầu khác là email chỉ cần unique trong các tài khoản còn hoạt động. `deleted_at IS NULL` biểu thị chưa xóa mềm:
+
+```sql
+CREATE UNIQUE INDEX users_live_email_unique_idx
+ON users (tenant_id, email)
+WHERE deleted_at IS NULL AND email IS NOT NULL;
+```
+
+Index này vừa giới hạn tập được kiểm tra, vừa bảo vệ trùng email trong từng tenant. Nó cho phép tái sử dụng email của row đã xóa mềm. Nếu một tài khoản được khôi phục mà email đã thuộc một tài khoản đang hoạt động, thao tác khôi phục sẽ bị từ chối.
+
+Ví dụ giả định quy tắc chuẩn hóa và so sánh email đã được giải quyết. Nếu ứng dụng coi chữ hoa/chữ thường là như nhau, cần chọn kiểu dữ liệu, collation hoặc expression phù hợp; index text thông thường không tự thực hiện mọi quy tắc nghiệp vụ về email.
+
+Để database enforce uniqueness thay vì chỉ `SELECT` kiểm tra rồi mới `INSERT`. Hai transaction có thể cùng thấy “chưa có” trước khi ghi; unique index mới là lớp bảo vệ cuối cùng trước race condition đó.
+
+## Khác biệt giữa các database
+
+### Bảng đối chiếu theo đúng loại index
+
+Bảng sau nói về **B-tree thông thường** hoặc index rowstore tương ứng, không khái quát cho mọi loại index của từng hệ quản trị:
+
+| Hệ quản trị | Row có key NULL trong index thường | Unique một cột nullable mặc định | Index chỉ một tập con |
+| --- | --- | --- | --- |
+| PostgreSQL 18 | Có | Cho phép nhiều `NULL`; có tùy chọn `NULLS NOT DISTINCT` | Partial index với `WHERE` |
+| MySQL 8.4/InnoDB | Có | Cho phép nhiều `NULL` | Không có partial index `CREATE INDEX ... WHERE` như PostgreSQL |
+| SQL Server | Có | Unique key một cột cho phép tối đa một `NULL` | Filtered index với điều kiện được hỗ trợ |
+| Oracle Database 19c, B-tree thông thường | Không lưu row nếu mọi key đều `NULL` | Cho phép nhiều row có key đơn `NULL` | Không có cùng cú pháp partial index `WHERE`; có thể thiết kế function-based index cho một số nhu cầu |
+
+Khác biệt của Oracle thường là nguồn gốc của câu khẳng định “index không lưu NULL”. Câu đó không đúng nếu mang nguyên sang PostgreSQL hoặc MySQL.
+
+### MySQL hỗ trợ IS NULL nhưng không có partial index tương đương
+
+MySQL 8.4 có tối ưu tìm `IS NULL` trên cột được index. Với điều kiện như `col = value OR col IS NULL`, `EXPLAIN` có thể hiện access type `ref_or_null`.
+
+Với màn hình cửa hàng, điểm xuất phát có thể là full composite index:
+
+```sql
+CREATE INDEX orders_tenant_shipped_created_idx
+ON orders (tenant_id, shipped_at, created_at, id);
+```
+
+Đừng copy phần `WHERE shipped_at IS NULL` từ DDL PostgreSQL sang MySQL. Generated column và functional index có thể hỗ trợ biểu thức tìm kiếm trong một số thiết kế, nhưng không nên mô tả chúng như một partial index chỉ lưu tập con. Với InnoDB, index thông thường vẫn có entry cho key `NULL`.
+
+Secondary index của InnoDB cũng mang primary key để định vị row. Vì vậy, kích thước và lợi ích của việc khai báo thêm `id` phải xét theo primary key thực tế; không thể lấy số đo index của PostgreSQL làm số đo cho MySQL.
+
+### SQL Server cần chú ý filtered index và uniqueness
+
+Nếu muốn nhiều row chưa khai báo email nhưng các email đã có phải unique, SQL Server thường dùng filtered unique index:
+
+```sql
+CREATE UNIQUE INDEX users_present_email_unique_idx
+ON dbo.users (email)
+WHERE email IS NOT NULL;
+```
+
+Với queue chưa giao, có thể thử filtered index như sau:
+
+```sql
+CREATE INDEX orders_unshipped_queue_idx
+ON dbo.orders (tenant_id, created_at, id)
+INCLUDE (shipped_at)
+WHERE shipped_at IS NULL;
+```
+
+Microsoft có tài liệu về trường hợp filtered index dùng `IS NULL` không được chọn khi cột trong predicate không nằm trong cấu trúc index. Đưa `shipped_at` vào key hoặc `INCLUDE` là hướng xử lý được tài liệu đó nêu. Đây là lưu ý riêng của SQL Server, không phải yêu cầu cú pháp chung cho partial index PostgreSQL.
+
+### Oracle bỏ qua bộ key toàn NULL trong B-tree thông thường
+
+Với Oracle B-tree một cột `(shipped_at)`, những row có `shipped_at IS NULL` không có entry. Index đó một mình không thể liệt kê các đơn chưa giao.
+
+Nhưng với composite index `(tenant_id, shipped_at)`, nếu `tenant_id` được đảm bảo `NOT NULL`, toàn bộ bộ key không còn là toàn `NULL`. Những row có `shipped_at IS NULL` vẫn có thể có mặt trong index.
+
+Việc chúng có mặt mới chỉ giải quyết độ đầy đủ dữ liệu. Thứ tự key, điều kiện tenant và cost vẫn quyết định access path được chọn. Không nên thay “Oracle không index NULL” bằng một khẩu quyết ngược lại là “thêm cột NOT NULL thì mọi query IS NULL sẽ nhanh”.
+
+Bitmap index của Oracle có quy tắc khác và có thể chứa `NULL`. Nó không phải lựa chọn mặc định cho bảng OLTP cập nhật nhiều, tức bảng phục vụ giao dịch online thường xuyên. Hãy đối chiếu đúng loại index và workload.
+
+## Những cách tối ưu dễ làm sai bài toán
+
+### Thay NULL bằng sentinel chỉ để dùng index
+
+Thay `NULL` bằng `1970-01-01` làm timestamp giả trộn vào dữ liệu thật. Query thống kê theo thời gian có thể tính luôn các đơn chưa giao vào năm 1970. Unique constraint, sort và code ứng dụng cũng phải hiểu thêm một quy ước riêng.
+
+**Sentinel** là một giá trị đặc biệt được chọn để thay cho trạng thái khác, như `-1` thay cho “chưa có”. Chỉ dùng khi đó là hợp đồng dữ liệu có chủ đích và được bảo vệ bằng ràng buộc thích hợp. Với PostgreSQL đã hỗ trợ `IS NULL` trên B-tree, không có lý do đổi ý nghĩa dữ liệu chỉ để tránh chữ `NULL`.
+
+### Bọc cột bằng COALESCE mà không xét expression index
+
+Hai điều kiện sau không nhất thiết có cùng access path:
+
+```sql
+WHERE shipped_at IS NULL
+
+WHERE COALESCE(shipped_at, TIMESTAMPTZ '1970-01-01 00:00:00+00')
+    = TIMESTAMPTZ '1970-01-01 00:00:00+00'
+```
+
+Điều kiện thứ hai còn khớp cả timestamp thật đúng bằng mốc sentinel. Ngoài chuyện sai tập kết quả, index trên cột gốc không mặc nhiên là index trên biểu thức `COALESCE(...)`.
+
+Một biểu thức phù hợp có thể có expression index riêng, tức index trên kết quả biểu thức thay vì trực tiếp trên cột. Nhưng nếu mục tiêu chỉ là tìm row thiếu `shipped_at`, hãy giữ `IS NULL`: dễ đọc hơn và không đưa thêm giá trị giả vào logic.
+
+### Index riêng deleted_at khi phần lớn row chưa bị xóa
+
+Giả sử 99% tài khoản có `deleted_at IS NULL`. Một index riêng `(deleted_at)` không tự làm query lấy toàn bộ tài khoản đang hoạt động rẻ đi nhiều.
+
+Nếu query thật là tìm một email đang hoạt động trong tenant, index `(tenant_id, email) WHERE deleted_at IS NULL` có thể phù hợp hơn. Partial index khi đó bỏ lịch sử đã xóa và phục vụ đúng cách tìm kiếm; nó không hứa luôn nhỏ nếu gần hết row vẫn đang hoạt động.
+
+Chọn index từ query hoàn chỉnh và ý nghĩa tập con. Đừng chọn chỉ vì thấy một cột nullable xuất hiện trong mọi `WHERE`.
+
+## Đưa index vào hệ thống đang chạy
+
+### Cân bằng đường đọc với đường ghi
+
+Mỗi index là một cấu trúc cần bảo trì. Khi một đơn từ chưa giao sang đã giao, full index có key `shipped_at` phải phản ánh key thay đổi. Partial index queue phải phản ánh việc row rời khỏi tập chưa giao.
+
+Index nhỏ hơn không đồng nghĩa chi phí ghi bằng 0. PostgreSQL còn có WAL, tức log phục vụ độ bền và khôi phục dữ liệu, cùng các phiên bản row cũ cần được vacuum xử lý.
+
+Nếu thêm cột vào key hoặc `INCLUDE`, những lần update cột đó có thể phải cập nhật index. Với partial index, thay đổi cột dùng trong predicate cũng liên quan đến việc bảo trì tập thành viên. Vì vậy, hãy đo thêm latency ghi, dung lượng index và hoạt động vacuum, không chỉ latency đọc.
+
+### Tạo index và theo dõi rollout
+
+Trong PostgreSQL, `CREATE INDEX` thông thường có thể chặn ghi trong lúc build. Với bảng đang phục vụ traffic, xem xét `CREATE INDEX CONCURRENTLY` và đọc kỹ giới hạn vận hành:
+
+```sql
+CREATE INDEX CONCURRENTLY orders_unshipped_queue_idx
+ON orders (tenant_id, created_at, id)
+WHERE shipped_at IS NULL;
+```
+
+Lệnh này không được chạy trong transaction block. Nó giảm việc chặn ghi theo cách build thông thường, nhưng vẫn tiêu tốn I/O, CPU, có các giai đoạn chờ và có thể để lại index không hợp lệ nếu build thất bại. “Concurrently” không có nghĩa miễn phí hoặc không cần giám sát.
+
+Một rollout có thể đi theo các bước:
+
+1. Xác nhận query và bind parameters thật từ ứng dụng. Ghi nhận latency, tần suất gọi và số row trả về trước thay đổi.
+2. Kiểm tra statistics và tỷ lệ `NULL` theo nhóm quan trọng, không chỉ trung bình toàn bảng.
+3. Chọn một candidate index, kiểm chứng trên dữ liệu đại diện và dự trù dung lượng build.
+4. Tạo index trong cửa sổ vận hành phù hợp. Theo dõi tải, thời gian chờ và trạng thái hợp lệ của index.
+5. So plan và số liệu đọc/ghi sau thay đổi. Chỉ xóa index cũ khi đã kiểm tra các query khác phụ thuộc nó.
+
+Đừng xóa một unique index chỉ vì ít lượt scan. Nó có thể đang bảo vệ ràng buộc dữ liệu ngay cả khi không phục vụ đường đọc nào nổi bật.
+
+## Checklist chọn phương án
+
+Trước khi viết DDL, hãy ghi lại câu SQL thật và trả lời lần lượt:
+
+- [ ] `NULL` trong mô hình này có một ý nghĩa rõ ràng; không bị trộn với nhiều trạng thái cần phân biệt.
+- [ ] Query dùng `IS NULL`/`IS NOT NULL` đúng ý, và không vô tình loại row qua `NOT IN` hoặc phủ định.
+- [ ] Đã xác định database, phiên bản và loại index; không áp quy tắc Oracle cho PostgreSQL hoặc ngược lại.
+- [ ] Đã biết nhóm cần tìm hiếm hay phổ biến, bao gồm phân bố theo tenant quan trọng.
+- [ ] Candidate index xét cả bộ lọc, cột trả về, `ORDER BY` và `LIMIT`.
+- [ ] Nếu dùng partial/filtered index, SQL thật cho phép planner nhận ra query thuộc tập được index.
+- [ ] Nếu cần uniqueness, quy tắc với `NULL`, tenant và xóa mềm đã được diễn đạt bằng constraint/index phù hợp.
+- [ ] Kết quả truy vấn đúng trước khi so tốc độ; plan được đọc cùng actual rows, loops và buffers.
+- [ ] Lợi ích đọc đủ lớn so với dung lượng, chi phí ghi và rủi ro rollout.
+
+Với truy vấn đơn chưa giao của bài này, điểm bắt đầu hợp lý trên PostgreSQL là thử `(tenant_id, created_at, id) WHERE shipped_at IS NULL`. Giữ hoặc đổi phương án dựa trên query thực tế và số liệu, không dựa trên việc cột nullable tự nó “tốt” hay “xấu”.
+
+## Tài liệu chính thức và bài liên quan
+
+### Nguồn đối chiếu
+
+- [PostgreSQL 18 — Index Types](https://www.postgresql.org/docs/18/indexes-types.html): B-tree và các điều kiện tìm kiếm, bao gồm `IS NULL`/`IS NOT NULL`.
+- [PostgreSQL 18 — Multicolumn Indexes](https://www.postgresql.org/docs/18/indexes-multicolumn.html) và [Indexes and ORDER BY](https://www.postgresql.org/docs/18/indexes-ordering.html): thứ tự key, skip scan và thứ tự `NULL`.
+- [PostgreSQL 18 — Partial Indexes](https://www.postgresql.org/docs/18/indexes-partial.html): predicate, điều kiện query và giới hạn nhận diện khi lập plan.
+- [PostgreSQL 18 — Index-Only Scans and Covering Indexes](https://www.postgresql.org/docs/18/indexes-index-only-scans.html): `INCLUDE`, visibility map và đọc heap.
+- [PostgreSQL 18 — Unique Indexes](https://www.postgresql.org/docs/18/indexes-unique.html): uniqueness mặc định và `NULLS NOT DISTINCT`.
+- [PostgreSQL 18 — Using EXPLAIN](https://www.postgresql.org/docs/18/using-explain.html) và [CREATE INDEX](https://www.postgresql.org/docs/18/sql-createindex.html): cách đọc plan và build concurrent.
+- [MySQL 8.4 — IS NULL Optimization](https://dev.mysql.com/doc/refman/8.4/en/is-null-optimization.html) và [CREATE INDEX](https://dev.mysql.com/doc/refman/8.4/en/create-index.html).
+- [SQL Server — Unique constraints](https://learn.microsoft.com/en-us/sql/relational-databases/tables/unique-constraints-and-check-constraints) và [filtered index với IS NULL](https://learn.microsoft.com/en-us/troubleshoot/sql/database-engine/performance/filtered-index-with-column-is-null).
+- [Oracle Database 19c — Optimizer Access Paths](https://docs.oracle.com/en/database/oracle/oracle-database/19/tgsql/optimizer-access-paths.html): B-tree, bitmap và giới hạn của key toàn `NULL`.
+
+### Đọc tiếp
+
+<Cards>
+  <Card title="Optimistic và pessimistic locking" href="/database/03-optimistic-vs-pessimistic-locking/" description="Index giúp tìm row; locking và kiểm tra version giúp cập nhật đúng khi có nhiều transaction." />
+  <Card title="Long-running transaction" href="/database/05-long-running-transaction/" description="Hiểu chi phí giữ transaction lâu và tác động lên hệ thống dữ liệu." />
+</Cards>

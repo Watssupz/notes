@@ -1,0 +1,710 @@
+---
+title: "SharedWorker và WebSocket: một connection owner cho nhiều tab"
+description: "Thiết kế một SharedWorker sở hữu WebSocket dùng chung cho nhiều tab: routing subscription, authentication, reconnect, backpressure, lifecycle và fallback an toàn."
+---
+
+Một người dùng mở nhiều tab của cùng ứng dụng có thể tạo nhiều WebSocket connections nhận cùng dữ liệu. Server phải serialize và gửi lại payload, còn mỗi tab có thêm một vòng reconnect. Nếu chi phí đó đáng kể, bạn có thể dùng SharedWorker để một nơi sở hữu connection và định tuyến event tới các tab cần nó.
+
+Bài này đi từ topology và message protocol đến subscription, authentication, reconnect và fallback. Một connection chỉ được chia sẻ trong phạm vi các context thật sự dùng chung worker instance; đây không phải một socket toàn cầu cho mọi browser, profile hay thiết bị của cùng user.
+
+<Callout type="info" title="Kiến thức nền và cách đọc">
+Bạn cần biết JavaScript modules, event handlers và WebSocket cơ bản. **MessagePort** là đầu giao tiếp giữa một tab và worker. **Subscription** là đăng ký quan tâm tới một topic. Đọc cơ chế trước, sau đó chạy lab cục bộ để quan sát; server lab không phải hệ thống đăng nhập/phân quyền production.
+</Callout>
+
+## Mục lục
+
+- [Chạy lab và mở source đầy đủ](#chạy-lab-và-mở-source-đầy-đủ)
+- [Vấn đề thực tế: 10 tab tạo 10 physical connections](#vấn-đề-thực-tế-10-tab-tạo-10-physical-connections)
+- [Worker instance, MessagePort và phạm vi chia sẻ](#worker-instance-messageport-và-phạm-vi-chia-sẻ)
+- [Phân biệt các worker và BroadcastChannel](#phân-biệt-các-worker-và-broadcastchannel)
+- [Protocol tab ↔ worker ↔ server](#protocol-tab--worker--server)
+  - [Message từ tab sang worker](#message-từ-tab-sang-worker)
+  - [Message từ worker về tab](#message-từ-worker-về-tab)
+  - [Message giữa worker và realtime server](#message-giữa-worker-và-realtime-server)
+- [Code phía tab](#code-phía-tab)
+- [Code SharedWorker: một socket, nhiều clients](#code-sharedworker-một-socket-nhiều-clients)
+- [Subscription routing: ref-count thay vì unsubscribe mù](#subscription-routing-ref-count-thay-vì-unsubscribe-mù)
+- [Authentication: đừng nhét access token dài hạn vào URL](#authentication-đừng-nhét-access-token-dài-hạn-vào-url)
+- [Reconnect đúng: backoff, jitter và state recovery](#reconnect-đúng-backoff-jitter-và-state-recovery)
+- [Lifecycle tab và worker: `unload` không phải cleanup contract](#lifecycle-tab-và-worker-unload-không-phải-cleanup-contract)
+- [Backpressure và slow consumers](#backpressure-và-slow-consumers)
+- [Ordering, duplicate và gap](#ordering-duplicate-và-gap)
+- [Browser support và fallback](#browser-support-và-fallback)
+- [Security boundaries](#security-boundaries)
+- [Observability: chứng minh rằng việc share thực sự hoạt động](#observability-chứng-minh-rằng-việc-share-thực-sự-hoạt-động)
+- [Test plan cho nhiều tabs và failure modes](#test-plan-cho-nhiều-tabs-và-failure-modes)
+  - [Functional](#functional)
+  - [Failure](#failure)
+  - [Security và load](#security-và-load)
+- [Những trường hợp nên giữ kiến trúc đơn giản hơn](#những-trường-hợp-nên-giữ-kiến-trúc-đơn-giản-hơn)
+- [Identity và rollout của worker](#identity-và-rollout-của-worker)
+- [Tài liệu chính thức](#tài-liệu-chính-thức)
+- [Bài liên quan](#bài-liên-quan)
+
+## Chạy lab và mở source đầy đủ
+
+<SourceRef project="shared-worker-websocket" file="src/connection-manager.ts" variant="button">Mở source · SharedWorker, client và WebSocket server</SourceRef>
+
+Từ thư mục gốc repository tài liệu:
+
+```bash
+cd examples/shared-worker-websocket
+npm install
+npm run dev
+```
+
+Mở `http://127.0.0.1:5175/` trong hai tab cùng browser profile. Chọn `orders` ở tab A và `notifications` ở tab B, rồi publish message. Endpoint `/api/demo/metrics` cho biết số **business WebSocket** và hợp subscription; dev còn có socket HMR của Vite nên không đếm mọi dòng WS trong Network là connection realtime.
+
+Để quan sát production output không có HMR:
+
+```bash
+npm run build
+npm run preview
+```
+
+Dừng dev server trước vì preview cũng dùng cổng 5175. Thêm `?mode=dedicated` để thử fallback: mỗi tab có một dedicated worker và một WebSocket riêng.
+
+| Muốn đọc phần nào? | File |
+| --- | --- |
+| Commands, dependencies và build | <SourceRef project="shared-worker-websocket" file="package.json">package.json</SourceRef>, <SourceRef project="shared-worker-websocket" file="vite.config.ts">vite.config.ts</SourceRef> |
+| Tách type checking DOM và WebWorker | <SourceRef project="shared-worker-websocket" file="tsconfig.json">tsconfig.json</SourceRef>, <SourceRef project="shared-worker-websocket" file="tsconfig.worker.json">tsconfig.worker.json</SourceRef> |
+| Wrapper phía tab | <SourceRef project="shared-worker-websocket" file="src/realtime-client.ts">realtime-client.ts</SourceRef> |
+| Entry worker và manager | <SourceRef project="shared-worker-websocket" file="src/realtime.shared-worker.ts">realtime.shared-worker.ts</SourceRef>, <SourceRef project="shared-worker-websocket" file="src/connection-manager.ts">connection-manager.ts</SourceRef> |
+| Ticket, snapshot, replay và metrics local | <SourceRef project="shared-worker-websocket" file="server.mjs">server.mjs</SourceRef> |
+| UI để mở nhiều tab | <SourceRef project="shared-worker-websocket" file="src/main.ts">main.ts</SourceRef>, <SourceRef project="shared-worker-websocket" file="index.html">index.html</SourceRef> |
+
+> [!WARNING]
+> Backend lab chỉ dùng một identity giả lập, ticket dùng một lần và history trong RAM. Nó kiểm tra Origin và topic demo, **không triển khai đăng nhập/phân quyền production**. Không deploy nguyên server này để bảo vệ dữ liệu thật. UI minh họa state mới nhất; event dạng delta cần policy buffer/replay và snapshot reconciliation chặt hơn.
+
+
+## Vấn đề thực tế: 10 tab tạo 10 physical connections
+
+Cách đơn giản nhất là để mỗi tab tự mở socket:
+
+```ts
+const socket = new WebSocket("wss://api.example.com/realtime");
+```
+
+Nó đúng về chức năng, nhưng chi phí tăng theo số tab:
+
+```txt
+1 user × 10 tabs = 10 WebSocket connections
+10 tabs subscribe "orders" = cùng event được server serialize và gửi 10 lần
+10 tabs mất mạng = 10 reconnect loops cùng chạy
+```
+
+Server phải giữ thêm file descriptor, session state, heartbeat và outbound buffer. Client cũng parse cùng payload nhiều lần. **Jitter** là việc thêm một khoảng ngẫu nhiên vào thời gian chờ reconnect. Nếu không có jitter, hàng nghìn tab có thể cùng reconnect đúng giây thứ 1, 2, 4, 8 và đồng loạt dồn tải lên server — hiện tượng này gọi là **reconnect storm**.
+
+Mục tiêu của SharedWorker là đổi topology thành:
+
+```d2 title="1. Vấn đề thực tế: 10 tab tạo 10 physical connections"
+direction: right
+T1: "Tab 1: orders"
+SW: "SharedWorker\nconnection manager"
+T2: "Tab 2: notifications"
+T3: "Tab 3: orders + chat"
+WS: "Realtime Gateway"
+T1 <-> SW: "MessagePort"
+T2 <-> SW: "MessagePort"
+T3 <-> SW: "MessagePort"
+SW <-> WS: "1 WebSocket"
+```
+
+Worker không chỉ “giữ socket hộ”. Nó trở thành một broker nhỏ trong browser với bốn trách nhiệm:
+
+1. Quản lý các tab đang kết nối.
+2. Hợp nhất và định tuyến subscription.
+3. Quản lý lifecycle của WebSocket.
+4. Chuẩn hóa authentication, retry và observability.
+
+> [!IMPORTANT]
+> “Một WebSocket” ở đây nghĩa là **một socket trên mỗi SharedWorker instance**. Khác origin, browser profile, private mode, thiết bị hoặc phiên worker khác vẫn tạo socket riêng.
+
+---
+
+## Worker instance, MessagePort và phạm vi chia sẻ
+
+`SharedWorker` là worker có thể được nhiều window, tab hoặc iframe truy cập nếu các context đó có **cùng origin chính xác**: scheme + host + port.
+
+Mỗi tab tạo cùng worker:
+
+```ts
+const worker = new SharedWorker("/workers/realtime.shared-worker.js", {
+  name: "realtime-v1",
+  type: "module",
+});
+```
+
+Tab không giao tiếp qua `worker.postMessage()` như `DedicatedWorker`. Nó dùng `worker.port`:
+
+```ts
+worker.port.start();
+worker.port.postMessage({ type: "REGISTER", clientId: crypto.randomUUID() });
+```
+
+Phía worker nhận mỗi tab trong event `connect`:
+
+```ts
+self.onconnect = (event: MessageEvent) => {
+  const port = event.ports[0];
+  port.start();
+
+  port.onmessage = (message) => {
+    console.log("Message từ một tab", message.data);
+  };
+};
+```
+
+Các tab dùng chung worker khi identity của worker match. Trong thực tế nên kiểm soát cả **script URL** và **name**. Khi deploy protocol mới không tương thích, đổi version có chủ đích:
+
+```ts
+new SharedWorker("/workers/realtime.v2.js", {
+  name: "realtime-v2",
+  type: "module",
+});
+```
+
+Trong một khoảng rollout, tab cũ và tab mới có thể giữ hai workers, tức hai sockets. Đây là trạng thái chuyển tiếp chấp nhận được; đừng cố ép hai version không tương thích dùng chung một worker.
+
+---
+
+## Phân biệt các worker và BroadcastChannel
+
+| Phương án | Ai sở hữu WebSocket? | Ưu điểm | Rủi ro / khi không nên dùng |
+| --- | --- | --- | --- |
+| Mỗi tab một socket | Từng tab | Đơn giản nhất, support rộng | N connections/user, event và reconnect bị nhân bản |
+| `SharedWorker` | Worker dùng chung | Single owner tự nhiên, state tập trung | Same-origin; browser cũ/WebView cần fallback |
+| `BroadcastChannel` + leader election | Một tab được bầu leader | Support rộng hơn trong nhiều môi trường | Split-brain, race khi leader chết, tab leader có thể bị freeze |
+| `ServiceWorker` | Service worker | Có thể nhận push/background event | Lifecycle event-driven; browser có thể terminate, không phù hợp giữ socket lâu dài |
+| Backend fan-out khác | Server/gateway | Client đơn giản | Không giải quyết số connections do nhiều tab tự mở |
+
+`BroadcastChannel` chỉ truyền message giữa tabs. Nó **không tự chọn leader** và không tự sở hữu WebSocket. Muốn dùng nó làm fallback một socket, bạn còn phải giải quyết lock, lease, fencing token và chuyển leader.
+
+`ServiceWorker` cũng không phải bản nâng cấp của SharedWorker. Service worker được tối ưu cho fetch interception, cache, push và background events. Browser được quyền dừng nó khi event kết thúc, nên một WebSocket dài hạn đặt ở đó không có lifecycle đáng tin cậy.
+
+> [!TIP]
+> Fallback tốt đầu tiên thường là **mỗi tab một socket**. Nó tốn tài nguyên hơn nhưng dễ giữ correctness. Chỉ xây leader election khi metric chứng minh connection cost đáng để đổi lấy độ phức tạp đó.
+
+---
+
+## Protocol tab ↔ worker ↔ server
+
+Không gửi object tùy ý rồi xử lý bằng nhiều `if` rời rạc. Hãy version hóa một protocol nhỏ.
+
+### Message từ tab sang worker
+
+```ts
+type TabToWorker =
+  | { type: "REGISTER"; clientId: string; protocolVersion: 1 }
+  | { type: "HEARTBEAT"; clientId: string }
+  | { type: "SUBSCRIBE"; clientId: string; topic: string }
+  | { type: "UNSUBSCRIBE"; clientId: string; topic: string }
+  | {
+      type: "COMMAND";
+      clientId: string;
+      requestId: string;
+      idempotencyKey: string;
+      payload: unknown;
+    }
+  | { type: "AUTH_CHANGED"; clientId: string }
+  | { type: "DISCONNECT"; clientId: string };
+```
+
+### Message từ worker về tab
+
+```ts
+type WorkerToTab =
+  | { type: "STATUS"; state: "connecting" | "open" | "closed" }
+  | { type: "EVENT"; topic: string; eventId: string; sequence: number; payload: unknown }
+  | { type: "COMMAND_REJECTED"; requestId: string; reason: string }
+  | { type: "AUTH_REQUIRED" }
+  | { type: "RESYNC_REQUIRED"; topic: string };
+```
+
+### Message giữa worker và realtime server
+
+```ts
+type ClientToServer =
+  | { type: "sync_subscriptions"; topics: string[]; resumeFrom: Record<string, number> }
+  | { type: "command"; requestId: string; idempotencyKey: string; payload: unknown };
+
+type ServerToClient =
+  | { type: "event"; topic: string; eventId: string; sequence: number; payload: unknown }
+  | { type: "resync_required"; topic: string }
+  | { type: "heartbeat"; serverTime: string };
+```
+
+Dùng `sync_subscriptions` chứa toàn bộ tập topic thường dễ làm idempotent hơn một chuỗi `subscribe/unsubscribe` delta. Sau reconnect, worker chỉ cần gửi lại snapshot hiện tại.
+
+Luồng chính:
+
+```d2 title="Message giữa worker và realtime server"
+shape: sequence_diagram
+A: "Tab A"
+B: "Tab B"
+W: "SharedWorker"
+S: "Realtime Server"
+A -> W: "REGISTER + SUBSCRIBE orders"
+W -> S: "mở WebSocket"
+W -> S: "sync_subscriptions [orders]"
+B -> W: "REGISTER + SUBSCRIBE notifications"
+W -> S: "sync_subscriptions [orders, notifications]"
+S -> W: "event topic=orders seq=42" {style.stroke-dash: 4}
+W -> A: "EVENT orders seq=42" {style.stroke-dash: 4}
+W."Tab B không subscribe orders nên không nhận"
+B -> W: "DISCONNECT"
+W -> S: "sync_subscriptions [orders]"
+```
+
+---
+
+## Code phía tab
+
+Một wrapper nhỏ giúp component không biết chi tiết `MessagePort`:
+
+Code đầy đủ ở <SourceRef project="shared-worker-websocket" file="src/realtime-client.ts">realtime-client.ts</SourceRef>. Giữ API sử dụng ngắn trong bài:
+
+```ts
+const client = new SharedRealtimeClient();
+const unsubscribe = client.subscribe('orders', (event) => console.log(event));
+// Khi không còn cần: unsubscribe(); client.close();
+```
+
+Các phần cần đối chiếu:
+
+- <SourceRef project="shared-worker-websocket" file="src/realtime-client.ts" region="transport">Transport</SourceRef>: chọn SharedWorker khi dùng được, dedicated worker khi cần fallback.
+- <SourceRef project="shared-worker-websocket" file="src/realtime-client.ts" region="subscriptions">Subscriptions</SourceRef>: ref-count listeners trong tab; không unsubscribe topic khi vẫn còn listener khác.
+- <SourceRef project="shared-worker-websocket" file="src/realtime-client.ts" region="lifecycle">Lifecycle</SourceRef>: heartbeat, pageshow/register, pagehide/BFCache và close idempotent; gỡ listeners khi đóng.
+- <SourceRef project="shared-worker-websocket" file="src/realtime-client.ts" region="snapshot">Snapshot</SourceRef>: tab mới lấy state hiện tại, bỏ snapshot cũ hơn event đã nhận và không giữ response sau khi client đóng.
+
+
+Nếu worker được đặt thẳng trong thư mục static thay vì đi qua bundler, dùng URL ổn định:
+
+```ts
+new SharedWorker("/workers/realtime.shared-worker.js", {
+  name: "realtime-v1",
+  type: "module",
+});
+```
+
+Không tạo một `SharedRealtimeClient` mới sau mỗi React render. Hãy đặt nó trong module singleton, context provider hoặc lifecycle của application shell.
+
+---
+
+## Code SharedWorker: một socket, nhiều clients
+
+Ví dụ sau tập trung vào các invariant production quan trọng:
+
+- Chỉ worker tạo `WebSocket`.
+- Mỗi tab có tập topics riêng.
+- Worker sync hợp của topics lên server.
+- Client stale bị cleanup bằng lease.
+- Reconnect có backoff + jitter.
+- Command không bị queue vô hạn khi offline.
+- `bufferedAmount` được giới hạn.
+
+Entry SharedWorker trong <SourceRef project="shared-worker-websocket" file="src/realtime.shared-worker.ts">source thật</SourceRef> rất ngắn:
+
+```ts
+import { connectPort } from './connection-manager';
+const scope = self as unknown as SharedWorkerGlobalScope;
+scope.onconnect = (event: MessageEvent) => connectPort(event.ports[0]);
+```
+
+Phần quản lý connection đã tách vào <SourceRef project="shared-worker-websocket" file="src/connection-manager.ts">connection-manager.ts</SourceRef>, không trải hàng trăm dòng trong bài:
+
+| Trách nhiệm | Mở đúng vùng code |
+| --- | --- |
+| Gắn mỗi port với một logical client | <SourceRef project="shared-worker-websocket" file="src/connection-manager.ts" region="clients">connectPort</SourceRef> |
+| Chỉ mở một socket/ticket attempt trong worker | <SourceRef project="shared-worker-websocket" file="src/connection-manager.ts" region="connect">ensureSocket/openSocket</SourceRef> |
+| Bỏ response thuộc auth generation cũ | <SourceRef project="shared-worker-websocket" file="src/connection-manager.ts" region="auth">resetAuthentication</SourceRef> |
+| Backoff và jitter | <SourceRef project="shared-worker-websocket" file="src/connection-manager.ts" region="reconnect">scheduleReconnect</SourceRef> |
+| Hợp subscription của các tab | <SourceRef project="shared-worker-websocket" file="src/connection-manager.ts" region="subscriptions">syncSubscriptions</SourceRef> |
+| Dedupe sequence, báo gap và route event | <SourceRef project="shared-worker-websocket" file="src/connection-manager.ts" region="events">handleServerMessage</SourceRef> |
+| Reject command khi offline/backpressure | <SourceRef project="shared-worker-websocket" file="src/connection-manager.ts" region="commands">forwardCommand</SourceRef> |
+
+Module này có một instance trong mỗi worker. SharedWorker dùng chung instance giữa các tab; fallback dedicated worker dùng instance riêng cho từng tab, nên **không còn bảo đảm một physical socket cho nhiều tab**.
+
+
+Lab có server và UI để chạy thử, nhưng connection manager vẫn không phải thư viện production drop-in. Production code cần schema validation chặt hơn cho cả hai chiều, giới hạn payload, logging đã redact, test protocol compatibility và policy cụ thể cho từng close code.
+
+---
+
+## Subscription routing: ref-count thay vì unsubscribe mù
+
+Giả sử:
+
+```txt
+Tab A subscribe orders
+Tab B subscribe orders
+Tab C subscribe notifications
+```
+
+Worker phải gửi server:
+
+```json
+{
+  "type": "sync_subscriptions",
+  "topics": ["orders", "notifications"]
+}
+```
+
+Nếu Tab A đóng, topic `orders` vẫn còn vì Tab B đang dùng. Chỉ khi client cuối cùng bỏ topic đó thì worker mới loại nó khỏi snapshot.
+
+Có hai cách lưu state:
+
+| Cách | Cấu trúc | Phù hợp khi |
+| --- | --- | --- |
+| Theo client | `clientId -> Set<topic>` | Dễ cleanup toàn bộ state khi tab chết |
+| Theo topic | `topic -> Set<clientId>` | Dễ route event và tính ref-count |
+
+Hệ thống nhỏ có thể lưu theo client rồi iterate như code trên. Nếu có hàng nghìn subscriptions trong một browser session, giữ cả hai index và cập nhật chúng atomically trong một function.
+
+Không cho client tùy ý subscribe topic nhạy cảm như `user:123` rồi tin rằng frontend đã phân quyền. Worker chỉ là code phía client và có thể bị sửa. Realtime server phải authorize từng topic dựa trên identity của socket.
+
+---
+
+## Authentication: đừng nhét access token dài hạn vào URL
+
+Browser `WebSocket` constructor không cho JavaScript tùy ý đặt header `Authorization`. Các lựa chọn thường gặp:
+
+| Cách | Ưu điểm | Rủi ro / lưu ý |
+| --- | --- | --- |
+| Session cookie `HttpOnly` | Token không lộ cho JavaScript | Cần chống Cross-Site WebSocket Hijacking và validate `Origin` |
+| Short-lived WebSocket ticket | Giảm blast radius nếu URL bị log | Cần HTTPS endpoint cấp ticket, one-time use, TTL ngắn |
+| Token trong query string | Dễ làm | URL có thể vào access log, proxy, tracing và error report |
+| Token trong subprotocol | Có thể truyền khi handshake | Dễ lạm dụng semantics và vẫn có thể xuất hiện trong log/header |
+| Message `authenticate` sau connect | URL sạch | Socket tồn tại unauthenticated; phải timeout và chặn mọi command trước auth |
+
+Flow khuyến nghị cho ứng dụng web dùng session cookie:
+
+```d2 title="8. Authentication: đừng nhét access token dài hạn vào URL"
+shape: sequence_diagram
+W: "SharedWorker"
+H: "HTTPS API"
+R: "Realtime Gateway"
+W -> H: "POST /api/realtime/ticket + HttpOnly cookie"
+H -> W: "one-time ticket, TTL 30s" {style.stroke-dash: 4}
+W -> R: "WSS handshake ?ticket=..."
+R -> R: "consume ticket + validate Origin"
+R -> W: "101 Switching Protocols" {style.stroke-dash: 4}
+```
+
+Ticket xuất hiện trong URL nhưng chỉ dùng một lần, hết hạn rất nhanh và phải được redact khỏi log. Không đưa refresh token hoặc access token sống hàng giờ vào query string.
+
+WebSocket handshake không dùng CORS preflight và không dựa vào `Access-Control-Allow-Origin` như `fetch`. Tuy nhiên browser vẫn gửi `Origin`; server phải exact-match origin tin cậy. Đây là điểm liên quan nhưng khác với [CORS và Same-Origin Policy](/web/01-cors).
+
+> [!WARNING]
+> Cookie được browser tự gắn vào WebSocket handshake. Nếu server không kiểm tra `Origin`, một website độc hại có thể mở socket tới domain của bạn bằng session cookie của nạn nhân. CORS allowlist của API HTTP không tự bảo vệ WebSocket endpoint.
+
+Khi user logout hoặc switch account, mọi tab và worker phải thống nhất identity mới:
+
+1. Tab hoàn tất logout qua HTTPS.
+2. Tab gửi `AUTH_CHANGED` cho SharedWorker.
+3. Worker đóng socket cũ.
+4. Worker không reuse subscription/sequence thuộc identity cũ nếu authorization scope đã thay đổi.
+5. Sau login mới, worker lấy ticket mới và resync dữ liệu từ server.
+
+---
+
+## Reconnect đúng: backoff, jitter và state recovery
+
+Flow reconnect nên là:
+
+```d2 title="9. Reconnect đúng: backoff, jitter và state recovery"
+direction: down
+C: "Socket close bất thường"
+A: "Còn tab active?" {shape: diamond}
+S: "Không reconnect"
+B: "Backoff lũy thừa + jitter"
+T: "Lấy ticket mới"
+O: "Mở WebSocket"
+R: "Sync subscriptions + sequence cuối"
+G: "Server resume được?" {shape: diamond}
+E: "Phát các event còn thiếu"
+F: "RESYNC_REQUIRED → fetch snapshot"
+C -> A
+A -> S: "Không"
+A -> B: "Có"
+B -> T
+T -> O
+O -> R
+R -> G
+G -> E: "Có"
+G -> F: "Không"
+```
+
+Không reconnect ngay lập tức trong vòng lặp. Công thức đơn giản:
+
+```ts
+const exponential = Math.min(1_000 * 2 ** attempt, 30_000);
+const delay = exponential * (0.5 + Math.random());
+```
+
+Jitter làm các browser không đồng loạt reconnect tại giây thứ 1, 2, 4, 8. Server restart code `1012` hoặc overload code `1013` thường là tín hiệu retry; auth failure thì cần dừng và yêu cầu login thay vì retry vô hạn.
+
+Mở lại socket chưa đủ. Worker phải phục hồi:
+
+- Tập subscription hiện tại.
+- Sequence/event ID cuối đã xử lý theo topic.
+- Snapshot mới nếu retention window không đủ để replay.
+- Pending command theo policy rõ ràng.
+
+Không queue mọi command trong RAM rồi gửi lại sau reconnect. Nếu command như “đặt hàng” đã tới server nhưng ACK bị mất, replay mù có thể tạo hai đơn. Caller phải gửi `idempotencyKey`; server deduplicate trong transaction với business mutation. Đây là cùng nguyên tắc delivery bất định được phân tích trong [Webhook Delivery System](/system-design/05-webhook-delivery-system).
+
+---
+
+## Lifecycle tab và worker: `unload` không phải cleanup contract
+
+SharedWorker còn sống khi vẫn có page/iframe/worker giữ tham chiếu. Khi không còn reference, browser có thể shutdown worker. Browser cũng có quyền tối ưu lifecycle khi điều hướng.
+
+Ba hệ quả:
+
+1. Không lưu state duy nhất trong RAM của worker nếu không thể khôi phục.
+2. Không giả định worker chạy khi mọi tab đã đóng.
+3. Không phụ thuộc riêng vào `beforeunload`/`unload` để decrement subscription.
+
+Tab có thể crash, process có thể bị kill, laptop sleep hoặc page bị freeze mà không gửi `DISCONNECT`. Vì worker đang giữ `MessagePort` trong map, cần một cơ chế lease để tránh client ma giữ socket sống mãi.
+
+Lease trong ví dụ dùng heartbeat 30 giây và TTL 5 phút. Các con số này không phải magic number. Background timer có thể bị throttled; TTL quá ngắn sẽ xóa nhầm tab bị freeze. Khi tab trở lại qua `pageshow`, nó phải REGISTER và subscribe lại, sau đó fetch snapshot nếu cần.
+
+Nếu yêu cầu là “nhận notification dù tất cả tabs đã đóng”, SharedWorker sai công cụ. Dùng Web Push + Service Worker, rồi kết nối realtime lại khi người dùng mở app.
+
+---
+
+## Backpressure và slow consumers
+
+WebSocket API truyền thống không có backpressure tự động. Nếu server gửi nhanh hơn worker và tabs xử lý, memory hoặc CPU có thể tăng không giới hạn.
+
+Ở chiều gửi, theo dõi:
+
+```ts
+socket.bufferedAmount
+```
+
+Nếu vượt threshold:
+
+- Reject command mới với lỗi retryable.
+- Không tiếp tục append vào một queue RAM vô hạn.
+- Ghi metric và đóng socket nếu protocol đã mất kiểm soát.
+
+Ở chiều nhận:
+
+- Giới hạn kích thước frame/message ở gateway.
+- Batch các update có thể gộp, ví dụ presence hoặc price ticker.
+- Coalesce theo entity: chỉ giữ trạng thái mới nhất nếu intermediate state không có giá trị.
+- Không gửi payload lớn tới tab không subscribe.
+- Dùng snapshot + cursor cho stream lớn thay vì replay vô hạn qua socket.
+
+Một socket dùng chung giảm connection count nhưng cũng tạo shared fate: một topic spam có thể làm chậm notifications của mọi tab. Server cần quota theo topic/tenant và worker cần đo message rate theo loại event.
+
+---
+
+## Ordering, duplicate và gap
+
+WebSocket giữ thứ tự message trên **một connection**, nhưng reconnect tạo một connection mới. Nó không tự bảo đảm end-to-end exactly-once.
+
+Mỗi event nên có:
+
+```json
+{
+  "eventId": "evt_01J...",
+  "topic": "orders",
+  "sequence": 42,
+  "payload": {}
+}
+```
+
+Client xử lý theo rule:
+
+| Sequence nhận được | Cách xử lý trong stream liên tiếp đã định nghĩa |
+| --- | --- |
+| Không lớn hơn `lastSequence` | Duplicate/cũ, bỏ qua theo policy |
+| Bằng `lastSequence + 1` | Xử lý rồi tiến cursor |
+| Lớn hơn `lastSequence + 1` | Phát hiện gap, yêu cầu replay hoặc snapshot |
+
+Quy tắc trên giả định sequence liên tiếp trong đúng scope mà client nhận đầy đủ. Nếu server cấp sequence toàn cục nhưng chỉ gửi một phần event theo quyền/subscription, nhảy số không nhất thiết là mất event. Phải thống nhất sequence scope trước khi dùng nó để phát hiện gap.
+
+Sequence toàn cục có thể thành bottleneck. Thường sequence theo user, topic, aggregate hoặc partition là đủ. Nếu UI chỉ cần state mới nhất, fetch snapshot đáng tin cậy hơn cố replay mọi intermediate event.
+
+Không lưu `lastSequence` chỉ trong SharedWorker nếu mất nó gây sai business. Có thể persist cursor phù hợp vào IndexedDB, hoặc luôn thiết kế snapshot endpoint để recovery.
+
+---
+
+## Browser support và fallback
+
+SharedWorker đã có mặt trên các browser hiện đại, nhưng trong năm 2026 vẫn nên coi đây là feature mới đạt baseline; browser cũ, embedded WebView hoặc policy môi trường có thể khác. Luôn feature-detect:
+
+```ts
+const supported = typeof SharedWorker !== 'undefined';
+```
+
+<SourceRef project="shared-worker-websocket" file="src/realtime-client.ts" region="transport">Client của lab</SourceRef> dùng feature detection và bắt lỗi constructor để chọn transport. <SourceRef project="shared-worker-websocket" file="src/realtime.dedicated-worker.ts">Dedicated worker fallback</SourceRef> tái sử dụng connection manager nhưng không share instance giữa tabs. Mở hai tab với `?mode=dedicated` và xem `/api/demo/metrics` để thấy số connections tăng thành hai. Lỗi load script xảy ra bất đồng bộ vẫn cần error handling/policy riêng; không coi constructor thành công là worker chắc chắn đã sẵn sàng.
+
+Fallback ladder hợp lý:
+
+Ưu tiên SharedWorker khi được hỗ trợ và khởi tạo thành công. Nếu không, giữ cùng chức năng bằng mỗi tab một WebSocket, như dedicated-worker mode của lab. Nếu môi trường không dùng được WebSocket, polling hoặc SSE có thể là phương án sản phẩm riêng; SSE một chiều không tự thay thế command protocol hai chiều.
+
+Nếu bắt buộc chỉ một socket cả ở browser không có SharedWorker, có thể dùng:
+
+```txt
+Web Locks hoặc lease trong storage
+        +
+BroadcastChannel
+        +
+leader tab sở hữu WebSocket
+        +
+fencing token chống hai leaders cùng tồn tại
+```
+
+Đây là một distributed system thu nhỏ. Leader có thể bị freeze mà lock/lease chưa được release; follower có thể tự promote; trong khoảng giao nhau có hai sockets. Nếu server không chấp nhận fencing token hoặc session generation, split-brain sẽ gây duplicate.
+
+---
+
+## Security boundaries
+
+Checklist tối thiểu:
+
+```txt
+[ ] Worker script chỉ được load từ origin tin cậy
+[ ] CSP của worker script được cấu hình rõ
+[ ] WebSocket dùng wss:// trong production
+[ ] Gateway exact-match Origin, không allow mù mọi origin
+[ ] Ticket one-time, TTL ngắn, redact khỏi logs
+[ ] Server authorize từng subscription/topic
+[ ] Validate schema và giới hạn kích thước message hai chiều
+[ ] Command có idempotency key và authorization phía server
+[ ] Không log cookie, access token hoặc payload nhạy cảm
+[ ] Logout/account switch đóng socket của identity cũ
+[ ] Rate limit theo user, connection, topic và command type
+```
+
+SharedWorker là shared state trong cùng origin. Nếu ứng dụng chứa nhiều micro-frontends có mức tin cậy khác nhau trên cùng origin, bất kỳ script nào cùng origin đều có thể cố kết nối worker và gửi protocol message. Worker phải validate message, nhưng authorization thật vẫn phải nằm ở server.
+
+---
+
+## Observability: chứng minh rằng việc share thực sự hoạt động
+
+Client/worker nên log hoặc emit metric đã giới hạn cardinality:
+
+```txt
+realtime_worker_clients
+realtime_worker_topics
+realtime_socket_state
+realtime_reconnect_attempts_total{reason}
+realtime_resync_total{topic_type}
+realtime_command_rejected_total{reason}
+realtime_socket_buffered_bytes
+realtime_messages_total{direction,type}
+```
+
+Server nên theo dõi:
+
+```txt
+physical WebSocket connections / authenticated users
+logical tabs / physical connection
+subscriptions / connection
+reconnect rate theo release/browser
+resume success rate và resync rate
+outbound buffered bytes và slow-consumer disconnects
+```
+
+Metric quyết định thành công không chỉ là “socket connected”. Với user mở nhiều tab, tỷ lệ `physical connections / user` phải giảm gần 1 trong nhóm browser hỗ trợ. Khi rollout worker version mới, tỷ lệ này có thể tạm tăng vì tab cũ và tab mới cùng tồn tại.
+
+Đặt correlation fields trong log:
+
+```json
+{
+  "connectionId": "conn_123",
+  "sessionGeneration": 7,
+  "workerProtocol": 1,
+  "logicalClientCount": 4,
+  "topicCount": 6
+}
+```
+
+Không dùng `clientId`, `eventId` hoặc topic động làm Prometheus label nếu cardinality không bị chặn.
+
+---
+
+## Test plan cho nhiều tabs và failure modes
+
+Kiểm thử runnable lab từ **root repository tài liệu**:
+
+```bash
+npx playwright install chromium
+npm run examples:labs:test
+```
+
+Lệnh chạy cả lab SharedWorker và Vite trong thư mục tạm. Với SharedWorker, nó kiểm tra nhiều tab/một socket, routing theo topic, snapshot cho tab mở muộn, unsubscribe, reconnect, cleanup, fallback mỗi tab một socket, idempotency và ticket dùng một lần. Những mục production rộng hơn bên dưới vẫn cần test riêng theo hệ thống thật.
+
+### Functional
+
+```txt
+[ ] Mở 3 tabs cùng origin -> server chỉ thấy 1 physical connection
+[ ] Hai tabs subscribe cùng topic -> mỗi tab nhận đúng một event
+[ ] Tab không subscribe -> không nhận payload của topic khác
+[ ] Một tab unsubscribe -> topic vẫn tồn tại nếu tab khác còn dùng
+[ ] Tab cuối rời đi -> socket đóng và worker có thể kết thúc
+```
+
+### Failure
+
+```txt
+[ ] Kill realtime server -> chỉ một reconnect loop chạy
+[ ] 1000 clients reconnect -> delay có jitter, không cùng một nhịp
+[ ] Mất event giữa reconnect -> resume hoặc RESYNC_REQUIRED hoạt động
+[ ] Ticket hết hạn -> worker lấy ticket mới
+[ ] Session hết hạn -> dừng retry và phát AUTH_REQUIRED
+[ ] Tab crash không gửi DISCONNECT -> lease dọn client stale
+[ ] Laptop sleep > lease -> tab đăng ký lại và fetch snapshot
+```
+
+### Security và load
+
+```txt
+[ ] Origin lạ bị WebSocket gateway từ chối
+[ ] Client subscribe topic không có quyền -> server từ chối
+[ ] Payload quá lớn/JSON sai -> connection bị xử lý theo protocol
+[ ] Slow consumer -> bufferedAmount bị chặn, memory không tăng vô hạn
+[ ] Command retry cùng idempotency key -> chỉ một business mutation
+[ ] Browser không có SharedWorker -> fallback vẫn hoạt động
+[ ] Deploy v1 -> v2 khi tab cũ còn mở -> không crash do protocol mismatch
+```
+
+Dùng Playwright hoặc Cypress multi-page test để mở nhiều pages trong cùng browser context, đồng thời assert connection count ở test realtime server. Unit test một tab không thể chứng minh invariant “N tabs chỉ có một socket”.
+
+---
+
+## Những trường hợp nên giữ kiến trúc đơn giản hơn
+
+Không dùng chỉ vì “worker nghe có vẻ tối ưu”. Mỗi tab một WebSocket vẫn là lựa chọn đúng khi:
+
+- User hiếm khi mở nhiều tab.
+- Server đã multiplex tốt và connection cost thấp.
+- Ứng dụng cần support WebView/browser cũ rộng.
+- Mỗi tab thực sự có identity hoặc isolation khác nhau.
+- Team chưa có khả năng test lifecycle/reconnect phức tạp.
+
+Dùng SharedWorker khi metric cho thấy nhiều tab tạo chi phí đáng kể, các tab cùng origin và cùng auth session, event có thể multiplex theo topic, và team chấp nhận duy trì một client-side connection manager.
+
+Nó giúp giảm tải ở edge/realtime gateway, nhưng không thay thế capacity planning phía server. Realtime backend vẫn phải scale connection state, fan-out, heartbeat và retry theo cách được phân tích trong [Scale từ 1,000 lên 50,000 users](/system-design/03-scale-1k-to-50k-users).
+
+## Identity và rollout của worker
+
+Cookie của các tab cùng origin thường dùng chung cookie jar. Khi một tab đổi tài khoản, worker phải coi đó là một auth generation mới: đóng connection cũ, bỏ state không còn quyền và lấy lại snapshot. Nếu sản phẩm thật sự cần nhiều identity độc lập trong cùng origin, không gộp chúng vào một socket chỉ dựa trên cùng browser.
+
+Version worker URL, worker name và message protocol có chủ đích. Tab cũ có thể tiếp tục giữ worker cũ trong lúc tab mới dùng worker mới; server cần compatibility window. Chỉ gỡ hỗ trợ protocol cũ sau khi có số liệu sử dụng và quy trình refresh/recovery cho tab còn mở.
+
+Mặc định, giữ fallback mỗi tab một socket cho tới khi metric chứng minh cần leader election. Một optimization connection không nên làm mất khả năng nhận event hay lộ dữ liệu giữa hai identity.
+
+## Tài liệu chính thức
+
+- [MDN SharedWorker](https://developer.mozilla.org/en-US/docs/Web/API/SharedWorker).
+- [MDN WebSocket](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket).
+
+## Bài liên quan
+
+- [CORS là gì và debug lỗi CORS trong production như thế nào?](/web/01-cors) — phân biệt CORS của HTTP request với việc validate `Origin` ở WebSocket handshake.
+- [Hệ thống đang phục vụ 1,000 users, scale lên 50,000 — thay đổi gì?](/system-design/03-scale-1k-to-50k-users) — đặt connection optimization vào bức tranh capacity planning tổng thể.
+- [10 triệu webhook/ngày, một endpoint chậm không được kéo sập cả hệ thống](/system-design/05-webhook-delivery-system) — đào sâu retry, backoff, idempotency và delivery bất định sau network failure.

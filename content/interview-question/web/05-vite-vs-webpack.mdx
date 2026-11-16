@@ -1,0 +1,603 @@
+---
+title: "Vite và webpack: khác biệt từ dev server đến production build"
+description: "Hiểu Vite và webpack qua cách phục vụ module, cập nhật HMR, tạo production chunks và kiểm chứng trên một lab React/TypeScript."
+---
+
+Bạn sửa một dòng React rồi chờ giao diện cập nhật. Khi dự án lớn dần, khoảng chờ đó bắt đầu làm gián đoạn công việc. Chuyển từ webpack sang Vite có giải quyết được không? Có thể, nhưng trước hết cần biết mình đang chờ compiler, plugin, type checker hay browser tải module.
+
+Bài này đi từ một lần mở trang đến một lần sửa code, rồi mới so sánh production build. Mục tiêu là giúp bạn giải thích được vì sao hai toolchain có hành vi khác nhau và biết kiểm tra gì trước khi đổi công cụ.
+
+<Callout type="info" title="Phạm vi phiên bản và kiến thức nền">
+
+Bài dùng **Vite 8** và **webpack 5** làm mốc. Vite 8 dùng Rolldown cho bundling và dependency optimization, cùng Oxc cho các tác vụ transform JavaScript/TypeScript. Mô tả “esbuild khi dev, Rollup khi build” thuộc toolchain Vite đời trước, không nên dùng để giải thích mọi phiên bản.
+
+Bạn chỉ cần quen React component và script trong `package.json`. Bài sẽ giải thích ES modules, `import` và pre-bundle bằng ví dụ trước khi dùng chúng để so sánh. Nếu chưa rõ compiler khác bundler thế nào, đọc [bản đồ frontend build tooling](/web/02-frontend-build-tooling) trước.
+
+</Callout>
+
+## Mục lục
+
+- [So sánh hai toolchain, không chỉ hai bundler](#so-sánh-hai-toolchain-không-chỉ-hai-bundler)
+- [Một ứng dụng để theo dõi xuyên suốt](#một-ứng-dụng-để-theo-dõi-xuyên-suốt)
+  - [ES modules là gì?](#es-modules-là-gì)
+  - [Từ HTML đến React component](#từ-html-đến-react-component)
+  - [Lúc mở trang và lúc bấm nút](#lúc-mở-trang-và-lúc-bấm-nút)
+  - [Static import và dynamic import khác nhau ở đâu?](#static-import-và-dynamic-import-khác-nhau-ở-đâu)
+- [webpack làm gì khi mở trang lần đầu?](#webpack-làm-gì-khi-mở-trang-lần-đầu)
+  - [Từ entry đến bundle có runtime](#từ-entry-đến-bundle-có-runtime)
+  - [Compile lại không có nghĩa làm lại mọi thứ](#compile-lại-không-có-nghĩa-làm-lại-mọi-thứ)
+- [Vite làm gì khi mở trang lần đầu?](#vite-làm-gì-khi-mở-trang-lần-đầu)
+  - [Browser yêu cầu module, server transform theo nhu cầu](#browser-yêu-cầu-module-server-transform-theo-nhu-cầu)
+  - [Vì sao vẫn cần pre-bundle dependency?](#vì-sao-vẫn-cần-pre-bundle-dependency)
+  - [Khởi động nhanh khác với trang sẵn sàng nhanh](#khởi-động-nhanh-khác-với-trang-sẵn-sàng-nhanh)
+- [Sửa một file thì HMR đi đến đâu?](#sửa-một-file-thì-hmr-đi-đến-đâu)
+  - [HMR không tự đảm bảo giữ React state](#hmr-không-tự-đảm-bảo-giữ-react-state)
+- [Production vẫn cần một pipeline riêng](#production-vẫn-cần-một-pipeline-riêng)
+  - [Bundling, tree shaking và code splitting khác nhau](#bundling-tree-shaking-và-code-splitting-khác-nhau)
+  - [Dùng chung engine không làm dev giống production](#dùng-chung-engine-không-làm-dev-giống-production)
+- [Tổng kết khác biệt giữa dev và production](#tổng-kết-khác-biệt-giữa-dev-và-production)
+  - [Dev nhanh hơn nhưng vẫn có giới hạn](#dev-nhanh-hơn-nhưng-vẫn-có-giới-hạn)
+  - [Production cả hai đều build trước khi phục vụ](#production-cả-hai-đều-build-trước-khi-phục-vụ)
+- [TypeScript chạy được chưa chắc đúng type](#typescript-chạy-được-chưa-chắc-đúng-type)
+- [Thực hành bằng source có sẵn](#thực-hành-bằng-source-có-sẵn)
+  - [Quan sát native ESM và cập nhật component](#quan-sát-native-esm-và-cập-nhật-component)
+  - [Đối chiếu production chunks và manifest](#đối-chiếu-production-chunks-và-manifest)
+  - [Tách lỗi type khỏi lỗi transform](#tách-lỗi-type-khỏi-lỗi-transform)
+- [Những khác biệt phải xử lý khi chuyển từ webpack](#những-khác-biệt-phải-xử-lý-khi-chuyển-từ-webpack)
+- [Đo trước khi kết luận công cụ nào nhanh hơn](#đo-trước-khi-kết-luận-công-cụ-nào-nhanh-hơn)
+- [Khi nào chọn Vite, khi nào giữ webpack?](#khi-nào-chọn-vite-khi-nào-giữ-webpack)
+- [Đọc tiếp và tài liệu đối chiếu](#đọc-tiếp-và-tài-liệu-đối-chiếu)
+
+## So sánh hai toolchain, không chỉ hai bundler
+
+Giả sử `npm run dev` chạy `vite`. Một lệnh đó khởi động dev server, xử lý HTML, transform source, phục vụ CSS/assets và kết nối cơ chế cập nhật code. Vite là **build tool**: nó tổ chức nhiều công cụ bên dưới thành một workflow cho ứng dụng.
+
+webpack tập trung vào **bundling**: lần theo các import và tổ chức module thành những file đầu ra. Để có trải nghiệm tương tự cho React/TypeScript, bạn thường dùng thêm `webpack-dev-server`, loader xử lý TypeScript/CSS và plugin tạo HTML. Loader chuyển đổi từng loại module; plugin can thiệp vào các giai đoạn của quá trình build.
+
+Vì vậy, đối tượng so sánh thực tế là **Vite cùng plugin framework** với **webpack cùng loaders, plugins và dev server**. Nếu một bên có type checking còn bên kia không có, thời gian đo được chưa phản ánh cùng khối lượng công việc.
+
+| Câu hỏi | Vite 8 | Toolchain webpack 5 |
+| --- | --- | --- |
+| Ai điều phối workflow? | Vite cung cấp dev/build CLI và nhiều mặc định cho ứng dụng web | webpack kết hợp các công cụ được chọn trong cấu hình |
+| App source trong dev mặc định | Phục vụ dưới dạng native ES modules, transform theo request | Compile graph từ entry và phục vụ bundles/chunks |
+| Engine bundling | Rolldown; không phải webpack | webpack |
+| Xử lý framework | Plugin tương ứng, chẳng hạn `@vitejs/plugin-react` | Loaders/plugins tương ứng; cấu hình React Refresh riêng nếu cần |
+| Production output | Bundle, chunks, CSS/assets theo cấu hình build | Bundle, chunks, CSS/assets theo cấu hình build |
+| HMR | Có; phụ thuộc module boundary và plugin | Có; phụ thuộc module boundary và tích hợp framework |
+
+Đừng hiểu bảng này thành “Vite không bundle” hay “webpack chỉ xuất một file”. Hai kết luận đó đều bỏ qua phần quan trọng của pipeline.
+
+## Một ứng dụng để theo dõi xuyên suốt
+
+Mình dùng một màn hình React có hai việc rất nhỏ:
+
+- Vừa mở trang, bạn thấy dòng **Kết quả: 5**.
+- Khi bấm nút **Tải admin module**, bạn mới thấy thêm dòng **Admin module đã được tải**.
+
+Ta sẽ xem code tạo ra hai hành vi này. Nhưng trước khi đọc React, mình tách riêng một ví dụ JavaScript để làm rõ cách các file chia sẻ code với nhau.
+
+### ES modules là gì?
+
+Giả sử bạn viết hàm cộng trong một file và muốn dùng nó ở file khác. JavaScript có sẵn cách làm việc đó: **export** phần code muốn chia sẻ, rồi **import** phần code đó ở nơi cần dùng. Cơ chế này gọi là **ES modules**, viết tắt là **ESM**. Đây là tính năng của JavaScript, không phải tính năng riêng của React hay Vite.
+
+Ví dụ dưới đây độc lập với lab React. Nó chỉ có hai file JavaScript đặt cùng thư mục. File **`math.js`** cung cấp hàm cộng:
+
+```js
+export function sum(a, b) {
+  return a + b;
+}
+```
+
+`export` cho phép file khác lấy hàm `sum` để dùng. File **`main.js`** lấy hàm đó về:
+
+```js
+import { sum } from './math.js';
+
+console.log(sum(2, 3)); // In ra 5 trong console
+```
+
+`'./math.js'` là đường dẫn tới file nằm cùng thư mục. `{ sum }` chọn giá trị được export với tên `sum`. Dòng import lấy hàm về; dòng `sum(2, 3)` mới gọi hàm để thực hiện phép cộng.
+
+Mỗi file được xử lý như một **module**, tức một đơn vị code riêng. Bạn không cần chép hàm cộng vào mọi file muốn dùng nó, cũng không cần đưa `sum` thành biến global để các file cùng truy cập.
+
+Để browser chạy ví dụ, một file HTML trong cùng thư mục khai báo:
+
+```html
+<script type="module" src="./main.js"></script>
+```
+
+`type="module"` báo cho browser xử lý script theo cơ chế ES modules. Khi các file được phục vụ qua HTTP, browser làm những việc sau:
+
+1. Đọc HTML và tải `main.js`.
+2. Thấy `main.js` import `./math.js`, tải thêm file đó.
+3. Khi dependency `math.js` đã sẵn sàng, chạy phần code trong `main.js` và in ra `5`.
+
+Với ví dụ JavaScript thuần này, không cần Vite hay React; chỉ cần một HTTP server phục vụ các file, thay vì mở HTML trực tiếp bằng `file://`. Browser hiện đại tự hiểu `import`/`export` và biết nạp module. Khi bài gọi đó là **native ESM**, chữ *native* chỉ khả năng hỗ trợ sẵn này của browser.
+
+**Giới hạn cần nhớ:** browser hiểu ES modules không có nghĩa nó hiểu TypeScript hay JSX. Ví dụ vừa rồi dùng `.js`; lab React bên dưới dùng `.tsx`, nên vẫn cần Vite chuyển code thành JavaScript trước khi browser chạy.
+
+### Từ HTML đến React component
+
+Browser mở `index.html` trước. Trong phần body của file này có:
+
+```html
+<div id="root"></div>
+<script type="module" src="/src/main.tsx"></script>
+```
+
+`div` là chỗ để React gắn giao diện vào. Thẻ `script` yêu cầu browser tải code từ URL `/src/main.tsx`; `type="module"` cho phép script dùng cơ chế `import` của JavaScript.
+
+Đây là HTML dùng với **Vite dev server**, không phải file có thể mở trực tiếp rồi mong browser chạy TSX. Vite nhận request tới `main.tsx`, chuyển TSX thành JavaScript rồi mới trả về browser. Phần sau sẽ giải thích bước chuyển đổi này; ở đây chỉ cần nhớ browser vẫn chạy JavaScript.
+
+File `src/main.tsx` có nội dung:
+
+```tsx
+import { createRoot } from 'react-dom/client';
+import App from './App';
+import './styles.css';
+
+const element = document.getElementById('root');
+if (!element) throw new Error('Missing #root');
+createRoot(element).render(<App />);
+```
+
+Đoạn cuối tìm vùng `root` trong HTML rồi yêu cầu React hiển thị component `App` vào đó. `import App from './App'` lấy component này từ file `src/App.tsx`. Vậy giao diện bạn nhìn thấy sẽ do `App` quyết định, không phải do thẻ `script` tự tạo ra.
+
+### Lúc mở trang và lúc bấm nút
+
+Đây là toàn bộ `src/App.tsx`, chỉ bỏ các comment đánh dấu vùng source:
+
+```tsx
+import { useState } from 'react';
+import { sum } from './math';
+
+export default function App() {
+  const [message, setMessage] = useState<string | null>(null);
+
+  async function openAdmin() {
+    const { getAdminMessage } = await import('./admin');
+    setMessage(getAdminMessage());
+  }
+
+  return (
+    <main>
+      <h1>Frontend build lab</h1>
+      <p>Kết quả: {sum(2, 3)}</p>
+      <button onClick={openAdmin}>Tải admin module</button>
+      {message && <p role="status">{message}</p>}
+    </main>
+  );
+}
+```
+
+Đọc lần đầu, bạn chỉ cần theo dõi hai thời điểm.
+
+**Khi vừa mở trang:** React chạy component `App` để tạo giao diện. Biểu thức `sum(2, 3)` gọi hàm cộng lấy từ `math.ts`, trả về `5`. Vì vậy dòng đầu hiển thị `Kết quả: 5`.
+
+`message` là giá trị mà React giữ giữa các lần cập nhật giao diện, thường gọi là **state**. Ban đầu nó là `null`, tức chưa có thông báo. Dòng `{message && ...}` chỉ hiển thị đoạn thông báo khi `message` có giá trị, nên lúc này bạn chưa thấy dòng nào bên dưới nút.
+
+Còn `openAdmin` thì sao? Component mới chỉ khai báo hàm đó. `onClick={openAdmin}` đăng ký hàm làm thao tác xử lý khi bấm nút; nó **không gọi hàm ngay trong lúc tạo giao diện**. Vì thế, dòng `import('./admin')` bên trong chưa chạy.
+
+**Khi bạn bấm nút:** React gọi `openAdmin`. Dòng `await import('./admin')` bắt đầu nạp module `admin.ts` và chờ lấy được các giá trị mà module export. Code lấy ra hàm `getAdminMessage`, gọi hàm để nhận chuỗi `Admin module đã được tải`, rồi đưa chuỗi đó vào `setMessage`.
+
+`setMessage` là hàm cập nhật state. React dùng giá trị mới để cập nhật giao diện; lúc này bạn mới thấy thông báo bên dưới nút. Lần bấm tiếp theo không nhất thiết tải lại code qua mạng vì module đã được nạp có thể được dùng lại.
+
+### Static import và dynamic import khác nhau ở đâu?
+
+Sau khi đã thấy luồng chạy, ta mới đặt tên cho hai cách import:
+
+```ts
+import { sum } from './math'; // Static import
+```
+
+**Static import** khai báo dependency ở cấp ngoài cùng của file. Module `App` cần dependency `math` sẵn sàng trước khi phần code của chính nó được thực thi. Trong ví dụ này, phép tính cần dùng ngay trên màn hình đầu tiên, nên cách viết đó phù hợp.
+
+Lưu ý: **import hàm không có nghĩa là gọi hàm**. Dòng import lấy hàm `sum`; biểu thức `sum(2, 3)` trong phần giao diện mới gọi hàm để tính ra `5`.
+
+```ts
+const { getAdminMessage } = await import('./admin'); // Dynamic import
+```
+
+**Dynamic import** là biểu thức có thể đặt bên trong hàm. Nó chỉ bắt đầu nạp module khi luồng chạy đến biểu thức đó. `import()` trả về một **Promise**, tức đối tượng đại diện cho kết quả sẽ có sau; `await` chờ kết quả đó trước khi chạy dòng tiếp theo trong hàm.
+
+Ở đây, chính việc đặt `import('./admin')` trong hàm xử lý nút bấm giúp trì hoãn nạp module admin. Không phải cứ viết `import()` là code tự chờ người dùng: nếu đặt biểu thức đó ở chỗ chạy ngay lúc khởi động, nó vẫn bắt đầu nạp ngay lúc khởi động.
+
+| Thời điểm trong ví dụ | Module math | Module admin |
+| --- | --- | --- |
+| Mở trang lần đầu | Cần sẵn sàng để App tính và hiển thị `5` | Chưa được yêu cầu qua `import('./admin')` |
+| Bấm nút tải admin | Đã được nạp | Bắt đầu được nạp, rồi cung cấp hàm tạo thông báo |
+
+**Điểm cần giữ để đọc tiếp:** app cần code tính toán ngay khi mở trang, còn code admin chỉ cần sau khi bấm nút. Vite và webpack đều hỗ trợ cách viết này. Phần tiếp theo so sánh cách mỗi toolchain đưa những module đó đến browser.
+
+Bạn có thể mở lại <SourceRef project="frontend-build-lab" file="src/App.tsx" region="lazy-import">hàm openAdmin trong React component</SourceRef> để đối chiếu source. Các bước chạy lab nằm ở phần thực hành bên dưới.
+
+## webpack làm gì khi mở trang lần đầu?
+
+### Từ entry đến bundle có runtime
+
+Với cấu hình webpack thông thường, entry là `src/main.tsx`. Compiler đọc file đó, tìm các import và xây **module graph** — danh sách module cùng quan hệ phụ thuộc giữa chúng. Khi gặp TSX hay CSS, webpack gọi loader phù hợp trước khi tiếp tục xử lý.
+
+Sơ đồ này mô tả đường đi của code trong dev, không phải số request cố định hay một phép đo thời gian:
+
+```d2 interactive=false title="webpack dev: compiler tạo bundles trước khi browser thực thi app"
+direction: down
+source: "Entry và các module được import"
+compiler: "webpack compiler" {
+  icon: /interview-question/webpack.svg
+}
+assets: "Bundles / chunks và webpack runtime"
+server: "webpack-dev-server"
+browser: "Browser chạy ứng dụng"
+source -> compiler: "Resolve imports, chạy loaders/plugins"
+compiler -> assets: "Tạo output theo chunk graph"
+assets -> server: "Phục vụ output, thường từ memory"
+server -> browser: "HTML và các assets được yêu cầu"
+```
+
+**Chunk** là đơn vị webpack dùng để nhóm code khi tạo output. Browser không nhất thiết tải mọi chunk ngay lúc mở trang. Chẳng hạn, chunk của `import('./admin')` có thể chỉ được tải khi hàm `openAdmin` chạy.
+
+Bundle còn có **runtime**, tức phần code quản lý việc thực thi module và tải thêm chunk. Vì thế, nhìn thấy một file JavaScript trong Network không có nghĩa file đó tương ứng một-một với một file source.
+
+`webpack-dev-server` thường phục vụ kết quả compile từ bộ nhớ. Không thấy bundle mới trên ổ đĩa chưa đủ để kết luận compiler không chạy.
+
+### Compile lại không có nghĩa làm lại mọi thứ
+
+Khi `App.tsx` thay đổi, webpack có thể dùng kết quả đã cache cho những module không đổi. Compiler đang watch cũng giữ thông tin giữa các lần rebuild. Nếu bật filesystem cache, một phần kết quả có thể được dùng lại qua các lần khởi động process.
+
+Chẳng hạn, một cấu hình muốn cache xuống đĩa có thể thêm:
+
+```js
+cache: {
+  type: 'filesystem',
+  buildDependencies: {
+    config: [__filename],
+  },
+},
+```
+
+Đây là một phần của `webpack.config.cjs`, không phải cấu hình đầy đủ. Khai báo file config trong `buildDependencies` giúp cache biết khi nào cấu hình build thay đổi.
+
+Chi phí rebuild vẫn phụ thuộc vào phạm vi module bị ảnh hưởng và công việc của loaders/plugins. Nhưng nói “mỗi lần sửa là webpack compile lại toàn bộ dự án từ đầu” sẽ dẫn bạn đến chẩn đoán sai. Trước khi migrate, kiểm tra cache, source map và các tác vụ chạy lại trong mỗi compilation.
+
+## Vite làm gì khi mở trang lần đầu?
+
+### Browser yêu cầu module, server transform theo nhu cầu
+
+Ở chế độ dev native ESM mặc định, browser đọc `index.html` rồi yêu cầu `/src/main.tsx`. Vite transform TSX thành JavaScript, xử lý đường dẫn import và trả kết quả. Browser đọc các import trong response rồi tiếp tục yêu cầu module cần thiết.
+
+Đây là **native ESM** đã thấy trong [ví dụ hai file JavaScript](#es-modules-là-gì): browser tự đọc import và yêu cầu module liên quan. Khác biệt là source ở đây có TSX nên Vite phải chuyển đổi trước. Vite cũng xử lý tên package như `'react'`; browser không tự tìm thư viện trong `node_modules`.
+
+Sơ đồ dưới đây tách app source khỏi dependency ít thay đổi:
+
+```d2 interactive=false title="Vite dev: phục vụ source theo request, tối ưu dependency riêng"
+direction: down
+browser: "Browser dùng native ESM"
+server: "Vite dev server"
+source: "Source app TS / TSX / CSS"
+react: "React dependency" {
+  icon: /interview-question/react.svg
+}
+optimized: "Dependency ESM đã pre-bundle"
+react -> optimized: "Rolldown tối ưu và cache"
+browser -> server: "Yêu cầu HTML và module URLs"
+source -> server: "Đọc và transform theo request"
+optimized -> server: "Dùng dependency output đã cache"
+server -> browser: "Trả module để browser thực thi"
+```
+
+Nếu chưa bấm nút tải admin, browser chưa cần module đó theo đường thực thi của ví dụ. Vite không phải tạo một production bundle của toàn app trước khi phục vụ trang này.
+
+Tuy nhiên, Vite vẫn có bước khởi tạo plugin, phân tích import và khám phá dependency. **Theo nhu cầu không có nghĩa là hoàn toàn không đọc source trước request đầu tiên.** Điểm khác biệt là cách tổ chức việc transform và phục vụ app source, không phải loại bỏ mọi bước chuẩn bị.
+
+### Vì sao vẫn cần pre-bundle dependency?
+
+Bạn vừa thấy browser có thể tải từng file được import. Vậy tại sao Vite còn phải “gom code trước”? Vì source app bạn đang sửa và thư viện cài từ npm có đặc điểm khác nhau.
+
+Lấy dòng trong `App.tsx`:
+
+```tsx
+import { useState } from 'react';
+```
+
+`react` là một **dependency**, tức thư viện mà app dùng. Bạn đã cài package này vào `node_modules` bằng npm. Khác với `'./math.js'`, tên `'react'` không phải đường dẫn để browser tải trực tiếp. Cách import bằng tên package này gọi là **bare import**.
+
+Vite tìm package tương ứng trên máy và đổi tên import thành URL mà browser có thể tải. Nhưng tìm được package mới chỉ là bước đầu: code bên trong thư viện có thể gồm nhiều file nhỏ hoặc dùng định dạng module mà browser không hỗ trợ trực tiếp.
+
+**Pre-bundle là gom và xử lý trước code của các dependency để browser dễ tải và chạy hơn trong dev.** Kết quả được lưu lại để dùng tiếp, thay vì lặp lại toàn bộ công việc mỗi khi bạn sửa một component. Có hai vấn đề cụ thể mà bước này giải quyết.
+
+**Vấn đề thứ nhất: thư viện có quá nhiều file nhỏ.** Giả sử một thư viện có 100 file JavaScript import lẫn nhau. Nếu phục vụ từng file riêng, browser có thể phải gửi rất nhiều request mới lấy đủ code. Vite gom các module đó thành ít file hơn để giảm số request. Con số 100 chỉ minh họa tình huống, không phải số file thực tế của React.
+
+**Vấn đề thứ hai: thư viện không dùng ES modules.** Một số package dùng **CommonJS**, một cơ chế module thường gặp trong Node.js. Chẳng hạn, chúng có thể nạp code bằng cú pháp `require('some-package')` thay vì `import`. Browser không trực tiếp cung cấp cơ chế `require()` đó. Khi tối ưu dependency dạng CommonJS, Vite chuyển code thành output ESM để browser nạp được.
+
+Trong Vite 8, công cụ làm bước pre-bundle này là **Rolldown**. Mặc định, Vite lưu kết quả đã xử lý vào thư mục cache:
+
+```text
+node_modules/.vite
+```
+
+Cache ở đây là bản kết quả được giữ lại để dùng lại. React thường không thay đổi khi bạn chỉ sửa chữ trong `App.tsx`, nên Vite có thể dùng lại phần dependency đã chuẩn bị. Bạn vẫn sửa app và thấy giao diện cập nhật mà không cần gom lại React sau mỗi lần lưu file.
+
+Cache không được dùng mãi bất kể thay đổi. Nếu lockfile hoặc cấu hình liên quan đổi, Vite có thể tối ưu dependency lại. Khi phát hiện thêm dependency chưa có trong cache, nó cũng có thể chạy thêm một lượt tối ưu.
+
+| Nhóm code trong ví dụ | Cách Vite xử lý trong chế độ dev đang xét |
+| --- | --- |
+| `App.tsx`, `math.ts` và source app bạn đang sửa | Chuyển đổi và phục vụ theo nhu cầu, dùng lại kết quả còn hợp lệ |
+| Dependency được tối ưu như React | Pre-bundle thành output phù hợp cho browser và cache để dùng lại |
+
+Vì vậy, **Vite không cần bundle toàn bộ app trước khi phục vụ trang, nhưng vẫn bundle dependency để tối ưu việc nạp thư viện**. Hai việc này không mâu thuẫn. Pre-bundle trong dev cũng không thay thế production build; phần production bên dưới sẽ giải thích công việc còn lại khi phát hành app.
+
+### Khởi động nhanh khác với trang sẵn sàng nhanh
+
+Một dev server có thể báo sẵn sàng rất sớm, nhưng browser vẫn phải yêu cầu và thực thi module trước khi giao diện dùng được. Giả sử một route import nối tiếp nhiều module, request sau chỉ được phát hiện khi response trước đã về. Độ sâu của chuỗi import cũng có thể tạo khoảng chờ.
+
+Vì vậy, cần đo cả thời gian process khởi động lẫn thời gian trang tương tác được. Với codebase rất lớn, số request module trong dev có thể trở thành vấn đề riêng.
+
+<Callout type="info" title="Không biến mô hình mặc định thành quy luật bất biến">
+
+Thông báo Vite 8 giới thiệu hướng **Full Bundle Mode** ở trạng thái experimental: bundle code trong dev để giảm số request. Bài này giải thích luồng native ESM mặc định, không dùng chế độ thử nghiệm đó làm cơ sở so sánh. Khi đọc một dự án khác, kiểm tra cả phiên bản lẫn mode thực tế.
+
+</Callout>
+
+## Sửa một file thì HMR đi đến đâu?
+
+Giả sử bạn sửa chữ trong `App.tsx` trong khi trang đang mở. **Hot Module Replacement (HMR)** là cơ chế đưa code mới vào ứng dụng đang chạy mà không cần tải lại toàn bộ document.
+
+Trong Vite native ESM dev, server đánh dấu kết quả transform liên quan là không còn hợp lệ và thông báo cho client. Client tải module cập nhật. Trong webpack, compiler tạo dữ liệu cập nhật cho compilation mới; HMR runtime tải và áp dụng các module thay đổi. Không phải mỗi lần webpack HMR đều gửi lại toàn bộ app bundle.
+
+Cả hai cần một **HMR boundary** — nơi chấp nhận bản cập nhật và biết cách áp dụng nó an toàn. Nếu module thay đổi không tự xử lý được, việc cập nhật có thể lan tới các module import nó. Khi không tìm được boundary thích hợp, toolchain có thể phải reload trang.
+
+Điều này giải thích vì sao sửa một component và sửa một module cấu hình dùng chung có thể cho trải nghiệm rất khác nhau. Số dòng sửa ít không đảm bảo phạm vi ảnh hưởng nhỏ.
+
+### HMR không tự đảm bảo giữ React state
+
+Bạn bấm nút trong app để tạo một ít state, rồi sửa nhãn trên giao diện. Muốn nhãn cập nhật mà state còn nguyên, cần tích hợp framework hiểu cách thay component. Với React, phần này thường là **Fast Refresh**, được nối vào HMR bởi plugin tương ứng.
+
+Vite có `@vitejs/plugin-react` cho workflow React. webpack cũng có thể tích hợp React Refresh; chỉ bật `devServer.hot` không tự biến mọi module React thành một boundary giữ state.
+
+Ngay cả khi có Fast Refresh, một số thay đổi vẫn có thể reset state hoặc dẫn tới reload. Ví dụ, thay cấu trúc hooks không tương đương với sửa một chuỗi văn bản. Vì vậy, khi kiểm tra HMR, hãy chọn cùng loại thay đổi ở cả hai toolchain.
+
+<Callout type="warn" title="Phân biệt khả năng của tool với cấu hình ví dụ">
+
+Demo webpack ở [bài trước](/web/03-webpack-tu-source-den-trinh-duyet) cố ý đặt `hot: false` và `liveReload: true`. Khi demo đó reload cả trang, bạn đang quan sát cấu hình live reload, không phải giới hạn của webpack. Đừng dùng nó làm benchmark đối đầu với React Fast Refresh của Vite.
+
+</Callout>
+
+## Production vẫn cần một pipeline riêng
+
+Native ESM giúp dev server phục vụ source linh hoạt. Nhưng trên đường truyền tới người dùng, hàng loạt file nhỏ và chuỗi import sâu có thể tạo nhiều lượt chờ. Production build tổ chức lại code để phục vụ hiệu quả hơn, thay vì đơn giản copy các module dev lên hosting.
+
+Với Vite 8, `vite build` dùng Rolldown. Với webpack, build production vẫn do webpack điều phối theo cấu hình tương ứng. Cả hai có thể tạo nhiều chunks, rút gọn code và xử lý assets; chất lượng output còn phụ thuộc cách bạn viết app và cấu hình pipeline.
+
+### Bundling, tree shaking và code splitting khác nhau
+
+Quay lại ví dụ `sum` và `openAdmin`:
+
+| Công việc | Ý nghĩa trong ví dụ | Không nên suy ra |
+| --- | --- | --- |
+| Bundling | Gom và tổ chức các module thành output để phân phối | Luôn gom tất cả vào một file |
+| Tree shaking | Loại code không dùng nếu có thể chứng minh việc bỏ đó là an toàn | Mọi dòng “có vẻ không được gọi” đều bị xóa |
+| Code splitting | Tạo phần output có thể tải riêng, chẳng hạn admin qua `import()` | Mỗi component chắc chắn có một chunk riêng |
+| Minification | Rút gọn biểu diễn code trong output | Tự thay thế được ba công việc trên |
+
+Trong lab, `math.ts` còn export `unusedMessage`, nhưng app không import hàm này. Production build có thể loại hàm đó. Nếu module có side effect — chẳng hạn đăng ký event listener ngay khi được import — bundler phải xét xem việc bỏ module có thay đổi hành vi không.
+
+`import('./admin')` tạo một ranh giới tải bất đồng bộ trong ví dụ. Hình dạng chunk cuối cùng còn phụ thuộc các import khác và cách bundler chia shared code. Trong app khác, nếu admin đã được static import ở đường khởi động, bạn không còn được hưởng việc trì hoãn tải phần code đó chỉ nhờ thêm một dynamic import nữa.
+
+### Dùng chung engine không làm dev giống production
+
+Vite 8 thống nhất nhiều phần xử lý quanh Rolldown/Oxc, nhưng điều đó không làm `vite dev` và `vite build` trở thành cùng một tác vụ. Dev có HMR và cách phục vụ module riêng. Build có bước tổ chức output, tối ưu và thay giá trị cấu hình dành cho bản phát hành.
+
+Mốc phiên bản giúp bạn đọc các bài hướng dẫn cũ đúng ngữ cảnh:
+
+| Toolchain | Dependency pre-bundling trong dev | Production bundling |
+| --- | --- | --- |
+| Vite 7 bản tiêu chuẩn | esbuild | Rollup |
+| Vite 8 | Rolldown | Rolldown |
+
+Bảng không bao gồm bản chuyển tiếp `rolldown-vite` hay cấu hình thay thế. Muốn biết dự án đang dùng gì, kiểm tra lockfile và lệnh build thay vì đoán từ tên file `vite.config.ts`.
+
+## Tổng kết khác biệt giữa dev và production
+
+Với SPA phía client đang xét trong bài, có thể nhớ khác biệt qua hai câu hỏi: **khi đang sửa code, toolchain đưa code tới browser thế nào?** Và **khi phát hành, browser nhận những file nào?** Đừng dùng câu trả lời của dev để suy ra hành vi production.
+
+### Dev nhanh hơn nhưng vẫn có giới hạn
+
+Trong dev, webpack thông thường compile graph từ entry rồi phục vụ các bundles/chunks được tạo. Vite ở chế độ native ESM mặc định phục vụ module source theo nhu cầu: browser yêu cầu module, Vite chuyển đổi thành JavaScript và trả về. Browser đọc các import để yêu cầu module liên quan rồi liên kết và thực thi chúng. Riêng dependency thư viện, Vite vẫn có bước pre-bundle.
+
+Vì không phải bundle toàn bộ source app trước khi phục vụ trang, Vite thường giảm thời gian chờ khởi động. Khi sửa code, nó cũng có thể cập nhật các module liên quan mà không cần tạo lại app bundle. Điều này không có nghĩa webpack luôn làm lại mọi thứ: webpack có cache, incremental rebuild và HMR. Mức chênh lệch cần được đo trên cùng app và cùng trách nhiệm kiểm tra.
+
+Nhưng giả sử route đang mở cần hàng nghìn **module source**, Vite vẫn có thể gặp nút thắt:
+
+- Browser phải gửi nhiều request để lấy đủ module.
+- Import nằm sâu trong chuỗi phụ thuộc có thể tạo thêm các lượt chờ nối tiếp.
+- Vite phải chuyển đổi những module chưa có kết quả cache phù hợp.
+- Browser vẫn phải phân tích cú pháp và thực thi JavaScript nhận được.
+
+Ở đây nên nói **nhiều module**, không phải **nhiều bundle**: trong luồng dev này, app source chưa được gom thành production bundles. Tổng số file trong repository cũng không quyết định tất cả. Một app có nhiều route nhưng chỉ nạp code cần cho route hiện tại có thể nhẹ hơn một màn hình import gần như toàn bộ app.
+
+Kết luận để dùng khi đo: **server báo ready nhanh chưa chắc trang đã tương tác được nhanh**. Hãy kiểm tra cả lần mở trang và lần cập nhật sau khi sửa code, không chỉ số thời gian trong terminal.
+
+### Production cả hai đều build trước khi phục vụ
+
+Quay lại nút tải admin. Trong Vite dev, thao tác có thể yêu cầu module source đã được chuyển đổi. Sau `vite build`, browser yêu cầu chunk JavaScript đã tạo sẵn trong output. Hosting không nhận request tới `App.tsx` rồi nhờ Vite chuyển đổi file đó cho từng người dùng.
+
+Với webpack production, browser cũng tải các file đã build. Cả hai đều có thể bundle code, loại phần code không dùng khi an toàn, chia chunks và minify. **Khác biệt “Vite phục vụ từng module source, webpack phục vụ bundle” không còn mô tả đúng cách so sánh hai bản production.**
+
+| Điểm so sánh | Vite 8 production | webpack 5 production |
+| --- | --- | --- |
+| Engine bundling | Rolldown, được Vite điều phối | webpack, cùng loaders/plugins đã cấu hình |
+| File đưa lên hosting cho SPA | HTML, JavaScript chunks, CSS/assets đã build | HTML, JavaScript chunks, CSS/assets theo pipeline đã cấu hình |
+| Code admin được tải khi nào? | Có thể tải chunk sau thao tác qua dynamic import | Cũng có thể tải chunk sau thao tác qua dynamic import |
+| Output có giống nhau không? | Cách chia chunks, tối ưu và mã nạp chunk phụ thuộc engine/config | Cũng phụ thuộc engine/config; không mặc định trùng output của Vite |
+| Có tiếp tục transform source theo request không? | Không; hosting phục vụ output đã build | Không; hosting phục vụ output đã build |
+
+ES modules và bundling cũng không loại trừ nhau. Bundler có thể gom nhiều file source vào một chunk, rồi các chunks dùng cú pháp ESM để import lẫn nhau. Vì vậy, thấy `type="module"` hoặc `import` trong output không đủ để kết luận code chưa được bundle.
+
+Vẫn có khác biệt đáng đo ở production, nhưng phải tách hai loại thời gian:
+
+- **Thời gian build:** CI mất bao lâu để tạo output. Engine bundling, plugins, source map và các bước kiểm tra đều ảnh hưởng. Vite dev nhanh không tự chứng minh production build cũng nhanh hơn cùng tỷ lệ.
+- **Thời gian người dùng chờ:** browser mất bao lâu để tải và chạy app. Kích thước code cần cho route, cách chia chunks, HTTP cache, network và chi phí thực thi mới là những yếu tố phải đối chiếu. Build nhanh hơn không tự làm trang chạy nhanh hơn.
+
+Ở production, một bundle quá lớn có thể làm chậm tải và thực thi code. Chia thành quá nhiều chunks nhỏ lại có thể tăng số request và các lượt chờ để lấy đủ code. Cả Vite lẫn webpack đều có thể gặp hai vấn đề này. Mục tiêu không phải ít file nhất hay nhiều chunks nhất, mà là người dùng tải được phần code cần thiết đúng lúc và dùng lại cache hiệu quả.
+
+**Cách nhớ ngắn gọn:** dev khác nhau rõ ở cách phục vụ và cập nhật source; production khác nhau ở pipeline build và output tạo ra. Đừng mặc định app dùng Vite sẽ chạy nhanh hơn app dùng webpack trên máy người dùng — hãy đo bản production của cùng một app.
+
+## TypeScript chạy được chưa chắc đúng type
+
+Giả sử một hàm khai báo trả về `number` nhưng lại trả về chuỗi:
+
+```ts
+export function sum(a: number, b: number): number {
+  return String(a + b);
+}
+```
+
+Đoạn này có lỗi type, nhưng sau khi bỏ type annotation, nó vẫn là JavaScript hợp lệ. **Transform TypeScript không đồng nghĩa với type checking.** Vite transform file để phục vụ/build; nó không tự kiểm tra toàn bộ hệ thống kiểu của ứng dụng.
+
+Lab tách trách nhiệm bằng các script sau:
+
+```json
+{
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && vite build"
+  }
+}
+```
+
+Type checker thất bại thì `&&` ngăn bước build tiếp tục. Khi dev, bạn có thể chạy `tsc --noEmit --watch` trong một terminal khác để nhận lỗi liên tục.
+
+Ở webpack, hành vi phụ thuộc loader và cấu hình. `ts-loader` có thể type-check; nếu dùng `transpileOnly`, SWC hoặc Babel để chỉ transform, bạn cần một tác vụ type checking riêng. Khi so tốc độ, hãy đối chiếu trách nhiệm này trước.
+
+## Thực hành bằng source có sẵn
+
+Lab dưới đây đã nằm trong repository `interview-question`, không cần tạo app mới hoặc chép các đoạn trích thành một project khác.
+
+<SourceRef project="frontend-build-lab" file="vite.config.ts" variant="button">Mở toàn bộ source · Vite React/TypeScript lab</SourceRef>
+
+Chạy các lệnh sau từ thư mục `interview-question`. Lab khai báo Node.js từ `22.12.0`; dùng một bản Node đáp ứng yêu cầu engine của dependencies được cài. Lab không có lockfile được commit, nên `npm install` ở các thời điểm khác nhau có thể resolve patch/minor khác nhau; đây không phải bộ fixture benchmark đã pin.
+
+### Quan sát native ESM và cập nhật component
+
+```bash
+cd examples/frontend-build-lab
+npm install
+npm run dev -- --port 5173 --strictPort
+```
+
+Mở `http://127.0.0.1:5173`, rồi mở Network trong DevTools. Với lần nạp đầu không dùng browser cache, bạn sẽ thấy request source như `/src/main.tsx` cùng các module liên quan. Mở response TSX để kiểm tra: nội dung trả về đã là JavaScript, không phải browser tự parse type annotation.
+
+Bấm **Tải admin module**. App hiển thị `Admin module đã được tải`. Theo dõi request xuất hiện khi thao tác này chạy; đừng chỉ tìm tên file rồi giả định thời điểm tải.
+
+Giữ nguyên trang, sửa tiêu đề `Frontend build lab` trong `src/App.tsx` thành một chuỗi khác. Với thay đổi văn bản này, giao diện cập nhật và thông báo admin vẫn còn. Bạn vừa kiểm tra một trường hợp Fast Refresh giữ state, không chứng minh mọi thay đổi đều giữ state.
+
+### Đối chiếu production chunks và manifest
+
+Dừng dev server. Từ chính thư mục lab, chạy:
+
+```bash
+npm run build
+npm run preview -- --port 4173 --strictPort
+```
+
+Mở `http://127.0.0.1:4173`. Preview phục vụ output đã build; nó không tiếp tục transform source như dev server và không phải production server được khuyến nghị để triển khai thực tế.
+
+Lab bật `build.manifest: true` trong <SourceRef project="frontend-build-lab" file="vite.config.ts">vite.config.ts</SourceRef>. Đọc `dist/.vite/manifest.json`, tìm entry `src/admin.ts` và trường `file` để biết tên chunk được tạo. Tên hash là kết quả của lần build, không phải một hằng số cần chép vào code.
+
+Reload trang với Network đang ghi request. Đối chiếu ba điều:
+
+1. Trang đầu hiển thị `Kết quả: 5`.
+2. Chunk admin ghi trong manifest chưa được tải trước thao tác trong lab này.
+3. Bấm nút mới yêu cầu chunk đó và hiển thị thông báo admin.
+
+Sau đó tìm chuỗi `UNUSED_MATH_SENTINEL` trong các file JavaScript runtime của `dist/assets`. Chuỗi nằm trong hàm không được dùng ở source, và phải vắng mặt trong output của lab. Đây là phép kiểm tra cụ thể cho tree shaking của ví dụ, không phải bảo đảm rằng mọi dependency trong một ứng dụng đều tree-shake được.
+
+### Tách lỗi type khỏi lỗi transform
+
+Dừng preview. Trong <SourceRef project="frontend-build-lab" file="src/math.ts">src/math.ts</SourceRef>, đổi `return a + b` thành `return String(a + b)` nhưng giữ kiểu trả về `number`. Chạy từng lệnh riêng để thấy khác biệt:
+
+```bash
+npm run typecheck
+npx --no-install vite build
+npm run build
+```
+
+Với thay đổi này, kết quả cần đối chiếu là:
+
+| Lệnh | Kết quả cần quan sát | Lý do |
+| --- | --- | --- |
+| `npm run typecheck` | Báo lỗi type, exit code khác 0 | Giá trị trả về là string, không khớp number |
+| `npx --no-install vite build` | Vẫn có thể tạo output | Gọi Vite trực tiếp, không chạy script typecheck |
+| `npm run build` | Dừng ở typecheck | Script của lab ghép kiểm tra type trước build |
+
+Đây là các kết quả mong đợi để bạn tự kiểm tra, không phải log terminal giả lập. Sửa lại `return a + b` và build lại sau thử nghiệm để không giữ output của phiên bản sai type.
+
+Repository còn có kiểm thử lab tự động. Từ thư mục `interview-question`, chạy `npm run examples:labs:test`; script cài/build trong thư mục tạm và kiểm tra manifest, lazy request, tree shaking, lỗi type cùng HMR. Lệnh này cũng chạy lab SharedWorker nên cần browser Playwright và mất nhiều công việc hơn riêng bài này. Nó không deploy site.
+
+## Những khác biệt phải xử lý khi chuyển từ webpack
+
+Giả sử app đang dùng `process.env.API_URL`, alias `@/`, import SVG thành React component và được host dưới `/portal/`. Chép source sang Vite chưa giải quyết được bốn quy ước đó. Toolchain mới cần tạo ra cùng hành vi, chứ không cần có một file config trông giống file cũ.
+
+| Vùng cần kiểm tra | Với Vite | Điều cần giữ đúng khi migrate |
+| --- | --- | --- |
+| HTML entry | HTML thuộc pipeline; khai báo module script | Không copy nguyên giả định của `HtmlWebpackPlugin` |
+| Environment variables | Mặc định dùng `import.meta.env.VITE_*` cho giá trị custom ở client | Đối chiếu chỗ đang dùng DefinePlugin hoặc env replacement của webpack |
+| Alias và extension resolution | Cấu hình tương ứng trong Vite và công cụ liên quan | Alias trong TypeScript không tự chứng minh runtime resolve đúng |
+| CSS, SVG và asset imports | Dùng hành vi mặc định hoặc plugin thích hợp | Phân biệt URL asset, raw text và React component |
+| CommonJS và Node APIs | Dependency optimizer xử lý nhiều package CommonJS trong dev | `node:fs` không tự có bản tương đương trong browser |
+| Đường dẫn deploy | `base` ảnh hưởng URLs của assets | Đối chiếu `output.publicPath`; test cả dynamic chunks |
+| Dev proxy và routing | Có cấu hình dev server riêng | Dev proxy không tự trở thành production proxy hay SPA fallback của hosting |
+| Module Federation | Cần chọn tích hợp tương thích cụ thể | Không mặc định plugin Vite là bản thay thế trực tiếp cho webpack ModuleFederationPlugin |
+
+Với `/portal/`, hãy kiểm tra cả HTML, ảnh/CSS, URL chunk admin và refresh một deep link sau production build. Router base, asset base và cấu hình fallback của hosting là những trách nhiệm liên quan nhưng không thay thế nhau.
+
+**Không đặt secrets vào biến môi trường được đưa xuống client.** Prefix `VITE_` chỉ là quy ước chọn biến để expose, không phải cơ chế bảo mật. Giá trị được nhúng vào bundle có thể bị người dùng đọc; webpack DefinePlugin cũng không biến client code thành nơi giữ bí mật.
+
+Loader của webpack không được chuyển sang Vite chỉ bằng đổi tên thành plugin. Nếu app có transform riêng cho SVG, i18n hoặc code generation, mình sẽ kiểm tra các phần đó sớm: chúng thường quyết định migration có khả thi hơn là vài dòng config entry/output.
+
+## Đo trước khi kết luận công cụ nào nhanh hơn
+
+Giả sử Vite báo server ready sớm hơn, nhưng route chính vẫn mất lâu để dùng được. Nếu chỉ ghi số ở terminal, bạn sẽ bỏ qua chi phí transform, request và thực thi phía browser. Chọn mốc đo theo công việc của người phát triển, không chỉ theo thông báo của CLI.
+
+| Phép đo | Điểm bắt đầu và kết thúc | Điều kiện cần ghi lại |
+| --- | --- | --- |
+| Cold start | Khởi động process đến lúc route kiểm tra tương tác được | Trạng thái tool cache và browser cache; dependency đã cài hay chưa |
+| Warm start | Khởi động lại đến cùng mốc tương tác | Cache nào còn được giữ |
+| Component update | Lưu cùng thay đổi đến lúc DOM cập nhật | Loại sửa, trạng thái HMR/Fast Refresh, có reload hay không |
+| Shared-module update | Sửa module dùng chung đến giao diện cập nhật | Những route/module bị ảnh hưởng |
+| Production build | Bắt đầu script đến lúc hoàn tất cùng tập kiểm tra và output | Type checking, source map, minification, plugins |
+| Production loading | Điều hướng đến mốc tương tác đã chọn | Kích thước tải, số request, cache và network/CPU profile |
+
+Giữ cùng source, cùng browser targets và cùng trách nhiệm kiểm tra. Lặp lại phép đo, ghi phiên bản Node/tool/dependencies rồi so cả phân bố kết quả thay vì chọn một lượt nhanh nhất.
+
+Nếu dùng hai lab khác source, bạn vẫn có thể học cách mỗi pipeline hoạt động. Nhưng không thể dùng thời gian của chúng làm bằng chứng “Vite nhanh hơn webpack bao nhiêu lần”. Bài này không đưa ra benchmark vì chưa có phép so sánh đối chứng như vậy.
+
+## Khi nào chọn Vite, khi nào giữ webpack?
+
+Với một React/Vue SPA mới, không có ràng buộc đặc biệt từ framework, mình chọn Vite làm điểm bắt đầu. Các mặc định cho HTML, assets và dev server giúp giảm phần cấu hình cần tự ghép. Sau đó vẫn cần type checking, tests và kiểm tra production output.
+
+Với app webpack đang ổn định, mình không đổi tool chỉ vì tên công cụ mới hơn. Trước hết hãy xác định chỗ chậm và thử xử lý đúng nút thắt. Nếu app phụ thuộc loader/plugin chuyên biệt, Federation runtime hoặc quy trình build đã tích hợp sâu, chi phí chuyển đổi phải được tính cùng lợi ích thực tế.
+
+Nếu đã chọn một framework có build system riêng như Next.js, hãy theo workflow của framework trước. Đổi bundler không đơn giản là thay script `next build` bằng `vite build`: routing, server rendering và output contract cũng thay đổi.
+
+Một bước thử hợp lý là chuyển một route đại diện hoặc một bản app thử nghiệm sang Vite. Route đó nên có dependency thật, CSS/assets, lazy loading và environment variables. Chỉ cân nhắc chuyển toàn bộ sau khi dev workflow, production build và cách host đều được kiểm chứng.
+
+## Đọc tiếp và tài liệu đối chiếu
+
+<Cards>
+  <Card title="Frontend build tooling" href="/web/02-frontend-build-tooling" description="Đặt compiler, bundler, type checker và build tool vào đúng tầng." />
+  <Card title="webpack từ source đến trình duyệt" href="/web/03-webpack-tu-source-den-trinh-duyet" description="Đọc entry, loaders, chunks và runtime trên một ví dụ React." />
+  <Card title="Module Federation: React và Vue" href="/web/04-module-federation-react-vue-microfrontend" description="Tìm hiểu khi nào cần tải module từ một build độc lập." />
+</Cards>
+
+Đối chiếu hành vi với tài liệu chính thức, nhất là khi dự án dùng major version khác:
+
+- [Vite 8: Rolldown, Oxc và hướng Full Bundle Mode](https://vite.dev/blog/announcing-vite8).
+- [Why Vite: native ESM dev và lý do cần production bundling](https://vite.dev/guide/why.html).
+- [Dependency pre-bundling: CommonJS, tối ưu request và cache](https://vite.dev/guide/dep-pre-bundling.html).
+- [Vite production build: tạo output sẵn để triển khai](https://vite.dev/guide/build).
+- [webpack production: cấu hình và tối ưu cho bản phát hành](https://webpack.js.org/guides/production/).
+- [Vite TypeScript: transform không thay cho type checking](https://vite.dev/guide/features.html#typescript).
+- [Vite environment variables và phạm vi expose xuống client](https://vite.dev/guide/env-and-mode.html).
+- [webpack HMR: compiler, runtime và cách áp dụng bản cập nhật](https://webpack.js.org/concepts/hot-module-replacement/).
+- [webpack cache: memory và filesystem](https://webpack.js.org/configuration/cache/).

@@ -1,0 +1,978 @@
+---
+title: "Long-running transaction: cơ chế, chẩn đoán và thiết kế lại"
+description: "Hiểu transaction sống lâu giữ lại những tài nguyên nào, phân biệt lock wait với snapshot retention, chẩn đoán trên PostgreSQL và thiết kế transaction ngắn mà vẫn giữ đúng nghiệp vụ."
+---
+
+<Callout type="info" title="Phạm vi và kiến thức nền">
+  Bài dành cho bạn đã biết `BEGIN`, `COMMIT`, `ROLLBACK` và SQL cơ bản. Các câu
+  SQL dùng **PostgreSQL 18**; isolation level mặc định trong ví dụ là
+  `READ COMMITTED`, trừ nơi ghi rõ khác. Phần MySQL nói riêng về **MySQL 8.4,
+  InnoDB**. Ví dụ Spring/JPA minh họa transaction boundary, không phải một
+  ứng dụng hoàn chỉnh. Mọi số thời gian trong trace đều là số giả định để học,
+  không phải benchmark.
+</Callout>
+
+## Mục lục
+
+- [Bắt đầu từ một request chậm nhưng SQL vẫn nhanh](#bắt-đầu-từ-một-request-chậm-nhưng-sql-vẫn-nhanh)
+- [Vòng đời transaction và các loại thời gian cần phân biệt](#vòng-đời-transaction-và-các-loại-thời-gian-cần-phân-biệt)
+  - [Transaction duration khác query duration](#transaction-duration-khác-query-duration)
+  - [Active, idle và idle in transaction](#active-idle-và-idle-in-transaction)
+  - [Không có ngưỡng dài dùng cho mọi workload](#không-có-ngưỡng-dài-dùng-cho-mọi-workload)
+- [Những tài nguyên bị giữ lại khi transaction sống lâu](#những-tài-nguyên-bị-giữ-lại-khi-transaction-sống-lâu)
+  - [Lock tồn tại lâu hơn câu SQL đã lấy nó](#lock-tồn-tại-lâu-hơn-câu-sql-đã-lấy-nó)
+  - [MVCC giữ lịch sử để reader còn đọc được](#mvcc-giữ-lịch-sử-để-reader-còn-đọc-được)
+  - [Connection pool và giới hạn concurrency](#connection-pool-và-giới-hạn-concurrency)
+  - [Dữ liệu cũ, WAL, replication và rollback không phải một thứ](#dữ-liệu-cũ-wal-replication-và-rollback-không-phải-một-thứ)
+- [Một trace minh họa cho transaction boundary quá rộng](#một-trace-minh-họa-cho-transaction-boundary-quá-rộng)
+- [Chẩn đoán theo chuỗi từ request đến database](#chẩn-đoán-theo-chuỗi-từ-request-đến-database)
+  - [Tìm transaction mở và đọc đúng timestamp](#tìm-transaction-mở-và-đọc-đúng-timestamp)
+  - [Truy ngược blocker thay vì chỉ nhìn query đang chờ](#truy-ngược-blocker-thay-vì-chỉ-nhìn-query-đang-chờ)
+  - [Đọc dấu hiệu snapshot retention và vacuum](#đọc-dấu-hiệu-snapshot-retention-và-vacuum)
+  - [Ghép với metrics và log của ứng dụng](#ghép-với-metrics-và-log-của-ứng-dụng)
+- [Thu hẹp database transaction mà không làm sai nghiệp vụ](#thu-hẹp-database-transaction-mà-không-làm-sai-nghiệp-vụ)
+  - [Xác định invariant trước khi tách transaction](#xác-định-invariant-trước-khi-tách-transaction)
+  - [Thiết kế checkout bằng các local transaction ngắn](#thiết-kế-checkout-bằng-các-local-transaction-ngắn)
+  - [Dùng conditional UPDATE để giảm phần việc dưới lock](#dùng-conditional-update-để-giảm-phần-việc-dưới-lock)
+  - [Không đổi lock dài thành race condition](#không-đổi-lock-dài-thành-race-condition)
+- [Outbox, idempotency và recovery cho công việc ngoài database](#outbox-idempotency-và-recovery-cho-công-việc-ngoài-database)
+  - [Outbox đóng khoảng trống giữa commit và gửi việc](#outbox-đóng-khoảng-trống-giữa-commit-và-gửi-việc)
+  - [Idempotency phải đi tới nơi có side effect](#idempotency-phải-đi-tới-nơi-có-side-effect)
+  - [Timeout của payment là trạng thái chưa chắc chắn](#timeout-của-payment-là-trạng-thái-chưa-chắc-chắn)
+  - [Compensation là nghiệp vụ bù, không phải ROLLBACK từ xa](#compensation-là-nghiệp-vụ-bù-không-phải-rollback-từ-xa)
+- [Transaction boundary trong Spring và JPA](#transaction-boundary-trong-spring-và-jpa)
+  - [Annotation đặt quá rộng khiến HTTP nằm dưới transaction](#annotation-đặt-quá-rộng-khiến-http-nằm-dưới-transaction)
+  - [Tách orchestration khỏi các method transactional](#tách-orchestration-khỏi-các-method-transactional)
+  - [Những bẫy khiến việc tách method chưa thực sự tách transaction](#những-bẫy-khiến-việc-tách-method-chưa-thực-sự-tách-transaction)
+- [Batch, import và báo cáo dài](#batch-import-và-báo-cáo-dài)
+  - [Chia batch bằng keyset và checkpoint bền vững](#chia-batch-bằng-keyset-và-checkpoint-bền-vững)
+  - [Commit theo batch thay đổi hợp đồng nhất quán](#commit-theo-batch-thay-đổi-hợp-đồng-nhất-quán)
+  - [Báo cáo cần snapshot dài thì phải trả đúng chi phí](#báo-cáo-cần-snapshot-dài-thì-phải-trả-đúng-chi-phí)
+- [Timeout và retry như hàng rào bảo vệ](#timeout-và-retry-như-hàng-rào-bảo-vệ)
+  - [Mỗi timeout bảo vệ một khoảng thời gian khác nhau](#mỗi-timeout-bảo-vệ-một-khoảng-thời-gian-khác-nhau)
+  - [Lỗi statement không có nghĩa ứng dụng được dùng tiếp transaction](#lỗi-statement-không-có-nghĩa-ứng-dụng-được-dùng-tiếp-transaction)
+  - [Retry cả đơn vị công việc hợp lệ trong transaction mới](#retry-cả-đơn-vị-công-việc-hợp-lệ-trong-transaction-mới)
+- [Đối chiếu PostgreSQL và MySQL InnoDB](#đối-chiếu-postgresql-và-mysql-innodb)
+- [Thực hành trên PostgreSQL bằng nhiều session](#thực-hành-trên-postgresql-bằng-nhiều-session)
+  - [Chuẩn bị database lab và ba cửa sổ psql](#chuẩn-bị-database-lab-và-ba-cửa-sổ-psql)
+  - [Thí nghiệm 1 - UPDATE xong nhưng writer khác vẫn chờ](#thí-nghiệm-1---update-xong-nhưng-writer-khác-vẫn-chờ)
+  - [Thí nghiệm 2 - read-only snapshot giữ góc nhìn cũ](#thí-nghiệm-2---read-only-snapshot-giữ-góc-nhìn-cũ)
+  - [Thí nghiệm 3 - statement timeout không tự đóng explicit transaction](#thí-nghiệm-3---statement-timeout-không-tự-đóng-explicit-transaction)
+  - [Dọn lab sau khi tất cả transaction đã kết thúc](#dọn-lab-sau-khi-tất-cả-transaction-đã-kết-thúc)
+- [Runbook ngắn khi production đang bị nghẽn](#runbook-ngắn-khi-production-đang-bị-nghẽn)
+  - [Khoanh vùng trước khi hủy session](#khoanh-vùng-trước-khi-hủy-session)
+  - [Phân biệt cancel query với terminate session](#phân-biệt-cancel-query-với-terminate-session)
+  - [Xác nhận recovery và sửa nguyên nhân gốc](#xác-nhận-recovery-và-sửa-nguyên-nhân-gốc)
+- [Checklist thiết kế và kiểm thử](#checklist-thiết-kế-và-kiểm-thử)
+- [Tài liệu tham khảo và bài liên quan](#tài-liệu-tham-khảo-và-bài-liên-quan)
+
+## Bắt đầu từ một request chậm nhưng SQL vẫn nhanh
+
+Giả sử API checkout cập nhật tồn kho, gọi Payment API rồi ghi kết quả thanh toán. Mỗi câu SQL chỉ mất vài millisecond, nhưng Payment API mất tám giây. Nếu tất cả nằm trong một database transaction, transaction đó vẫn sống suốt tám giây chờ mạng.
+
+Một request khác muốn mua cùng sản phẩm có thể phải chờ lock. Nhiều request cùng làm như vậy sẽ giữ hết connection trong pool — tập các connection mà ứng dụng tái sử dụng để nói chuyện với database. Lúc này API chậm hàng loạt dù CPU database chưa cao và không có câu SQL nào tốn tám giây xử lý.
+
+**Long-running transaction là vấn đề về thời gian giữ một transaction mở, không chỉ về tốc độ của từng query.** Để sửa đúng, bạn cần xác định transaction đang giữ gì, ai bị ảnh hưởng và phần công việc nào thật sự phải commit cùng nhau.
+
+Bài dùng checkout làm ví dụ chính. Cơ chế tương tự cũng xuất hiện trong job import, báo cáo dài, migration dữ liệu và code ORM mở transaction rộng hơn cần thiết.
+
+## Vòng đời transaction và các loại thời gian cần phân biệt
+
+### Transaction duration khác query duration
+
+Với một explicit transaction, khoảng thời gian từ `BEGIN` đến khi transaction kết thúc có thể chứa nhiều việc ngoài SQL:
+
+```sql title="Một transaction chưa kết thúc sau câu UPDATE"
+BEGIN;
+
+UPDATE inventory
+SET remaining = remaining - 1
+WHERE sku = 'BOOK-001' AND remaining > 0;
+
+-- Ứng dụng chưa gửi COMMIT hoặc ROLLBACK.
+-- Trong lúc đó, nó có thể đang chờ HTTP, xử lý CPU hoặc chờ người dùng.
+```
+
+Đây là hình dạng SQL minh họa; bảng cho bài thực hành được tạo riêng ở cuối bài. Nếu `UPDATE` sửa được row, transaction đã có thay đổi chưa commit và quyền khóa tương ứng. Câu `UPDATE` chạy xong không có nghĩa transaction đã xong.
+
+Khi không có explicit `BEGIN`, chế độ autocommit thường khiến mỗi statement là một transaction riêng. Một `SELECT` chạy mười phút vẫn có thể là transaction mười phút, dù code không hề viết `BEGIN`.
+
+| Đại lượng | Đo khoảng nào | Dùng để tìm vấn đề |
+| --- | --- | --- |
+| Request duration | Từ lúc nhận request đến khi trả response | Trải nghiệm của caller |
+| Transaction duration | Từ lúc transaction bắt đầu đến khi kết thúc | Thời gian giữ transaction mở |
+| Statement duration | Một statement từ khi bắt đầu đến khi xong hoặc bị hủy | SQL chậm, lock wait, I/O |
+| Lock wait duration | Thời gian chờ lấy một lock | Contention giữa các transaction |
+| Pool acquisition duration | Thời gian ứng dụng chờ mượn connection | Pool thiếu connection hoặc DB quá tải |
+| Idle-in-transaction duration | Thời gian backend chờ lệnh tiếp theo khi transaction còn mở | Application bỏ quên transaction hoặc chờ việc ngoài DB |
+
+Một statement đang chờ lock vẫn được tính vào statement duration. Nó không nhất thiết đang dùng CPU để thực thi query.
+
+### Active, idle và idle in transaction
+
+PostgreSQL thể hiện trạng thái backend trong `pg_stat_activity`. Backend là process phía server phục vụ một connection.
+
+- `active`: đang thực thi một query. Query có thể đang chờ lock, I/O hoặc một sự kiện khác.
+- `idle`: đang chờ lệnh từ client, không có transaction mở.
+- `idle in transaction`: đang chờ lệnh từ client, nhưng transaction chưa kết thúc.
+- `idle in transaction (aborted)`: transaction đã gặp lỗi và đang chờ client kết thúc transaction lỗi, thường bằng `ROLLBACK`.
+
+Ví dụ ứng dụng vừa `UPDATE` xong rồi `await paymentClient.charge(...)`. Nếu không gửi thêm SQL trong lúc chờ HTTP, phía PostgreSQL thường thấy `idle in transaction`, không thấy tên Payment API.
+
+`idle in transaction` không tự động có nghĩa là đang giữ một row lock nguy hiểm. `BEGIN` rồi chưa truy cập dữ liệu khác với `UPDATE` một hot row rồi ngừng gửi lệnh. Bạn phải đọc trạng thái cùng lock, transaction ID và snapshot đang được giữ.
+
+### Không có ngưỡng dài dùng cho mọi workload
+
+Một transaction giữ row tồn kho trong hai giây có thể gây ùn tắc checkout. Một read-only report chạy hai phút trên hạ tầng tách biệt có thể chấp nhận được. Cùng một duration, tác động khác nhau vì tài nguyên và workload khác nhau.
+
+Mình sẽ đặt budget theo loại thao tác: checkout cần transaction ngắn và deadline rõ; batch có giới hạn số row mỗi lần commit; report có ngân sách tài nguyên riêng. Cảnh báo nên kết hợp tuổi transaction với blocking, pool pending và tốc độ phát sinh dữ liệu cũ, thay vì chỉ nhìn một mốc thời gian cố định.
+
+## Những tài nguyên bị giữ lại khi transaction sống lâu
+
+### Lock tồn tại lâu hơn câu SQL đã lấy nó
+
+Trong PostgreSQL, nhiều lock lấy trong transaction được giữ đến cuối transaction. Chẳng hạn `UPDATE` giữ row lock cho row được sửa và table-level lock phù hợp với thao tác ghi. Rollback về savepoint có thể giải phóng lock lấy sau savepoint đó; đây không phải lý do để mở một outer transaction dài.
+
+Giả sử transaction A giảm tồn kho của `BOOK-001` rồi gọi HTTP. Transaction B cũng muốn cập nhật `BOOK-001`. B phải chờ A commit hoặc rollback, dù câu `UPDATE` của A đã hoàn thành từ lâu.
+
+Một plain `SELECT` dùng MVCC thường vẫn đọc được phiên bản đã commit trước đó. **Row lock không đồng nghĩa tất cả reader đều bị chặn.** Ngược lại, DDL cần lock mạnh như `ACCESS EXCLUSIVE` có thể phải chờ cả transaction đọc đang giữ `ACCESS SHARE` trên bảng.
+
+Sơ đồ sau thể hiện quan hệ chờ, không phải timeline đo được. Logo PostgreSQL chỉ nhận diện database; pool và Payment API là thành phần generic nên không gắn logo vendor.
+
+```d2 title="Một transaction chậm lan thành hàng chờ" interactive=false
+direction: down
+owner: "Request A\nChờ Payment API"
+database: "PostgreSQL\nTransaction A chưa kết thúc" {
+  shape: cylinder
+  icon: /interview-question/postgresql.svg
+}
+waiters: "Request B và C\nChờ cập nhật cùng row"
+pool: "Connection pool\nConnection đang được mượn"
+new_requests: "Request mới\nChờ mượn connection"
+owner -> database: "Chưa gửi COMMIT hoặc ROLLBACK"
+waiters -> database: "Chờ lock do A giữ"
+waiters -> pool: "Vẫn chiếm connection khi chờ"
+owner -> pool: "Connection của A chưa được trả"
+new_requests -> pool: "Không còn connection rảnh"
+```
+
+Điểm cần sửa đầu tiên là transaction A đang giữ tài nguyên trong lúc chờ việc ngoài database. Tăng pool có thể chỉ cho phép nhiều request hơn đi vào cùng hàng chờ lock.
+
+Một rủi ro khác là DDL đang chờ. Ví dụ migration cần exclusive lock sau một transaction đọc dài; các request mới có thể tiếp tục xếp hàng sau yêu cầu lock mạnh đang chờ đó. Khi triage, đừng chỉ tìm row bị nhiều người ghi: kiểm tra cả migration và table-level lock.
+
+### MVCC giữ lịch sử để reader còn đọc được
+
+MVCC — multi-version concurrency control — cho phép database phục vụ các transaction bằng những phiên bản dữ liệu khác nhau. Nếu report đang nhìn tồn kho tại một snapshot cũ, database không được xóa phiên bản mà report vẫn có thể cần.
+
+Snapshot là góc nhìn về các thay đổi đã commit mà một thao tác được phép thấy. Nó không phải một bản sao đầy đủ của database được tạo ngay khi `BEGIN`.
+
+Trong PostgreSQL, `UPDATE` tạo phiên bản row mới. Phiên bản cũ trở thành đối tượng có thể được dọn khi không còn transaction/snapshot liên quan cần nó. `VACUUM` thu hồi phần không gian có thể tái sử dụng; autovacuum là cơ chế tự chạy công việc này.
+
+Một snapshot cũ được giữ lâu có thể trì hoãn việc dọn những phiên bản còn cần cho snapshot đó. Nếu các transaction khác liên tục cập nhật bảng, lượng phiên bản cũ tích lại có thể lớn hơn nhiều so với dữ liệu mà report thực sự đọc.
+
+| Chế độ PostgreSQL | Snapshot cho đọc thông thường | Hệ quả với transaction dài |
+| --- | --- | --- |
+| `READ COMMITTED` | Snapshot mới cho mỗi statement | Một `SELECT` dài giữ snapshot trong lúc chạy; không mặc định giữ nguyên snapshot của `SELECT` đã xong tới cuối transaction |
+| `REPEATABLE READ` | Snapshot chung được lấy từ statement đầu tiên cần snapshot | Transaction tiếp tục đọc góc nhìn đó; snapshot có thể giữ cleanup horizon lùi lại |
+| `SERIALIZABLE` | Có tính chất snapshot như `REPEATABLE READ`, thêm theo dõi để phát hiện lịch chạy không serializable | Transaction dài còn tăng cửa sổ phát sinh xung đột; ứng dụng phải xử lý serialization failure |
+
+Cleanup horizon là ranh giới mà sau nó database mới có thể kết luận một số phiên bản cũ không còn cần nữa. Trong chẩn đoán PostgreSQL, `backend_xmin` giúp nhìn phần snapshot horizon do backend giữ. `backend_xid` cho biết top-level transaction ID đã được cấp, nếu có.
+
+Một transaction đã ghi có thể ảnh hưởng việc dọn ngay cả khi đang dùng `READ COMMITTED`. Vì vậy, đừng suy từ tên isolation level rằng transaction không thể giữ cleanup lại. Hãy xem cả `backend_xmin`, `backend_xid`, hoạt động ghi và thông tin vacuum.
+
+<Callout type="warn" title="Không đồng nhất transaction age với snapshot age">
+  `BEGIN` rồi ngồi chờ ở `READ COMMITTED` không tự động giữ một snapshot cố định
+  như report `REPEATABLE READ`. Ngược lại, một read-only transaction vẫn có thể
+  giữ snapshot và table lock. Chẩn đoán phải dựa trên tài nguyên thật đang giữ,
+  không chỉ nhãn read-only hay tuổi `xact_start`.
+</Callout>
+
+### Connection pool và giới hạn concurrency
+
+Với một ứng dụng dùng connection gắn với transaction, transaction mở thường giữ connection đã mượn cho đến khi kết thúc. Việc backend đang idle không làm connection đó tự trở về pool ứng dụng.
+
+Có thể ước lượng mức giữ connection bằng Little's Law: trong hệ thống ổn định, số công việc trung bình đang ở trong hệ thống bằng tốc độ vào nhân thời gian trung bình ở trong đó.
+
+Ví dụ giả định: có 20 transaction mỗi giây, mỗi transaction giữ connection trung bình 0,05 giây. Mức sử dụng trung bình tương ứng khoảng một connection. Nếu cùng lượng việc giữ connection tám giây, nhu cầu trung bình thành khoảng 160 connection.
+
+Đây là phép tính minh họa, không phải công thức chọn pool size. Burst, phân bố latency, lock contention và giới hạn DB làm tình hình khác đi. Nó chỉ ra vì sao giảm thời gian giữ connection thường hiệu quả hơn việc tăng pool một cách mù quáng.
+
+Đo riêng `active`, `idle`, `pending` và thời gian acquisition ở pool. `max_connections` của database không cho bạn biết request đang chờ pool ứng dụng bao lâu.
+
+### Dữ liệu cũ, WAL, replication và rollback không phải một thứ
+
+Khi xử lý transaction lớn, cần phân biệt các loại chi phí thay vì gom tất cả thành “log phình”.
+
+| Thành phần | Điều đang xảy ra | Điều không nên suy ra |
+| --- | --- | --- |
+| PostgreSQL dead tuples | Phiên bản row cũ chờ dọn hoặc không gian chờ tái sử dụng | Cứ kết thúc blocker là file bảng tự co lại ngay |
+| PostgreSQL WAL | Nhật ký phục vụ durability và recovery; thay đổi có thể phát sinh WAL trước commit | Một transaction mở bất kỳ luôn giữ toàn bộ WAL từ lúc `BEGIN` |
+| Replication slot / archive | Có thể giữ WAL nếu consumer hoặc lưu trữ log không tiến kịp | Mọi trường hợp WAL tăng đều do transaction lâu |
+| InnoDB undo history | Giữ thông tin phiên bản cũ và phục vụ rollback | PostgreSQL cũng rollback bằng đúng cơ chế undo của InnoDB |
+| Logical replication | Transaction lớn có thể gây áp lực decode, buffering hoặc apply tùy cấu hình/version | Mọi kiểu replication đều chờ commit mới nhận bất kỳ byte thay đổi nào |
+
+PostgreSQL physical replication có thể nhận và replay WAL trước khi transaction nguồn commit. Dữ liệu vẫn chưa trở thành thay đổi đã commit cho reader. Logical replication có tùy chọn streaming transaction đang chạy; hành vi buffering/apply còn tùy cấu hình.
+
+Rollback một transaction ghi lớn của InnoDB có thể mất thời gian đáng kể để undo thay đổi. PostgreSQL chủ yếu làm các phiên bản của transaction bị abort không còn được xem là committed; dọn vật lý vẫn là công việc về sau. Dù dùng engine nào, hủy transaction không đồng nghĩa hoàn trả tức thì mọi chi phí I/O, disk và side effect ngoài database.
+
+## Một trace minh họa cho transaction boundary quá rộng
+
+Trong tình huống giả định dưới đây, request chỉ có hai thao tác database ngắn. Transaction lại ôm cả cuộc gọi Payment API. Mốc thời gian chung bắt đầu từ lúc nhận request; span transaction nằm trong request, các thao tác còn lại nằm trong transaction.
+
+```span-waterfall
+title: Trace minh họa - transaction giữ connection trong lúc chờ HTTP
+unit: ms
+provenance:
+  kind: illustrative
+  description: Số giả định để giải thích transaction boundary; không lấy từ production và không phải benchmark.
+spans:
+  - id: request
+    name: POST /checkout
+    service: checkout-api
+    start: 0
+    duration: 8080
+    status: ok
+  - id: transaction
+    parent: request
+    name: Database transaction
+    service: checkout-api
+    start: 10
+    duration: 8060
+    status: ok
+  - id: reserve
+    parent: transaction
+    name: UPDATE inventory
+    service: postgresql
+    start: 15
+    duration: 10
+    status: ok
+  - id: payment
+    parent: transaction
+    name: Payment API
+    service: payment-provider
+    start: 30
+    duration: 8000
+    status: ok
+  - id: finish
+    parent: transaction
+    name: UPDATE order và COMMIT
+    service: postgresql
+    start: 8040
+    duration: 30
+    status: ok
+```
+
+Span Payment API kéo dài 8.000 ms. Khoảng giữ lock sau câu cập nhật tồn kho kéo dài qua toàn bộ đoạn chờ đó nếu row đã được sửa thành công. Trong khi chờ HTTP, PostgreSQL không cần có một query dài tương ứng để request vẫn gây hại.
+
+Không cộng duration của span cha với span con: chúng chồng lấp. Trace cũng không tự chứng minh request khác đang bị block; bạn cần liên hệ thêm với lock wait và pool metrics.
+
+Mục tiêu thiết kế là bỏ cuộc gọi HTTP ra khỏi **database transaction**, không nhất thiết làm toàn bộ nghiệp vụ checkout hoàn tất trong một transaction duy nhất.
+
+## Chẩn đoán theo chuỗi từ request đến database
+
+### Tìm transaction mở và đọc đúng timestamp
+
+Chạy truy vấn sau trên database cần kiểm tra, ở một monitoring connection dùng autocommit. Bạn cần quyền xem thống kê phù hợp, chẳng hạn role `pg_read_all_stats`, để đọc đầy đủ thông tin session của user khác. Query text có thể chứa dữ liệu nhạy cảm; không đưa nguyên văn vào ticket công khai.
+
+```sql title="monitor-open-transactions.sql"
+SELECT
+    pid,
+    application_name,
+    usename,
+    state,
+    clock_timestamp() - xact_start AS transaction_age,
+    CASE WHEN state = 'active'
+         THEN clock_timestamp() - query_start
+    END AS active_query_age,
+    CASE WHEN state LIKE 'idle in transaction%'
+         THEN clock_timestamp() - state_change
+    END AS idle_in_transaction_age,
+    wait_event_type,
+    wait_event,
+    backend_xid,
+    backend_xmin,
+    left(query, 300) AS query_sample
+FROM pg_stat_activity
+WHERE datname = current_database()
+  AND (xact_start IS NOT NULL OR state LIKE 'idle in transaction%')
+  AND pid <> pg_backend_pid()
+ORDER BY xact_start NULLS LAST;
+```
+
+`xact_start` là lúc transaction hiện tại bắt đầu. `query_start` là lúc query hiện tại bắt đầu nếu backend đang active; nếu không active, nó chỉ thời điểm query gần nhất bắt đầu. Vì vậy, lấy `now() - query_start` rồi gọi tất cả kết quả là “query đang chạy” sẽ gây chẩn đoán sai.
+
+`state_change` cho biết lúc backend chuyển sang trạng thái hiện tại. Nó hữu ích để phân biệt transaction đã sống lâu với việc vừa mới bắt đầu idle. Session `idle in transaction (aborted)` có thể có `xact_start` rỗng; query vẫn giữ lại row đó để bạn thấy đường cleanup phía client còn chưa kết thúc.
+
+Dùng `clock_timestamp()` để đọc đồng hồ hiện tại. `now()` trong PostgreSQL cố định tại đầu transaction; một monitoring transaction bị mở quá lâu có thể làm phép đo của chính bạn gây hiểu nhầm. Chạy từng lần lấy mẫu trong autocommit cũng tránh giữ snapshot thống kê lâu không cần thiết.
+
+Khi `state = 'active'` và `wait_event_type = 'Lock'`, ưu tiên truy ngược blocker. Khi backend idle lâu sau câu `UPDATE`, tìm application trace, đường gọi HTTP và nhánh exception đã không đóng transaction.
+
+### Truy ngược blocker thay vì chỉ nhìn query đang chờ
+
+Dùng `pg_blocking_pids()` để hỏi PostgreSQL backend nào đang chặn việc lấy lock. Hàm này tránh việc phải tự ghép mọi loại lock từ `pg_locks` bằng một query dễ sai.
+
+```sql title="monitor-blockers.sql"
+SELECT
+    waiting.pid AS waiting_pid,
+    waiting.application_name AS waiting_app,
+    clock_timestamp() - waiting.query_start AS waiting_query_age,
+    blocker_pid.pid AS blocking_pid,
+    blocking.application_name AS blocking_app,
+    blocking.state AS blocking_state,
+    clock_timestamp() - blocking.xact_start AS blocking_transaction_age,
+    left(waiting.query, 200) AS waiting_query,
+    left(blocking.query, 200) AS blocking_last_query
+FROM pg_stat_activity AS waiting
+CROSS JOIN LATERAL
+    unnest(pg_blocking_pids(waiting.pid)) AS blocker_pid(pid)
+LEFT JOIN pg_stat_activity AS blocking
+    ON blocking.pid = blocker_pid.pid
+WHERE waiting.datname = current_database()
+ORDER BY waiting.query_start;
+```
+
+Một waiting backend có thể có nhiều blocker. Blocker cũng có thể đang chờ người khác; tiếp tục lần theo quan hệ này để tìm điểm đầu chuỗi, không chỉ hủy một request ở cuối hàng.
+
+`blocking_last_query` của backend idle là query cuối, không phải query vẫn đang chạy. Đây thường là manh mối để tìm thao tác đã lấy lock rồi bỏ transaction mở.
+
+`pg_blocking_pids()` còn xét thứ tự hàng chờ lock. Trường hợp prepared transaction giữ lock có thể xuất hiện PID bằng `0`, không có row backend tương ứng; khi đó cần kiểm tra `pg_prepared_xacts` và quy trình two-phase commit của hệ thống. Đừng coi `LEFT JOIN` không tìm ra backend là bằng chứng không có blocker.
+
+### Đọc dấu hiệu snapshot retention và vacuum
+
+Nếu không có lock wait nhưng bảng cập nhật nhiều và cleanup không tiến, kiểm tra transaction horizon:
+
+```sql title="monitor-transaction-horizons.sql"
+SELECT
+    pid,
+    application_name,
+    state,
+    clock_timestamp() - xact_start AS transaction_age,
+    backend_xid,
+    age(backend_xid) AS xid_age,
+    backend_xmin,
+    age(backend_xmin) AS xmin_age
+FROM pg_stat_activity
+WHERE datname = current_database()
+  AND (backend_xid IS NOT NULL OR backend_xmin IS NOT NULL)
+ORDER BY GREATEST(age(backend_xid), age(backend_xmin)) DESC NULLS LAST;
+
+SELECT
+    relname,
+    n_live_tup,
+    n_dead_tup,
+    last_autovacuum,
+    autovacuum_count
+FROM pg_stat_user_tables
+ORDER BY n_dead_tup DESC;
+```
+
+`age(backend_xmin)` và `age(backend_xid)` đo khoảng cách transaction ID, **không phải số giây**. Hệ thống ghi nhiều có thể tăng XID age nhanh hơn hệ thống ít ghi, dù cùng wall-clock duration.
+
+`n_dead_tup` là ước lượng thống kê. Nó không đủ để kết luận bảng đã bloat bao nhiêu byte hoặc một transaction cụ thể là thủ phạm duy nhất. Bloat là phần không gian vật lý phình ra so với dữ liệu cần giữ; muốn đánh giá phải xét thêm kích thước bảng/index và lịch sử thay đổi.
+
+Nếu kết thúc transaction nghi vấn mà cleanup vẫn bị giữ, mở rộng kiểm tra prepared transactions, replication slots và feedback từ standby. `hot_standby_feedback` có thể giữ cleanup trên primary để bảo vệ query trên standby. Đừng dừng điều tra chỉ vì không thấy một session đọc lâu trên primary.
+
+### Ghép với metrics và log của ứng dụng
+
+Database không biết transaction thuộc nhánh business nào nếu ứng dụng không truyền đủ ngữ cảnh. Đặt `application_name` có ý nghĩa cho service/job, rồi liên hệ với trace/request ID trong log ứng dụng. Không nhồi token, thông tin khách hàng hoặc toàn bộ payload vào connection metadata.
+
+Một bộ tín hiệu hữu ích gồm:
+
+| Lớp | Theo dõi | Cách diễn giải ban đầu |
+| --- | --- | --- |
+| API | Latency, timeout, số request đang xử lý | Xác định phạm vi ảnh hưởng |
+| Pool | Active, pending, acquisition latency, acquisition timeout | Request chờ connection hay đã vào DB |
+| Transaction | Duration theo use case, commit/rollback, idle duration | Boundary có rộng hơn công việc DB không |
+| Lock | Số waiter, thời gian chờ, chuỗi blocker | Contention hay query tự chậm |
+| Cleanup | Dead-tuple trend, vacuum progress, XID/xmin age | Có lịch sử bị giữ hoặc vacuum thiếu tài nguyên không |
+| External dependency | HTTP duration, deadline, retry count | Phần chờ mạng có nằm trong transaction không |
+
+Nếu API timeout sau ba giây nhưng transaction tiếp tục mở thêm nhiều giây, cancellation của request chưa được truyền thành cleanup tài nguyên. Đây là lỗi lifecycle, không chỉ là một timeout đặt chưa đẹp.
+
+## Thu hẹp database transaction mà không làm sai nghiệp vụ
+
+### Xác định invariant trước khi tách transaction
+
+Invariant là điều luôn phải đúng sau mỗi lần commit. Với checkout, một invariant đơn giản là `remaining >= 0`: không bán quá số hàng có thể cấp.
+
+Database có thể bảo vệ việc giảm tồn kho và tạo reservation trong cùng local transaction. Nhưng nó không tự rollback khoản tiền mà một payment provider đã charge qua HTTP. Đặt HTTP call vào giữa `BEGIN` và `COMMIT` chỉ kéo dài thời gian giữ lock; nó không biến hai hệ thống thành một atomic transaction.
+
+Trước khi sửa boundary, viết rõ ba điều:
+
+1. Những thay đổi nào trong **cùng database** phải commit hoặc rollback cùng nhau.
+2. Những side effect nào nằm ngoài quyền rollback của database.
+3. Trạng thái trung gian nào được phép xuất hiện để nghiệp vụ tiếp tục hoặc phục hồi.
+
+Với một thao tác chuyển tiền giữa hai account trong cùng DB, có thể vẫn cần một transaction chứa cả hai cập nhật. Đừng tách mỗi câu `UPDATE` thành một transaction chỉ để duration trông ngắn hơn; bạn sẽ phá invariant chuyển tiền nguyên vẹn.
+
+### Thiết kế checkout bằng các local transaction ngắn
+
+Một hướng mặc định hợp lý là reserve tồn kho và tạo order `PENDING_PAYMENT` trong transaction ngắn. Sau commit, worker hoặc bước orchestration mới gọi Payment API. Kết quả được ghi bằng một transaction ngắn khác.
+
+| Bước | Công việc | Có nằm trong DB transaction không |
+| --- | --- | --- |
+| Chuẩn bị | Parse request, kiểm tra format, chuẩn bị dữ liệu không cần lock | Không |
+| T1 | Kiểm tra/giảm lượng có thể bán, tạo reservation và order, ghi payment intent vào outbox | Có; commit cùng nhau |
+| Gọi ngoài | Gửi yêu cầu thanh toán với idempotency key ổn định | Không giữ transaction T1 |
+| T2 | Áp dụng kết quả thanh toán hợp lệ vào order/reservation | Có; transaction mới |
+| Gửi thông báo | Phát sự kiện hoặc email qua cơ chế retry riêng | Ngoài T1/T2; có thể dùng outbox |
+
+Reservation là phần hàng đã giữ cho một order nhưng chưa hoàn tất bán. Nếu trường `remaining` đại diện cho hàng còn có thể bán, T1 có thể giảm nó ngay khi reserve. Khi thanh toán thất bại chắc chắn hoặc reservation hết hạn hợp lệ, một transaction bù sẽ trả lượng hàng tương ứng.
+
+Các bước này tạo **eventual consistency**: trạng thái giữa các hệ thống có thể khác nhau tạm thời, nhưng có cơ chế đưa chúng về trạng thái nghiệp vụ hợp lệ. Bạn đổi một boundary rộng, dễ nghẽn thành nhiều boundary nhỏ có recovery rõ ràng.
+
+Đổi lại, hệ thống phải hiển thị và xử lý trạng thái pending. Đây là chi phí thật, không phải chi tiết có thể bỏ qua sau khi đưa HTTP ra ngoài transaction.
+
+### Dùng conditional UPDATE để giảm phần việc dưới lock
+
+Nếu quy tắc có thể biểu diễn ngay bằng điều kiện SQL, không cần đọc tồn kho rồi giữ lock trong lúc ứng dụng tính một phép trừ đơn giản.
+
+```sql title="Giảm tồn kho có điều kiện"
+UPDATE inventory
+SET remaining = remaining - 1
+WHERE sku = 'BOOK-001'
+  AND remaining >= 1
+RETURNING sku, remaining;
+```
+
+Ứng dụng phải kiểm tra có row trả về hay không. Không có row nghĩa là SKU không tồn tại hoặc không đủ hàng theo điều kiện đã chọn; nó không phải một lần reserve thành công.
+
+Ở PostgreSQL `READ COMMITTED`, nếu hai writer tranh cùng row, writer đến sau có thể chờ writer trước kết thúc rồi kiểm tra lại điều kiện trên phiên bản mới. Đây vẫn có lock và vẫn có thể chờ; nó giảm round trip và tránh phần tính toán không cần thiết trong ứng dụng.
+
+Nếu còn phải tạo order và reservation, đặt câu `UPDATE` đó cùng các thao tác insert trong T1. Việc câu lệnh đơn lẻ atomic không làm cả một chuỗi statement chạy autocommit trở thành atomic.
+
+### Không đổi lock dài thành race condition
+
+Một cách sửa sai thường gặp là đọc tồn kho trong transaction ngắn, commit, gọi HTTP rồi dùng số đã đọc để ghi đè tồn kho. Lock đã ngắn, nhưng dữ liệu đọc trước HTTP có thể cũ.
+
+Khi quay lại T2, chỉ thực hiện transition nếu state/version hiện tại cho phép. Ví dụ một kết quả payment không được tự chuyển order `CANCELLED` thành `PAID` chỉ vì worker đã đọc order là pending vài giây trước.
+
+Có thể dùng conditional update theo state, optimistic version check hoặc lock ngắn khi quyết định transition. Cơ chế nào cũng cần kiểm tra số row đã cập nhật. Nếu không transition được, đi vào nhánh reconcile, không coi đó là thành công im lặng.
+
+Đặc biệt, worker xử lý thanh toán và worker hết hạn reservation có thể chạy đồng thời. Chúng phải thống nhất thứ tự khóa hoặc điều kiện version/state để chỉ một transition hợp lệ thắng. Nếu payment đã thành công nhưng reservation vừa hết hạn, cần policy rõ: hoàn tiền, cấp lại hàng nếu còn, hoặc chuyển xử lý thủ công.
+
+## Outbox, idempotency và recovery cho công việc ngoài database
+
+### Outbox đóng khoảng trống giữa commit và gửi việc
+
+Giả sử T1 commit order xong, process chết trước khi publish `PaymentRequested`. Nếu chỉ gọi queue sau commit, có thể không ai tiếp tục xử lý order đó.
+
+Transactional outbox giải quyết khoảng trống này bằng cách ghi **order và ý định phát công việc trong cùng database transaction**. Một relay đọc outbox đã commit rồi chuyển công việc tới worker/broker. Outbox có thể chứa `event_id`, loại sự kiện, order ID, payload tối thiểu và trạng thái gửi.
+
+Sơ đồ dưới đây thể hiện boundary sở hữu dữ liệu. T1 không chứa cuộc gọi Payment API; T2 cũng chỉ ghi kết quả về database.
+
+```d2 title="Checkout bằng outbox và các transaction ngắn" interactive=false
+direction: down
+api: Checkout API
+store: "PostgreSQL\nOrder + reservation + outbox" {
+  shape: cylinder
+  icon: /interview-question/postgresql.svg
+}
+relay: "Outbox relay"
+worker: "Payment worker"
+payment: "Payment API"
+api -> store: "T1 commit dữ liệu và payment intent"
+store -> relay: "Đọc outbox đã commit"
+relay -> worker: "Giao việc có event ID"
+worker -> payment: "HTTP với idempotency key"
+payment -> worker: "Kết quả hoặc trạng thái chưa rõ"
+worker -> store: "T2 áp dụng transition hợp lệ"
+```
+
+Relay có thể chết sau khi publish nhưng trước khi đánh dấu đã gửi. Vì vậy, message có thể được gửi lại. Outbox giải quyết tính atomic của **dữ liệu và ý định gửi**, không tự cung cấp exactly-once delivery cho toàn bộ hệ thống.
+
+Nếu relay hoặc worker claim job bằng lock, commit việc claim trước khi gọi HTTP. Có thể dùng lease — quyền xử lý có thời hạn — để job được nhận lại sau khi worker chết. Việc `SELECT ... FOR UPDATE SKIP LOCKED` rồi giữ transaction suốt HTTP vẫn tái tạo đúng lỗi ban đầu.
+
+### Idempotency phải đi tới nơi có side effect
+
+Idempotency nghĩa là lặp lại cùng một thao tác logic không làm side effect xảy ra thêm lần nữa. Với payment, retry cùng payment attempt cần dùng cùng key, ví dụ `order-demo-42:payment-attempt-1`.
+
+Không tạo UUID mới cho từng network retry: provider sẽ hiểu chúng là các yêu cầu khác nhau. Một payment attempt mới do nghiệp vụ chủ động tạo là chuyện khác và cần ID riêng.
+
+Ứng dụng cũng cần chống xử lý lặp callback/message. Unique constraint trên `event_id` hoặc bảng inbox có thể hỗ trợ, nhưng việc đánh dấu đã xử lý và áp dụng thay đổi nghiệp vụ phải commit cùng nhau. Nếu ghi “đã xử lý” trước rồi transaction nghiệp vụ thất bại, message sẽ bị bỏ qua sai ở lần retry.
+
+Unique key chỉ ở database nội bộ không thể ngăn provider charge hai lần. Side effect phải có idempotency tại provider hoặc một giao thức tương đương; state machine nội bộ vẫn phải kiểm tra chuyển trạng thái hợp lệ.
+
+### Timeout của payment là trạng thái chưa chắc chắn
+
+Một HTTP timeout không cho biết provider đã charge hay chưa. Provider có thể đã xử lý xong nhưng response bị mất trên đường về.
+
+Do đó, `timeout` không nên tự động bị coi là `PAYMENT_FAILED` rồi trả tồn kho ngay. Hãy lưu trạng thái phù hợp như `PAYMENT_UNKNOWN`, tra cứu bằng payment ID/idempotency key hoặc chờ webhook xác nhận. Tên state có thể khác giữa các hệ thống; điều quan trọng là phân biệt **thất bại chắc chắn** với **chưa biết kết quả**.
+
+| Điểm gián đoạn | Trạng thái có thể đã xảy ra | Recovery cần có |
+| --- | --- | --- |
+| Trước T1 commit | Chưa có order/payment intent bền vững | Retry request với request key ổn định |
+| Sau T1 commit, trước giao việc | Order pending và outbox còn đó | Relay đọc lại outbox |
+| Sau publish, trước đánh dấu đã gửi | Message có thể đã được giao | Deduplicate theo event ID |
+| Provider xử lý xong, response mất | Tiền có thể đã bị charge | Retry/lookup theo cùng payment key, reconcile webhook |
+| Worker nhận kết quả, chết trước T2 commit | Provider xong, DB chưa cập nhật | Nhận lại kết quả và áp dụng idempotently |
+| Reservation hết hạn cạnh tranh payment | Một transition khác có thể đã thắng | Kiểm tra state/version và thực hiện policy bù |
+
+### Compensation là nghiệp vụ bù, không phải ROLLBACK từ xa
+
+Nếu order phải hủy sau khi đã charge, refund là một thao tác mới có thể thất bại hoặc chờ xử lý. Nó không phải việc database kéo thời gian quay lại trước cuộc gọi HTTP.
+
+Một workflow có nhiều local transaction và các hành động bù thường được gọi là saga. Nó cần lưu tiến độ, retry có giới hạn và đường xử lý các trường hợp không thể tự phục hồi. Không nhất thiết phải dùng một framework saga ngay; một state machine bền vững, worker và reconciliation job có thể đủ cho phạm vi nhỏ.
+
+Reconciliation job định kỳ tìm các order pending quá budget hoặc trạng thái không đồng bộ với provider. Đừng chỉ dựa vào một lần gửi message hay một callback duy nhất để kết luận hệ thống sẽ luôn tự hoàn tất.
+
+## Transaction boundary trong Spring và JPA
+
+### Annotation đặt quá rộng khiến HTTP nằm dưới transaction
+
+Ví dụ sau là anti-pattern nếu repository và HTTP client thực sự được gọi trong transaction của method:
+
+```java title="Boundary quá rộng trong service"
+@Transactional
+public void checkout(CheckoutCommand command) {
+    inventoryRepository.reserve(command.sku(), command.quantity());
+    PaymentResult result = paymentClient.charge(command.paymentRequest());
+    orderRepository.recordPayment(command.orderId(), result);
+}
+```
+
+Repository có thể chạy SQL rất nhanh nhưng transaction chưa kết thúc khi method đang chờ `charge()`. Sau thao tác ghi đầu, connection và lock có thể bị giữ đến lúc method trả về hoặc transaction rollback.
+
+`@Transactional(readOnly = true)` không có nghĩa là không tạo database transaction hay không giữ snapshot. Nó là chỉ dẫn cho transaction manager/provider, không phải cách vô hiệu hóa mọi chi phí transaction dài.
+
+### Tách orchestration khỏi các method transactional
+
+Một cách biểu diễn boundary rõ hơn là để orchestration không có outer transaction, còn từng thay đổi local nằm ở một bean transactional riêng:
+
+```java title="Boundary ngắn và lời gọi qua Spring proxy"
+@Service
+public class CheckoutFacade {
+    private final CheckoutTransactions transactions;
+
+    public CheckoutFacade(CheckoutTransactions transactions) {
+        this.transactions = transactions;
+    }
+
+    // Không có @Transactional ở method hoặc class này.
+    public OrderId checkout(CheckoutCommand command) {
+        return transactions.reserveAndEnqueuePayment(command);
+    }
+}
+
+@Service
+public class CheckoutTransactions {
+    @Transactional
+    public OrderId reserveAndEnqueuePayment(CheckoutCommand command) {
+        // 1. Conditional UPDATE tồn kho; kiểm tra affected rows.
+        // 2. Tạo reservation và order PENDING_PAYMENT.
+        // 3. INSERT outbox PaymentRequested.
+        // Các repository dùng cùng transaction manager/database.
+        return persistReservationOrderAndOutbox(command);
+    }
+}
+```
+
+Đây là skeleton: command, entity và phần repository không được triển khai trong snippet. Điểm cần đọc là lời gọi từ facade sang bean khác đi qua Spring proxy; T1 có thể commit trước khi worker gọi provider.
+
+Worker cũng cần một orchestration không transactional: nhận/claim việc bằng transaction ngắn, gọi payment ngoài transaction, rồi gọi method transactional khác để áp dụng kết quả. Đừng đánh dấu `@Transactional` trên cả worker handler nếu handler bao cả HTTP.
+
+### Những bẫy khiến việc tách method chưa thực sự tách transaction
+
+Trong chế độ Spring proxy thường dùng, một method gọi method khác trên chính `this` không đi qua proxy. Chỉ thêm `@Transactional` vào method private hoặc self-invocation không tạo boundary mới như bạn mong đợi.
+
+`Propagation.REQUIRED` sẽ tham gia transaction đang có. Nếu caller vẫn mở outer transaction, việc tách repository call sang một method khác không giúp outer transaction kết thúc sớm hơn.
+
+`REQUIRES_NEW` tạo transaction độc lập và suspend transaction ngoài. Nhưng outer transaction vẫn giữ các tài nguyên đã lấy, trong khi inner transaction có thể cần connection khác và có thể chờ lock do chính outer giữ. Vì vậy, `REQUIRES_NEW` không phải cách mặc định để “rút ngắn” một checkout đang mở transaction quá rộng.
+
+JPA còn có flush: đẩy các thay đổi đang giữ trong persistence context xuống database. SQL có thể chạy khi flush tự động trước query hoặc lúc commit, không nhất thiết đúng dòng code `save()`. Hãy đo thời điểm SQL thật sự chạy và lúc transaction kết thúc, thay vì suy từ tên method.
+
+Mặc định Spring thường rollback với unchecked exception; checked exception cần policy rollback phù hợp nếu nghiệp vụ yêu cầu. Bắt exception rồi nuốt lỗi có thể làm transaction commit ngoài ý muốn. Sau lỗi persistence, rollback và retry trong transaction mới theo hợp đồng của provider; đừng tiếp tục ghi trong một transaction đã hỏng.
+
+## Batch, import và báo cáo dài
+
+### Chia batch bằng keyset và checkpoint bền vững
+
+Giả sử cần normalize hàng triệu row. Một transaction cập nhật toàn bộ làm lock, WAL, rollback scope và replication pressure dồn thành một khối lớn. Cách thường hợp lý hơn là xử lý các batch có kích thước giới hạn rồi commit từng batch.
+
+Keyset pagination chọn batch kế tiếp theo một key có thứ tự, chẳng hạn `id > last_id`, thay vì `OFFSET` càng lúc càng lớn. Ví dụ sau trả ID lớn nhất của batch vừa xử lý; `:last_id` và `:upper_id` là tham số do job cung cấp, không phải cú pháp SQL literal để copy nguyên vào `psql`.
+
+```sql title="Một batch có phạm vi ID xác định"
+BEGIN;
+
+WITH batch AS (
+    SELECT id
+    FROM customers
+    WHERE id > :last_id
+      AND id <= :upper_id
+    ORDER BY id
+    LIMIT 500
+), changed AS (
+    UPDATE customers AS c
+    SET normalized_name = lower(c.name)
+    FROM batch AS b
+    WHERE c.id = b.id
+    RETURNING c.id
+)
+SELECT max(id) AS next_last_id
+FROM changed;
+
+-- Cập nhật checkpoint của job trong cùng transaction này.
+-- Nếu batch không còn row, đánh dấu job hoàn tất theo giao thức của job.
+COMMIT;
+```
+
+Job phải ghi checkpoint bền vững cùng transaction với phần dữ liệu vừa sửa. Nếu commit dữ liệu xong mới lưu checkpoint ở một nơi khác, crash giữa hai bước có thể khiến batch chạy lại. Nếu checkpoint đi trước dữ liệu, crash có thể làm bỏ qua row chưa xử lý.
+
+Với cùng database, có thể lưu checkpoint trong bảng job và commit cùng batch. Nếu checkpoint ở hệ thống khác, cần thiết kế thao tác idempotent và chấp nhận replay có kiểm soát, không giả định hai lần ghi sẽ atomic.
+
+Con số 500 chỉ minh họa. Tăng/giảm batch size theo transaction duration, lock wait, WAL rate và tải replica; giới hạn cả thời gian, không chỉ số row. Nếu nhiều worker cùng xử lý, cần cơ chế phân vùng hoặc claim riêng để không cùng giẫm lên checkpoint.
+
+### Commit theo batch thay đổi hợp đồng nhất quán
+
+Sau batch thứ nhất, reader có thể thấy một phần dữ liệu đã chuyển đổi còn phần khác chưa. Đây là khác biệt nghiệp vụ so với một transaction all-or-nothing.
+
+Nếu không cho phép trạng thái trộn, cân nhắc ghi sang staging table hoặc dataset có version mới. Chỉ publish version mới bằng một thao tác cuối có boundary ngắn khi dữ liệu đã đầy đủ và được kiểm tra. Đổi lại, bạn cần thêm storage và logic chọn version.
+
+Một `upper_id` chụp đầu job chỉ giới hạn miền key, không tự tạo snapshot nhất quán. Với concurrent insert, một transaction có thể đã lấy ID nhỏ nhưng commit muộn sau khi job đi qua vùng đó. Row có ID cũ cũng có thể bị sửa sau khi job xử lý xong.
+
+Vì vậy, nếu yêu cầu là “xử lý chính xác tập dữ liệu tại một thời điểm”, hãy xác định tập công việc bền vững hoặc dùng snapshot/staging thích hợp. Đừng gọi `max(id)` là bằng chứng không bỏ sót mọi thay đổi concurrent.
+
+### Báo cáo cần snapshot dài thì phải trả đúng chi phí
+
+Một report `REPEATABLE READ READ ONLY` có thể cần góc nhìn nhất quán xuyên nhiều query. Chia thành nhiều transaction `READ COMMITTED` sẽ giảm tuổi snapshot, nhưng các query có thể nhìn dữ liệu ở những thời điểm khác nhau.
+
+Với report tài chính cần tổng và chi tiết khớp cùng snapshot, không được đổi tính nhất quán chỉ để hết cảnh báo transaction dài. Hãy cân nhắc giới hạn phạm vi báo cáo, precompute, dữ liệu đã đóng kỳ hoặc chạy trên hạ tầng phân tích phù hợp.
+
+Replica có thể tách tải đọc nhưng không miễn phí. Trên PostgreSQL standby, query dài có thể xung đột với WAL replay và bị hủy; bật feedback để bảo vệ query lại có thể giữ dead tuples trên primary lâu hơn. Replica còn có replication lag, nên phải kiểm tra độ mới dữ liệu mà report yêu cầu.
+
+Cursor hoặc streaming result giúp giảm bộ nhớ ứng dụng, nhưng không tự rút ngắn transaction/snapshot. Nếu client đọc stream chậm, transaction có thể còn mở lâu hơn. Khi hủy stream hoặc client ngắt kết nối, đóng cursor, result set và transaction theo đúng lifecycle của driver/framework.
+
+## Timeout và retry như hàng rào bảo vệ
+
+### Mỗi timeout bảo vệ một khoảng thời gian khác nhau
+
+Các setting dưới đây nói riêng về PostgreSQL 18:
+
+| Setting | Giới hạn | Khi chạm giới hạn |
+| --- | --- | --- |
+| `lock_timeout` | Mỗi lần chờ lấy lock | Hủy statement đang chờ lock |
+| `statement_timeout` | Thời gian thực thi statement, gồm cả chờ | Hủy statement |
+| `idle_in_transaction_session_timeout` | Khoảng idle liên tục trong transaction mở | Kết thúc session |
+| `transaction_timeout` | Thời gian một transaction tồn tại | Kết thúc session |
+| Pool acquisition timeout | Thời gian ứng dụng chờ mượn connection | Caller nhận lỗi ở lớp pool, chưa chắc đã gửi SQL |
+| HTTP/request deadline | Budget của lời gọi từ caller | Không tự đảm bảo database transaction đã bị đóng |
+
+`transaction_timeout` có từ PostgreSQL 17. Không copy setting này sang version cũ mà không kiểm tra hỗ trợ. Prepared transactions không chịu timeout này.
+
+Đây là budget minh họa cho một transaction OLTP ngắn, không phải cấu hình production dùng chung:
+
+```sql title="Transaction có timeout cục bộ"
+BEGIN;
+SET LOCAL lock_timeout = '500ms';
+SET LOCAL statement_timeout = '2s';
+SET LOCAL idle_in_transaction_session_timeout = '3s';
+SET LOCAL transaction_timeout = '5s';
+
+-- Chỉ chạy các thao tác database cần commit cùng nhau.
+COMMIT;
+```
+
+`SET LOCAL` chỉ có hiệu lực trong transaction hiện tại, giúp tránh vô tình để setting lan sang request khác qua connection pool. Lệnh phải được gửi trên đúng connection đang chạy transaction; gọi một query rời qua pool có thể không đặt gì cho transaction bạn định bảo vệ.
+
+Nên để `lock_timeout` thấp hơn `statement_timeout` nếu muốn phân biệt lock contention với statement quá chậm. `statement_timeout` không giới hạn tổng duration của nhiều statement ngắn xen giữa các lần chờ ứng dụng; đó là lý do cần budget cho cả transaction.
+
+Nếu `transaction_timeout` ngắn hơn hoặc bằng `statement_timeout` hay `idle_in_transaction_session_timeout`, timeout dài hơn tương ứng bị bỏ qua theo hành vi PostgreSQL. Dùng ít setting có chủ đích và kiểm thử trên version thật thay vì xếp nhiều deadline rồi đoán cái nào sẽ nổ.
+
+Timeout kết thúc session làm connection không còn dùng được. Pool/driver phải phát hiện và loại connection đó; bạn cần thử đường phục hồi này trước khi bật rộng cho service.
+
+### Lỗi statement không có nghĩa ứng dụng được dùng tiếp transaction
+
+Trong explicit PostgreSQL transaction không có savepoint phục hồi, lỗi như lock timeout hoặc statement timeout đưa transaction vào trạng thái lỗi. Các statement tiếp theo bị từ chối cho đến khi rollback.
+
+Dấu hiệu quen thuộc là SQLSTATE `25P02`, `current transaction is aborted`. Đây thường là hậu quả sau một lỗi trước đó, không phải nguyên nhân đầu tiên. Hãy giữ lại exception gốc và rollback thay vì chỉ retry câu SQL ngay trên transaction đang hỏng.
+
+Nếu dùng savepoint có chủ đích, có thể rollback về savepoint để phục hồi phần tương ứng. Nhưng savepoint không thay thế việc kết thúc outer transaction và không làm các lock trước savepoint tự biến mất.
+
+### Retry cả đơn vị công việc hợp lệ trong transaction mới
+
+Deadlock là một vòng chờ, còn lock wait thông thường chỉ cần có một blocker chưa kết thúc. Tăng thời gian chờ không sửa được một vòng deadlock.
+
+Với lỗi có thể retry như serialization failure (`40001`) hoặc deadlock (`40P01`), thường phải rollback rồi chạy lại toàn bộ local transaction bằng dữ liệu đọc mới. Lock timeout (`55P03`) có thể cần fail fast hoặc retry giới hạn, tùy budget và mức contention; không phải lỗi nào cũng nên retry.
+
+Retry cần backoff, jitter và số lần tối đa. Backoff là khoảng chờ tăng dần; jitter thêm biến thiên để các request không cùng đổ lại vào đúng một thời điểm. Tổng thời gian retry phải nằm trong deadline nghiệp vụ.
+
+Không retry mù quáng một workflow có HTTP side effect. Nếu payment đã được gọi, phải dùng idempotency và cơ chế xác định kết quả trước khi quyết định lặp lại thao tác.
+
+Cũng cần xử lý lỗi kết nối trong lúc `COMMIT`: ứng dụng có thể không biết server đã commit hay chưa. Dùng request key và khả năng tra cứu kết quả bền vững để phân biệt “chưa làm” với “đã làm nhưng mất response”; đừng suy từ exception rằng rollback chắc chắn đã xảy ra.
+
+## Đối chiếu PostgreSQL và MySQL InnoDB
+
+Nguyên tắc giữ transaction ngắn áp dụng cho cả hai, nhưng công cụ và cơ chế cleanup không giống hệt nhau.
+
+| Khía cạnh | PostgreSQL 18 | MySQL 8.4 / InnoDB |
+| --- | --- | --- |
+| Isolation mặc định | `READ COMMITTED` | `REPEATABLE READ` |
+| Lịch sử row | Phiên bản tuple; vacuum dọn phần không còn cần | Undo records; purge dọn history không còn cần |
+| Đọc nhất quán thông thường | Snapshot theo statement ở `READ COMMITTED` | Read view chung ở `REPEATABLE READ` sau consistent read đầu tiên |
+| Transaction đọc dài | Có thể giữ snapshot/table lock tùy cách đọc | Read view dài có thể trì hoãn purge undo history |
+| Quan sát transaction | `pg_stat_activity` | `information_schema.innodb_trx` |
+| Quan sát lock wait | `pg_blocking_pids()`, `pg_locks` | `performance_schema.data_lock_waits`, `data_locks` |
+| Rollback ghi lớn | Không dùng mô hình undo row-by-row giống InnoDB | Có thể cần undo nhiều thay đổi trước khi hoàn tất rollback |
+
+Ở InnoDB, locking read như `SELECT ... FOR UPDATE` không nên được giải thích như plain consistent read chỉ đọc snapshot cũ. Gap lock/next-key lock — khóa cả khoảng key trong một số điều kiện — cũng làm phạm vi contention khác với PostgreSQL.
+
+Các setting `innodb_lock_wait_timeout`, `max_execution_time` và idle timeout của MySQL không phải bản sao một-một của bộ timeout PostgreSQL. Chẳng hạn lock wait timeout InnoDB mặc định thường rollback statement, không phải toàn transaction; deadlock thường rollback transaction. Hãy kiểm tra cấu hình/version và chủ động kết thúc transaction trước retry theo policy của ứng dụng.
+
+History list length trong InnoDB giúp theo dõi undo history chưa purge. Đừng coi nó là số byte hay dùng trực tiếp một ngưỡng PostgreSQL `n_dead_tup` cho MySQL. Cần quan sát xu hướng cùng workload ghi, read view cũ và tốc độ purge.
+
+## Thực hành trên PostgreSQL bằng nhiều session
+
+### Chuẩn bị database lab và ba cửa sổ psql
+
+Chỉ làm trên database riêng có thể bỏ đi. Các lệnh dưới đây tạo bảng `lrt_inventory`, không dùng bảng `inventory` minh họa ở trên và không tác động dữ liệu ứng dụng.
+
+Tạo database bằng user local đã có quyền `CREATEDB`, rồi mở ba cửa sổ `psql` vào cùng database:
+
+```bash title="Tạo database thực hành riêng"
+createdb lrt_lab
+psql -X -d lrt_lab
+```
+
+Nếu môi trường yêu cầu host/user/port, thêm tham số kết nối theo môi trường lab của bạn. Không dùng connection string production. Trong ba cửa sổ, đặt tên lần lượt:
+
+```sql title="Session A"
+SET application_name = 'lrt-lab-a';
+```
+
+```sql title="Session B"
+SET application_name = 'lrt-lab-b';
+```
+
+```sql title="Session C - chỉ quan sát"
+SET application_name = 'lrt-lab-observer';
+```
+
+Ở C, chạy phần chuẩn bị một lần. Không chạy lại giữa lúc A/B đang mở transaction:
+
+```sql title="lab-setup.sql"
+CREATE TABLE lrt_inventory (
+    sku text PRIMARY KEY,
+    remaining integer NOT NULL CHECK (remaining >= 0)
+);
+
+INSERT INTO lrt_inventory (sku, remaining)
+VALUES ('BOOK-001', 10);
+```
+
+Các kết quả sau đây là hành vi kỳ vọng để bạn đối chiếu khi chạy lab; PID và timestamp thực tế sẽ khác. Nếu một thí nghiệm bị ngắt giữa chừng, chạy `ROLLBACK` trong A và B trước khi bắt đầu lại.
+
+### Thí nghiệm 1 - UPDATE xong nhưng writer khác vẫn chờ
+
+Ở A, giữ transaction mở sau câu cập nhật:
+
+```sql title="lab-lock-a.sql"
+BEGIN;
+UPDATE lrt_inventory
+SET remaining = remaining - 1
+WHERE sku = 'BOOK-001';
+-- Dừng tại đây. Không COMMIT.
+```
+
+Ở B, mở transaction và chạy `UPDATE` cùng row. Timeout dài hơn chỉ để bạn có thời gian chuyển sang cửa sổ C, không phải cấu hình đề xuất cho checkout:
+
+```sql title="lab-lock-b.sql"
+BEGIN;
+SET LOCAL lock_timeout = '60s';
+UPDATE lrt_inventory
+SET remaining = remaining - 1
+WHERE sku = 'BOOK-001';
+```
+
+B chưa trả prompt vì đang chờ. Trong C, chạy hai query:
+
+```sql title="lab-observe-lock.sql"
+SELECT
+    application_name,
+    state,
+    wait_event_type,
+    pg_blocking_pids(pid) AS blocked_by,
+    clock_timestamp() - xact_start AS transaction_age
+FROM pg_stat_activity
+WHERE datname = current_database()
+  AND application_name IN ('lrt-lab-a', 'lrt-lab-b')
+ORDER BY application_name;
+
+SELECT remaining
+FROM lrt_inventory
+WHERE sku = 'BOOK-001';
+```
+
+Kỳ vọng: A là `idle in transaction`, B là `active` và chờ `Lock`; `blocked_by` của B chứa PID A. Plain `SELECT` tại C vẫn trả `10`, vì thay đổi `9` của A chưa commit.
+
+Quay lại A và chạy:
+
+```sql title="lab-lock-release-a.sql"
+ROLLBACK;
+```
+
+B được chạy tiếp, cập nhật thành `9` trong transaction của B. Ở B, chạy:
+
+```sql title="lab-lock-release-b.sql"
+ROLLBACK;
+```
+
+Kiểm tra từ C: `remaining` vẫn là `10`. Cả hai lần giảm đều đã rollback. Thí nghiệm tách rõ ba việc: query A đã xong, transaction A còn mở và writer B vẫn chưa thể lấy lock.
+
+### Thí nghiệm 2 - read-only snapshot giữ góc nhìn cũ
+
+A bắt đầu report với snapshot ổn định:
+
+```sql title="lab-snapshot-a.sql"
+BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SELECT remaining FROM lrt_inventory WHERE sku = 'BOOK-001';
+```
+
+Kết quả đầu tiên là `10`. Ở B, không mở transaction thủ công; để autocommit cho lần ghi này:
+
+```sql title="lab-snapshot-b.sql"
+UPDATE lrt_inventory
+SET remaining = remaining - 1
+WHERE sku = 'BOOK-001';
+```
+
+B hoàn tất mà không chờ A. Sau đó ở A, đọc lại:
+
+```sql title="lab-snapshot-read-again.sql"
+SELECT remaining FROM lrt_inventory WHERE sku = 'BOOK-001';
+```
+
+A vẫn thấy `10`, trong khi C đọc mới sẽ thấy `9`. A không cần chặn writer bằng row lock để giữ góc nhìn cũ. Tại C, có thể quan sát snapshot horizon:
+
+```sql title="lab-observe-snapshot.sql"
+SELECT application_name, backend_xid, backend_xmin
+FROM pg_stat_activity
+WHERE datname = current_database()
+  AND application_name = 'lrt-lab-a';
+```
+
+Với đường chạy này, A có `backend_xmin`; một transaction chỉ đọc không nhất thiết được cấp `backend_xid`. Chỉ một row trong lab không đủ để chứng minh mức bloat hay hiệu năng vacuum. Thí nghiệm chứng minh snapshot được giữ, không phải một benchmark cleanup.
+
+Kết thúc report tại A:
+
+```sql title="lab-snapshot-finish.sql"
+COMMIT;
+```
+
+Nếu lặp lại bằng `READ COMMITTED`, statement đọc thứ hai sau khi B commit sẽ thấy `9`. Đó là lý do cần phân biệt transaction lâu với snapshot lâu, thay vì áp một mô tả chung cho mọi isolation level.
+
+### Thí nghiệm 3 - statement timeout không tự đóng explicit transaction
+
+Tại B, chạy từng statement sau, không gom thành một chuỗi rồi tự bỏ qua lỗi:
+
+```sql title="lab-timeout.sql"
+BEGIN;
+SET LOCAL statement_timeout = '1s';
+SELECT pg_sleep(2);
+```
+
+Kỳ vọng nhận lỗi hủy statement do timeout, SQLSTATE `57014`. Thời gian một và hai giây chỉ giúp quan sát cơ chế; không dùng `pg_sleep()` trong transaction nghiệp vụ.
+
+Thử câu sau trong chính B:
+
+```sql title="lab-timeout-aborted.sql"
+SELECT 1;
+```
+
+PostgreSQL từ chối vì transaction đang ở trạng thái aborted, SQLSTATE `25P02`. Trong C, B có thể hiện `idle in transaction (aborted)` khi đang chờ lệnh tiếp theo. Kết thúc tại B:
+
+```sql title="lab-timeout-recover.sql"
+ROLLBACK;
+SELECT 1;
+```
+
+`SELECT 1` bây giờ thành công. Điều cần mang về code ứng dụng là đóng transaction lỗi đúng cách; chỉ bắt exception và trả connection về pool mà không cleanup là chưa đủ.
+
+### Dọn lab sau khi tất cả transaction đã kết thúc
+
+Thoát cả ba session bằng `\q`. Khi chắc chắn đây là database lab vừa tạo và không còn cần dữ liệu trong đó, xóa nó:
+
+```bash title="Chỉ xóa database thực hành"
+dropdb lrt_lab
+```
+
+Không dùng `--force` để bỏ qua session lạ. Nếu database còn connection, xác minh chúng là session lab và đóng đúng cách trước.
+
+## Runbook ngắn khi production đang bị nghẽn
+
+### Khoanh vùng trước khi hủy session
+
+1. Kiểm tra pool pending và acquisition latency để biết request đang chờ ở đâu.
+2. Tìm transaction mở lâu và chuỗi blocker trên đúng database. Ghi PID, app name, transaction age, state, wait event và ngữ cảnh request/job liên quan.
+3. Xác minh transaction thuộc checkout, migration, import hay report. Kiểm tra side effect ngoài DB có thể đã xảy ra.
+4. Giảm nguồn tạo thêm tải: tạm dừng job hoặc chặn retry storm theo quy trình vận hành. Đừng tăng pool trước khi hiểu bottleneck.
+5. Cùng người sở hữu workload chọn kết thúc công việc hợp lệ, cancel query hay terminate session. Không hủy mọi session chỉ vì vượt một mốc tuổi.
+
+Dữ liệu điều tra nên được lưu sau khi redaction. Query text và trace attributes có thể chứa thông tin riêng tư dù bản thân truy vấn monitoring chỉ đọc.
+
+### Phân biệt cancel query với terminate session
+
+`pg_cancel_backend(pid)` yêu cầu hủy query đang chạy. Nếu blocker đang `idle in transaction`, không có query active để cancel theo cách bạn mong đợi. Lệnh này không phải “rollback transaction theo PID”.
+
+`pg_terminate_backend(pid)` yêu cầu kết thúc session; transaction chưa commit của session sẽ bị abort khi backend xử lý việc kết thúc. Quyền signaling phụ thuộc role và target backend; ví dụ `pg_signal_backend` không cho phép hủy tùy ý superuser backend.
+
+Nếu đã được phê duyệt, dùng **một trong hai** lệnh sau với PID vừa xác minh. `:verified_pid` là psql variable bạn chủ động gán, không phải PID demo để copy chạy hàng loạt:
+
+```sql title="Thao tác can thiệp cần phê duyệt"
+-- Hủy statement active:
+SELECT pg_cancel_backend(:verified_pid);
+
+-- Hoặc kết thúc session, kể cả session đang idle in transaction:
+-- SELECT pg_terminate_backend(:verified_pid);
+```
+
+Xác nhận lại PID/app/state ngay trước can thiệp vì session có thể đã kết thúc hoặc được tái sử dụng theo thời gian. Giá trị trả về của hàm signaling không thay thế việc kiểm tra backend và blocker chain sau đó.
+
+Termination không hoàn tác payment/email đã gửi. Với transaction ghi lớn, hãy theo dõi cleanup/rollback và recovery thay vì giả định hệ thống trở lại bình thường ngay lập tức.
+
+### Xác nhận recovery và sửa nguyên nhân gốc
+
+Sau can thiệp, kiểm tra chuỗi lock wait đã tan, transaction nghi vấn không còn mở, pool pending giảm và latency quay về budget. Nếu job/application tiếp tục mở transaction tương tự, tình trạng sẽ lặp lại; cần dừng hoặc sửa đường tạo mới đó.
+
+Theo dõi autovacuum, dead-tuple trend, replication lag và WAL retention riêng. Vacuum thông thường có thể làm không gian tái sử dụng được mà không trả file về kích thước ban đầu. Không dùng `VACUUM FULL` như phản xạ chữa cháy: nó cần lock mạnh và có thêm chi phí rewrite.
+
+Cuối cùng, reconcile các operation mà caller đã timeout hoặc connection mất lúc commit. Chỉ đóng blocker mà bỏ qua trạng thái nghiệp vụ có thể đổi một incident latency thành lỗi thanh toán hoặc dữ liệu.
+
+## Checklist thiết kế và kiểm thử
+
+Trước khi chấp nhận một transaction boundary, đối chiếu với các câu sau:
+
+- [ ] Invariant cần bảo vệ đã được viết rõ; mọi thay đổi local liên quan commit cùng nhau.
+- [ ] Không có HTTP, email, queue publish chậm hoặc chờ người dùng bên trong transaction giữ lock.
+- [ ] Các dữ liệu đọc trước transaction được kiểm tra lại bằng điều kiện/version khi ghi nếu cần.
+- [ ] Mỗi request có budget transaction, statement, lock wait và pool acquisition phù hợp.
+- [ ] Mọi nhánh lỗi đều kết thúc transaction và trả hoặc loại connection đúng cách.
+- [ ] Job theo batch có checkpoint bền vững, replay an toàn và hợp đồng partial progress rõ ràng.
+- [ ] Report cần snapshot dài đã được chấp nhận chi phí và không âm thầm làm đổi yêu cầu nhất quán.
+- [ ] Outbox/inbox, idempotency và state transition chống duplicate đã bao phủ side effect ngoài DB.
+- [ ] Timeout payment và mất kết nối lúc commit được coi là kết quả chưa chắc chắn khi phù hợp.
+- [ ] Monitoring đo cả transaction duration và idle duration, không chỉ slow queries.
+
+Đừng chỉ test happy path. Ít nhất hãy có test concurrent writer cùng hot row, timeout giữa transaction, process chết sau T1 commit, duplicate message, duplicate payment callback và cuộc đua giữa payment với reservation expiry.
+
+Với mỗi test, kiểm tra cả dữ liệu cuối lẫn tài nguyên sau lỗi: transaction còn mở không, connection có trở về pool không, retry có giới hạn không và outbox còn công việc cần phục hồi không. Đó là bằng chứng transaction ngắn hơn mà hệ thống vẫn đúng, thay vì chỉ làm biểu đồ latency đẹp hơn.
+
+## Tài liệu tham khảo và bài liên quan
+
+Tài liệu chính thức dùng để đối chiếu cơ chế và giới hạn theo version:
+
+- [PostgreSQL 18 - Transaction isolation](https://www.postgresql.org/docs/18/transaction-iso.html): snapshot của `READ COMMITTED`, `REPEATABLE READ` và `SERIALIZABLE`.
+- [PostgreSQL 18 - Explicit locking](https://www.postgresql.org/docs/18/explicit-locking.html): vòng đời lock, table lock và deadlock.
+- [PostgreSQL 18 - Monitoring statistics](https://www.postgresql.org/docs/18/monitoring-stats.html): ý nghĩa các cột trong `pg_stat_activity`.
+- [PostgreSQL 18 - Routine vacuuming](https://www.postgresql.org/docs/18/routine-vacuuming.html): cleanup, transaction horizon và wraparound.
+- [PostgreSQL 18 - Client connection defaults](https://www.postgresql.org/docs/18/runtime-config-client.html): timeout và giới hạn áp dụng.
+- [PostgreSQL 18 - System information functions](https://www.postgresql.org/docs/18/functions-info.html): `pg_blocking_pids()`.
+- [MySQL 8.4 - InnoDB multi-versioning](https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html): undo history và purge.
+- [MySQL 8.4 - InnoDB error handling](https://dev.mysql.com/doc/refman/8.4/en/innodb-error-handling.html): phạm vi rollback theo loại lỗi.
+- [Spring Framework - Declarative transaction management](https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/annotations.html): proxy, annotation và rollback.
+
+Nếu bạn đang sửa một luồng nghiệp vụ cụ thể, bắt đầu bằng cách đánh dấu các lần lấy lock, gọi ngoài và commit trên luồng đó. Sau đó đọc bài locking để chọn điều kiện bảo vệ dữ liệu, hoặc bài resumable import nếu phần dài nằm trong batch job.
+
+<Cards>
+  <Card title="Optimistic và pessimistic locking" href="/database/03-optimistic-vs-pessimistic-locking/" description="Chọn version check, row lock và atomic UPDATE theo invariant cần bảo vệ." />
+  <Card title="Import Excel có thể tiếp tục sau lỗi" href="/system-design/06-resumable-excel-import/" description="Áp dụng batch, checkpoint và recovery cho công việc dài." />
+</Cards>
