@@ -1,0 +1,354 @@
+---
+title: "Proxy và registry mirror"
+description: "Cấu hình network egress cho Docker daemon, build và container; quản lý NO_PROXY, corporate CA và Docker Hub pull-through cache với quy trình xác minh."
+---
+
+Khi `curl` trên host truy cập internet nhưng `docker pull` timeout, nguyên nhân thường là cấu hình đúng proxy cho **shell** nhưng chưa đúng cho **daemon**. Docker còn có network path riêng cho build và process trong container; một setting không tự áp cho cả ba.
+
+Registry mirror giải quyết bài toán khác proxy: mirror cache image content gần các daemon để giảm repeated download và latency. Nó không thay thế outbound proxy, authentication, content policy hoặc private registry.
+
+## Tách bốn network path
+
+```text
+1. Docker CLI ───────────────► Docker API endpoint
+2. Docker daemon ─ proxy? ──► registry / Swarm peers
+3. Build step ─ proxy? ─────► package repositories
+4. Container process ───────► application dependencies
+
+Docker Hub pull-through mirror nằm trên path daemon → registry.
+```
+
+| Triệu chứng | Layer cần kiểm tra trước |
+|---|---|
+| CLI không kết nối daemon | Context, socket, SSH/TLS API; không phải registry proxy |
+| `docker pull` timeout/TLS error | Daemon DNS, proxy, CA, registry/mirror |
+| Pull được base image nhưng `RUN apt update` fail | Build proxy/network/CA |
+| Container chạy nhưng gọi API ngoài fail | Container DNS/network/app proxy |
+| Chỉ Docker Hub chậm/rate-limited | Mirror/cache/auth/fair-use policy |
+
+Đừng đưa proxy credential vào Dockerfile bằng `ENV` hoặc `ARG` không kiểm soát; chúng có thể xuất hiện trong image metadata, history, cache hoặc logs.
+
+## Thu thập thông tin trước khi cấu hình
+
+Bạn cần giá trị do network team cấp:
+
+- HTTP và HTTPS proxy URL;
+- proxy authentication mechanism;
+- domain, IP/CIDR và port phải bypass qua `NO_PROXY`;
+- corporate CA nếu có TLS inspection;
+- private registry/mirror hostname và CA chain;
+- policy Docker Hub access, rate limit và authentication.
+
+Kiểm tra current environment:
+
+```bash
+env | grep -iE '^(http|https|no)_proxy=' || true
+docker info
+systemctl show --property=Environment docker
+```
+
+Redact user/password/token trước khi lưu ticket. Proxy URL trong process environment, unit file hoặc `docker info` có thể lộ credential cho user có quyền đọc tương ứng.
+
+## Cấu hình proxy cho rootful Docker Engine
+
+Docker Engine 23.0+ hỗ trợ `http-proxy`, `https-proxy` và `no-proxy` trong `daemon.json`; Docker khuyến nghị cấu hình trực tiếp ở đây thay vì environment khi có thể.
+
+Merge vào `/etc/docker/daemon.json`:
+
+```json
+{
+  "proxies": {
+    "http-proxy": "http://proxy.example.com:3128",
+    "https-proxy": "http://proxy.example.com:3128",
+    "no-proxy": "localhost,127.0.0.1,.corp.example,registry.corp.example"
+  }
+}
+```
+
+`proxy.example.com` và domains là placeholder. `https-proxy` thường vẫn có scheme `http://` khi client dùng HTTP CONNECT tới proxy; dùng đúng URL do network team cung cấp, không tự đổi scheme theo tên field.
+
+Validate và restart:
+
+```bash
+sudo dockerd --validate --config-file=/etc/docker/daemon.json
+sudo systemctl restart docker
+sudo systemctl is-active docker
+```
+
+Xác minh:
+
+```bash
+docker info | grep -i -A3 proxy || true
+sudo journalctl -u docker --since '5 minutes ago' --no-pager
+```
+
+Sau đó pull một image được policy cho phép, tốt nhất pin digest trong production test:
+
+```bash
+docker pull hello-world
+```
+
+### Dùng systemd environment khi cần
+
+Nếu Engine cũ hoặc policy quản lý proxy bằng service environment, tạo drop-in:
+
+```bash
+sudo mkdir -p /etc/systemd/system/docker.service.d
+sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf >/dev/null <<'EOF'
+[Service]
+Environment="HTTP_PROXY=http://proxy.example.com:3128"
+Environment="HTTPS_PROXY=http://proxy.example.com:3128"
+Environment="NO_PROXY=localhost,127.0.0.1,.corp.example,registry.corp.example"
+EOF
+```
+
+Apply:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+sudo systemctl show --property=Environment docker
+```
+
+Daemon config/flags có precedence cao hơn environment. Không giữ hai nguồn với value khác nhau; người xử lý incident sẽ khó biết effective proxy.
+
+Systemd yêu cầu escape đặc biệt trong credential chứa ký tự như `%`. Thay vì nhúng password phức tạp vào unit, ưu tiên proxy auth mechanism/secret delivery được tổ chức hỗ trợ và rotate credential.
+
+## Rootless proxy
+
+Rootless daemon dùng user service. Drop-in path và command không có `sudo`:
+
+```bash
+mkdir -p "$HOME/.config/systemd/user/docker.service.d"
+cat > "$HOME/.config/systemd/user/docker.service.d/http-proxy.conf" <<'EOF'
+[Service]
+Environment="HTTP_PROXY=http://proxy.example.com:3128"
+Environment="HTTPS_PROXY=http://proxy.example.com:3128"
+Environment="NO_PROXY=localhost,127.0.0.1,.corp.example,registry.corp.example"
+EOF
+
+systemctl --user daemon-reload
+systemctl --user restart docker
+systemctl --user show --property=Environment docker
+```
+
+Nếu dùng direct daemon config, file mặc định là `~/.config/docker/daemon.json`; validate/restart bằng user command như trang [Rootless mode](/docs/cai-dat-va-moi-truong/rootless-mode/).
+
+## Docker Desktop proxy
+
+Docker Desktop bỏ qua proxy configuration trong Engine `daemon.json`. Dùng **Docker Desktop Settings → Resources/Proxies** hoặc admin settings/deployment flags đúng version.
+
+Desktop có thể dùng system proxy hoặc manual proxy, PAC, Kerberos/NTLM tùy platform/version/edition. Không sửa distribution `docker-desktop` nội bộ; update có thể ghi đè và setup đó không thuộc supported configuration surface.
+
+Xác minh từ terminal:
+
+```bash
+docker version
+docker info
+docker pull hello-world
+```
+
+Nếu shell trong WSL có proxy nhưng Desktop pull vẫn fail, cấu hình Desktop path chứ không chỉ `.bashrc`.
+
+## Thiết kế `NO_PROXY`
+
+`NO_PROXY` là comma-separated list. Theo behavior Docker/Go hiện hành, có thể dùng host/domain, IP prefix/CIDR trong supported context và optional port. Cần test client/version thực tế vì ecosystem không có một standard duy nhất được mọi tool parse giống nhau.
+
+Baseline thường gồm:
+
+```text
+localhost,127.0.0.1,::1,.corp.example,registry.corp.example
+```
+
+Các lỗi thiết kế phổ biến:
+
+- thiếu registry nội bộ nên proxy chặn hoặc loop request;
+- thêm domain quá rộng, làm traffic đáng lẽ phải inspect đi thẳng;
+- chỉ thêm hostname nhưng application gọi IP;
+- quên port-specific behavior;
+- dùng wildcard với giả định mọi tool hỗ trợ giống nhau.
+
+Test từng endpoint qua daemon/build/container thay vì chỉ in environment.
+
+## Corporate CA và private registry TLS
+
+Nếu proxy TLS inspection hoặc registry dùng internal CA, Docker daemon phải trust CA. Với private registry `registry.corp.example:5000`, Docker Engine hỗ trợ CA theo directory:
+
+```text
+/etc/docker/certs.d/registry.corp.example:5000/ca.crt
+```
+
+Tạo directory và cài **CA certificate**, không phải private key của server:
+
+```bash
+sudo install -d -m 0755 \
+  /etc/docker/certs.d/registry.corp.example:5000
+sudo install -m 0644 <CORPORATE_CA.crt> \
+  /etc/docker/certs.d/registry.corp.example:5000/ca.crt
+```
+
+Cách update system trust store khác theo distribution. Phối hợp security/network team và kiểm tra certificate expiry/rotation. Build step hoặc application trong container cũng cần CA trong image/trust store của chính nó; host daemon trust không tự inject CA vào container.
+
+<Callout type="error" title="Không dùng insecure registry để né TLS">
+  `insecure-registries` cho phép HTTP hoặc certificate không được verify và mở đường cho content/credential interception. Chỉ dùng trong lab cô lập có threat model rõ; production nên sửa DNS, certificate chain, SAN và CA trust.
+</Callout>
+
+## Proxy cho build và container
+
+### Build
+
+Docker CLI có thể truyền proxy build arguments từ client config hoặc `--build-arg`. Dùng mechanism hiện hành của BuildKit và secret mount khi credential nhạy cảm. Không ghi:
+
+```dockerfile
+ENV HTTPS_PROXY=http://user:password@proxy.example.com:3128
+```
+
+vào production image vì value tồn tại trong image config/runtime environment.
+
+Để chẩn đoán, tách hai bước:
+
+```bash
+docker pull alpine
+docker build --progress=plain -t proxy-build-check .
+```
+
+Nếu pull thành công nhưng package command trong build fail, daemon registry proxy đã đúng nhưng build egress/DNS/CA chưa đúng.
+
+### Container runtime
+
+Daemon proxy không tự cấu hình application container. Truyền environment có chủ đích hoặc dùng application/platform configuration:
+
+```bash
+docker run --rm \
+  -e HTTPS_PROXY=http://proxy.example.com:3128 \
+  -e NO_PROXY=localhost,127.0.0.1,.corp.example \
+  alpine env
+```
+
+Command chỉ chứng minh environment được truyền, không gửi network request. Không đặt credential thật trong shell history; dùng secret manager/orchestrator phù hợp.
+
+## Registry mirror là gì?
+
+Pull-through cache cho Docker Hub hoạt động:
+
+```text
+Docker daemon → local mirror
+                   │ cache hit: trả content
+                   └ cache miss: pull Docker Hub → lưu → trả content
+```
+
+Lần pull bằng tag, mirror có thể kiểm tra upstream để đảm bảo content hiện tại. Cache cũ cần garbage collection/retention và disk monitoring. Mirror vẫn chịu Docker Hub fair-use policy.
+
+Giới hạn quan trọng trong Docker official Registry guidance: pull-through cache này mirror **central Docker Hub**, không phải cơ chế tổng quát mirror mọi private registry. Nếu image set nhỏ và xác định, chủ động copy/push image vào private registry thường đơn giản, audit được và hỗ trợ air-gap tốt hơn.
+
+## Trỏ daemon tới mirror
+
+Sau khi platform team đã triển khai mirror có TLS/auth/storage/monitoring, merge endpoint vào daemon config:
+
+```json
+{
+  "registry-mirrors": [
+    "https://mirror.corp.example"
+  ]
+}
+```
+
+Validate và restart:
+
+```bash
+sudo dockerd --validate --config-file=/etc/docker/daemon.json
+sudo systemctl restart docker
+```
+
+Xác minh effective list:
+
+```bash
+docker info | sed -n '/Registry Mirrors:/,/Live Restore Enabled:/p'
+```
+
+Pull một image chưa có local cache để buộc network path:
+
+```bash
+docker image rm hello-world 2>/dev/null || true
+docker pull hello-world
+```
+
+Đối chiếu đồng thời:
+
+- daemon journal;
+- mirror access log/metrics;
+- upstream request trong lần cache miss;
+- cache hit trong lần pull từ một daemon sạch khác.
+
+Xóa local image không bảo đảm mirror cache miss; mục tiêu là loại local daemon cache để chứng minh request tới mirror.
+
+## Bảo mật mirror
+
+Nếu mirror cấu hình Docker Hub username/password để truy cập private images, mọi private resource account đó đọc được có nguy cơ được phục vụ qua mirror. Khi đó mirror bắt buộc có authentication, authorization, network isolation và audit phù hợp.
+
+Ngoài ra cần:
+
+- TLS certificate hợp lệ và rotation;
+- credential upstream scope tối thiểu;
+- disk capacity, deletion/garbage collection;
+- availability/fallback policy;
+- content provenance/vulnerability scanning theo supply-chain policy;
+- rate-limit và abuse protection;
+- logs không ghi bearer token/password.
+
+Mirror tăng availability/performance trong một số failure mode nhưng cũng trở thành dependency và trust boundary mới.
+
+## Troubleshooting theo tín hiệu
+
+### `proxyconnect tcp: dial tcp ... timeout`
+
+Kiểm tra daemon effective environment/config, DNS tới proxy và firewall từ host namespace:
+
+```bash
+systemctl show --property=Environment docker
+getent hosts proxy.example.com
+sudo journalctl -u docker -n 100 --no-pager
+```
+
+Không kết luận proxy “down” chỉ từ browser vì browser có PAC/auth khác daemon.
+
+### `x509: certificate signed by unknown authority`
+
+Xác định certificate nào được trả về, hostname/SAN có khớp và CA chain thiếu ở daemon, build image hay application container. Không tắt verification. Kiểm tra clock vì thời gian sai cũng gây lỗi certificate.
+
+### Private registry bị gửi qua proxy
+
+Review `NO_PROXY` exact hostname và port mà daemon dùng. `registry.corp.example` và `registry.corp.example:5000` có thể cần test riêng theo parser. Restart daemon sau thay đổi và kiểm tra effective environment.
+
+### Mirror cấu hình nhưng không có request
+
+1. Image đã có trong local daemon cache chưa?
+2. `docker info` có endpoint mirror không?
+3. Bạn đang điều khiển đúng context/daemon không?
+4. Pull reference có thuộc Docker Hub không?
+5. Docker Desktop có cần cấu hình qua UI thay vì host file không?
+6. DNS/TLS/auth tới mirror có thành công không?
+
+### Pull qua mirror trả image cũ
+
+Phân biệt mutable tag với digest. Pull bằng digest để yêu cầu content identity cụ thể; kiểm tra mirror upstream validation, logs và clock. Production deployment nên pin digest/attestation theo supply-chain policy, không dựa vào cache freshness của mutable `latest`.
+
+## Checklist hoàn thành
+
+- [ ] Đã phân biệt daemon, build và container proxy.
+- [ ] Proxy/NO_PROXY effective value được xác minh mà không lộ credential.
+- [ ] Corporate CA được cài đúng trust store/layer.
+- [ ] Pull qua daemon thành công sau khi loại local cache phù hợp.
+- [ ] Build và runtime egress được test riêng.
+- [ ] Mirror có TLS/auth/storage/monitoring và upstream policy.
+- [ ] Không dùng `insecure-registries` để che lỗi certificate.
+- [ ] Có rollback config nếu restart daemon fail.
+
+Tiếp theo, chạy [Xác minh môi trường](/docs/cai-dat-va-moi-truong/verify-environment/) để kiểm tra cả registry, build, port và persistence path.
+
+## Nguồn chính thức để đối chiếu
+
+- [Daemon proxy configuration](https://docs.docker.com/engine/daemon/proxy/)
+- [Configure Docker CLI to use a proxy](https://docs.docker.com/engine/cli/proxy/)
+- [Mirror the Docker Hub library](https://docs.docker.com/docker-hub/image-library/mirror/)
+- [Verify repository client with certificates](https://docs.docker.com/engine/security/certificates/)

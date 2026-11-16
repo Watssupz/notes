@@ -1,0 +1,109 @@
+---
+title: "None network"
+description: "Cô lập container khỏi Docker networks bằng --network none, xác minh chỉ còn loopback và hiểu giới hạn của network isolation."
+---
+
+`--network none` tạo container có network namespace riêng nhưng không nối endpoint vào network nào. Container chỉ có loopback IPv4; Docker không cấu hình external interface, default route hay embedded DNS cho service discovery.
+
+```text
+Process -> loopback 127.0.0.1
+        X không có eth0
+        X không có default route
+        X không có peer Docker network
+```
+
+## `none` giải quyết điều gì?
+
+- batch job chỉ xử lý input đã mount sẵn;
+- parser chạy với untrusted input không cần network;
+- test chứng minh application không phụ thuộc API bên ngoài;
+- bước pipeline offline sau khi artifact/dependency đã được chuẩn bị;
+- giảm egress path cho workload không có lý do kết nối.
+
+`none` không tự biến container thành sandbox an toàn hoàn chỉnh. Bind mount, Docker socket, device, capabilities, shared PID/IPC namespace và kernel attack surface vẫn tồn tại theo configuration khác.
+
+## Lab: xác minh effective state
+
+```bash
+docker run --rm --network none alpine:3.23 ip -br address
+```
+
+Expected output chỉ có loopback, dạng:
+
+```text
+lo               UNKNOWN        127.0.0.1/8
+```
+
+Kiểm tra route:
+
+```bash
+docker run --rm --network none alpine:3.23 ip route
+```
+
+Expected output rỗng. Thử outbound:
+
+```bash
+docker run --rm --network none alpine:3.23 \
+  wget -T 2 -qO- https://example.com
+```
+
+Command dự kiến fail. Failure có thể báo DNS hoặc unreachable tùy tool; evidence quyết định là không có external interface/default route.
+
+Docker official behavior hiện không cấu hình IPv6 loopback `::1` trong none mode:
+
+```bash
+docker run --rm --network none alpine:3.23 ip -6 address
+```
+
+Application yêu cầu `::1` cần được test riêng thay vì giả định loopback dual-stack.
+
+## `none` khác internal network
+
+| Đặc điểm | `--network none` | `docker network create --internal` |
+|---|---|---|
+| Container-to-container | Không | Có giữa members |
+| Docker DNS service discovery | Không | Có trên user-defined network |
+| External default route | Không | Không theo internal network contract |
+| Attach thêm network khi chạy | Không dùng `none` cùng network khác | Có thể multi-home container |
+| Use case | Workload hoàn toàn offline | Backend tier chỉ giao tiếp nội bộ |
+
+Docker không cho kết hợp network mode `none` với network khác lúc create. Nếu workload cần peer nội bộ nhưng không egress, dùng user-defined `--internal` network.
+
+## Chuẩn bị input cho job offline
+
+Dữ liệu và executable phải sẵn sàng trước khi process chạy:
+
+```bash
+mkdir -p /tmp/offline-job
+printf 'hello\n' > /tmp/offline-job/input.txt
+
+docker run --rm --network none \
+  --mount type=bind,src=/tmp/offline-job,dst=/work,readonly \
+  alpine:3.23 \
+  sha256sum /work/input.txt
+```
+
+Bind mount read-only ngăn job sửa input, nhưng host path vẫn là boundary cần bảo vệ. Với secret, ưu tiên cơ chế secret của orchestrator thay vì ghi plaintext tùy tiện vào host directory.
+
+## Failure modes
+
+- Package manager fail: image chưa chứa dependency; build dependency vào image trước.
+- Telemetry/licensing fail: application vẫn có hidden network dependency.
+- Healthcheck fail: probe gọi external endpoint thay vì local process.
+- Job treo: client retry/backoff dài dù network chắc chắn không tồn tại.
+- Application chỉ bind `::1`: none mode không có IPv6 loopback mặc định.
+
+Thiết kế timeout và error message rõ để offline mode fail fast.
+
+## Security checklist
+
+- Không mount `/var/run/docker.sock` vào workload offline.
+- Dùng non-root user, drop capabilities và read-only root filesystem khi phù hợp.
+- Chỉ mount input/output cần thiết với mode đúng.
+- Không dùng `--privileged` để sửa lỗi permission.
+- Test application không cố resolve/gọi endpoint telemetry hoặc update.
+
+## Nguồn chính thức
+
+- [None network driver](https://docs.docker.com/engine/network/drivers/none/)
+- [Docker network drivers](https://docs.docker.com/engine/network/drivers/)

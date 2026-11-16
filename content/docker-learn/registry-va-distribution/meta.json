@@ -1,0 +1,15 @@
+{
+  "title": "Registry và distribution",
+  "pages": [
+    "index",
+    "docker-hub",
+    "push-pull-login",
+    "image-names-tags-digests",
+    "private-registry",
+    "registry-authentication",
+    "registry-storage",
+    "registry-garbage-collection",
+    "content-trust",
+    "registry-mirrors"
+  ]
+}

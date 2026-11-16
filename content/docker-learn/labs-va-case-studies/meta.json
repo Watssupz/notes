@@ -1,0 +1,18 @@
+{
+  "title": "Labs và case studies",
+  "pages": [
+    "index",
+    "lab-static-site",
+    "lab-nodejs-api",
+    "lab-python-api",
+    "lab-java-application",
+    "lab-database",
+    "lab-compose-fullstack",
+    "lab-private-registry",
+    "lab-multi-platform",
+    "lab-secure-container",
+    "lab-ci-pipeline",
+    "case-study-production",
+    "capstone-project"
+  ]
+}

@@ -1,0 +1,224 @@
+---
+title: "Compose volumes"
+description: "Khai báo named volume, bind mount và tmpfs trong Compose; hiểu lifecycle, project scope, long syntax, backup và rủi ro down --volumes."
+---
+
+Compose service có thể dùng named volume, bind mount, tmpfs hoặc image mount theo capability hiện hành. Chọn loại mount theo ownership và lifecycle của dữ liệu, không chỉ theo cú pháp ngắn nhất.
+
+| Loại | Source do ai quản lý | Dùng khi |
+|---|---|---|
+| Named volume | Docker Engine/volume driver | Database data, queue state, dữ liệu cần sống qua recreate |
+| Bind mount | Host filesystem | Source code, config local, file cần host quản lý trực tiếp |
+| tmpfs | Memory của host | Scratch data, socket/cache ngắn hạn, dữ liệu không cần persist |
+| Anonymous volume | Docker tạo nhưng không có logical name ổn định | Thường tránh cho dữ liệu cần attach lại rõ ràng |
+
+## Hai cấp khai báo
+
+```yaml
+services:
+  db:
+    image: postgres:18-alpine
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+volumes:
+  db-data: {}
+```
+
+- service-level `volumes` cấp mount cho container;
+- top-level `volumes` định nghĩa named volume logic và cách provisioning.
+
+Compose thường tạo physical volume `<project>_db-data`, gắn labels project/volume và dùng lại qua container recreate.
+
+## Short và long syntax
+
+Short syntax tiện cho trường hợp rõ ràng:
+
+```yaml
+volumes:
+  - db-data:/var/lib/postgresql/data
+  - ./config:/etc/app:ro
+```
+
+Long syntax tránh ambiguity và mở option:
+
+```yaml
+services:
+  app:
+    volumes:
+      - type: volume
+        source: app-data
+        target: /var/lib/app
+        volume:
+          nocopy: true
+      - type: bind
+        source: ./config
+        target: /etc/app
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          size: 67108864
+          mode: 1770
+
+volumes:
+  app-data: {}
+```
+
+`create_host_path: false` giúp fail thay vì âm thầm tạo directory khi bind source bị sai. Option availability phụ thuộc Compose/Engine/platform.
+
+## Volume lifecycle
+
+```bash
+docker compose up --detach
+docker compose down
+docker compose up --detach
+```
+
+Named volume vẫn còn sau `down` mặc định. Command sau **xóa dữ liệu volume của project**:
+
+```bash
+docker compose down --volumes
+```
+
+<Callout type="error" title="Rủi ro mất dữ liệu">
+  Không dùng `down -v`, `docker volume prune` hoặc xóa project name trước khi xác định volume nào chứa dữ liệu cần giữ và đã có backup có thể restore.
+</Callout>
+
+Anonymous volume không bị `down` xóa mặc định nhưng không có logical name ổn định để lần `up` sau tự attach. Dùng named volume cho state cần persistence.
+
+## External volume và custom name
+
+Resource được provisioning ngoài project:
+
+```yaml
+services:
+  db:
+    image: postgres:18-alpine
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+volumes:
+  db-data:
+    external: true
+    name: inventory-postgres-data
+```
+
+Compose fail nếu external volume không tồn tại và không xóa nó khi `down`. Provision trước:
+
+```bash
+docker volume create inventory-postgres-data
+```
+
+`name` không có project scope. Không đặt custom global name nếu mục tiêu là cho nhiều branch/CI project độc lập.
+
+## Bind mounts và portability
+
+```yaml
+services:
+  web:
+    build: .
+    volumes:
+      - type: bind
+        source: ./src
+        target: /app/src
+```
+
+Relative source được resolve theo project/base-file rules. Bind mount:
+
+- phụ thuộc path và permission trên host;
+- che nội dung có sẵn ở target trong image;
+- cho container quyền đọc/ghi trực tiếp host path theo mode;
+- có behavior performance/file notification khác trên Docker Desktop;
+- không portable như named volume giữa hosts.
+
+Không bind Docker socket hoặc host root chỉ để tiện debug; đó là quyền điều khiển host rất lớn.
+
+## Permission và ownership
+
+Compose không tự đồng bộ UID/GID giữa host, image và volume. Khi bị `permission denied`, kiểm tra:
+
+```bash
+docker compose exec app id
+docker compose exec app stat -c '%u:%g %a %n' /var/lib/app
+docker volume inspect PROJECT_app-data
+```
+
+Giải pháp phải theo ownership contract: image khởi tạo directory đúng UID, entrypoint đổi ownership có kiểm soát, host provision bind path, hoặc service chạy UID phù hợp. Không chữa bằng `chmod 777`/root mặc định.
+
+## Lab: persistence qua recreate
+
+Tạo `compose.yaml`:
+
+```yaml
+name: compose-volume-lab
+
+services:
+  writer:
+    image: alpine:3.23
+    command: ["sh", "-c", "touch /data/initialized; exec sleep 300"]
+    volumes:
+      - data:/data
+
+volumes:
+  data: {}
+```
+
+Start và ghi dữ liệu:
+
+```bash
+docker compose up --detach
+docker compose exec writer sh -c 'date -u > /data/evidence.txt'
+docker compose exec writer cat /data/evidence.txt
+```
+
+Recreate container:
+
+```bash
+docker compose up --detach --force-recreate
+docker compose exec writer cat /data/evidence.txt
+```
+
+Expected: file còn vì nằm trong named volume. Xem physical volume:
+
+```bash
+docker volume ls --filter label=com.docker.compose.project=compose-volume-lab
+docker volume inspect compose-volume-lab_data
+```
+
+## Backup trước thay đổi phá hủy
+
+Backup phải nhất quán với application. Với database, ưu tiên dump/snapshot theo cơ chế database thay vì tar live data directory. Với generic files đã quiesce:
+
+```bash
+docker run --rm \
+  --volume compose-volume-lab_data:/source:ro \
+  --volume "$PWD":/backup \
+  alpine:3.23 tar -C /source -czf /backup/data.tgz .
+```
+
+Kiểm tra archive và thử restore vào volume khác trước khi gọi là backup hợp lệ. Đọc [Backup và restore](/docs/storage/backup-and-restore/) và [Storage cho database](/docs/storage/database-storage/).
+
+## Cleanup lab
+
+Giữ volume để quan sát:
+
+```bash
+docker compose down
+```
+
+Xóa lab khi chắc chắn không cần dữ liệu:
+
+```bash
+docker compose down --volumes
+rm -f data.tgz
+```
+
+## Nguồn chính thức
+
+- [Volumes top-level element](https://docs.docker.com/reference/compose-file/volumes/)
+- [Volumes in Compose](https://docs.docker.com/storage/volumes/)
+- [`docker compose down`](https://docs.docker.com/reference/cli/docker/compose/down/)
+- [Storage và dữ liệu](/docs/storage/)

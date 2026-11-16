@@ -1,0 +1,327 @@
+---
+title: "Docker Rootless mode"
+description: "Cài và vận hành Docker daemon bằng user thường, kiểm tra subordinate IDs, systemd user service, context, cgroup và các giới hạn network/storage."
+---
+
+Rootless mode chạy cả Docker daemon lẫn containers trong user namespace của một user thường. Mục tiêu là giảm tác động nếu daemon hoặc runtime có lỗ hổng: process không trực tiếp có host root privilege như daemon rootful thông thường.
+
+Rootless không có nghĩa container trở thành sandbox hoàn hảo. Workload vẫn dùng chung host kernel, user sở hữu daemon vẫn toàn quyền với dữ liệu của chính daemon, và một số capability về network/cgroup/storage cần helper hoặc host-level preparation.
+
+## Rootless khác nhóm `docker` và `userns-remap`
+
+| Mô hình | `dockerd` trên host | Container UID mapping | User gọi API |
+|---|---|---|---|
+| Rootful + nhóm `docker` | Root | Thường theo daemon config | Thành viên group có quyền điều khiển rootful daemon, gần như host root |
+| `userns-remap` | Root | Container IDs được remap | API daemon vẫn là boundary quyền mạnh |
+| Rootless | User thường | Daemon và containers ở user namespace | Chỉ user socket/context tương ứng |
+
+`userns-remap` giảm quyền container process trên host nhưng daemon vẫn root. Rootless đưa cả daemon vào unprivileged user namespace.
+
+## Khi nên và không nên chọn
+
+Rootless phù hợp cho:
+
+- development host nơi không muốn thêm user vào nhóm `docker`;
+- CI runner theo user, workload không cần privileged host integration;
+- single-user service có network/resource requirement tương thích;
+- môi trường muốn giảm daemon attack surface.
+
+Cần đánh giá kỹ hoặc chọn rootful daemon đã harden khi workload cần:
+
+- host networking/device/low-level kernel integration;
+- privileged port dưới `1024` mà không thể thay đổi host policy/helper;
+- resource limit cgroup trên host chưa có cgroup v2 + systemd delegation;
+- storage trên NFS home directory;
+- operations tooling chỉ hỗ trợ system-wide service/rootful paths;
+- multi-user scheduling thực thụ. Mỗi rootless user có daemon, data store, socket và quota riêng.
+
+## Mental model về path
+
+Với systemd user session thông thường:
+
+```text
+User shell
+  │ docker context: rootless
+  ▼
+/run/user/<UID>/docker.sock
+  │
+  ▼
+~/.config/systemd/user/docker.service
+  │
+  ├── daemon config: ~/.config/docker/daemon.json
+  └── data: ~/.local/share/docker
+```
+
+`~/.docker` là client config; `~/.config/docker` là rootless daemon config; `~/.local/share/docker` là daemon data mặc định. Không trộn ba path này.
+
+## Prerequisites
+
+Docker yêu cầu `newuidmap` và `newgidmap`, thường đến từ package `uidmap`, cùng ít nhất `65,536` subordinate UIDs và GIDs cho user.
+
+Kiểm tra:
+
+```bash
+whoami
+id -u
+command -v newuidmap
+command -v newgidmap
+grep "^$(whoami):" /etc/subuid || true
+grep "^$(whoami):" /etc/subgid || true
+```
+
+Dòng hợp lệ có dạng minh họa:
+
+```text
+devuser:231072:65536
+```
+
+Giá trị start có thể khác; điều cần kiểm tra là range không overlap theo host policy và count đủ. Việc cấp subordinate IDs là thay đổi cấp host, thường cần administrator.
+
+Cài helper trên Debian/Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install uidmap docker-ce-rootless-extras
+```
+
+Tên package trên distribution khác có thể khác. Nếu đã cài Docker CE bằng official DEB/RPM, script `dockerd-rootless-setuptool.sh` thường có sẵn; package `docker-ce-rootless-extras` cung cấp bổ sung khi thiếu.
+
+## Quyết định có giữ rootful daemon không
+
+Nếu system-wide Docker đang chạy, hai daemon có thể cùng tồn tại nhưng bạn phải phân biệt context, socket, data và port. Để host chỉ dùng rootless, dừng và disable rootful service trong maintenance window:
+
+```bash
+sudo systemctl disable --now docker.service docker.socket
+```
+
+Chỉ xóa stale socket nếu service đã dừng và bạn xác nhận nó thuộc rootful daemon:
+
+```bash
+sudo rm -f /var/run/docker.sock
+```
+
+<Callout type="error" title="Thao tác gây downtime">
+  Dừng `docker.service` làm mất control plane rootful và có thể ảnh hưởng containers. Inventory workload, restart policy và rollback trước. Không chạy bước này trên host dùng chung chỉ để hoàn thành lab.
+</Callout>
+
+Nếu giữ cả hai, đừng dùng `--force` trong setup cho đến khi hiểu script cảnh báo gì; luôn kiểm tra `docker context show` trước thao tác.
+
+## Cài rootless daemon
+
+Đăng nhập bằng user sẽ sở hữu daemon, **không dùng `sudo`**:
+
+```bash
+dockerd-rootless-setuptool.sh install
+```
+
+Script thường:
+
+- tạo `~/.config/systemd/user/docker.service`;
+- start user service;
+- tạo Docker context tên `rootless`;
+- chuyển CLI sang context đó;
+- in biến environment cần thiết cho installation hiện tại.
+
+Đọc output thật và làm theo path nó cung cấp. Với installation không package manager, Docker có rootless install script, nhưng phải tải thành file, review và hiểu source trước khi chạy; official package là lựa chọn dễ update hơn.
+
+## Quản lý user service
+
+```bash
+systemctl --user status docker --no-pager
+systemctl --user enable docker
+systemctl --user is-active docker
+```
+
+Để user service chạy sau boot ngay cả khi user chưa login, admin có thể bật lingering:
+
+```bash
+sudo loginctl enable-linger "$(whoami)"
+```
+
+Kiểm tra:
+
+```bash
+loginctl show-user "$(whoami)" -p Linger
+```
+
+Lingering làm user manager/service có thể chạy khi không có interactive session; đây là lifecycle decision, không bật mặc định cho mọi account.
+
+Rootless Docker được quản lý bằng `systemctl --user`, không tạo system-wide unit với `User=` để giả lập rootless setup.
+
+## Chọn đúng context và socket
+
+Setup tool trên Engine hiện đại tự tạo context `rootless`:
+
+```bash
+docker context ls
+docker context use rootless
+docker version
+```
+
+Một số application không hiểu Docker context và cần `DOCKER_HOST`:
+
+```bash
+export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/docker.sock"
+```
+
+Không đặt đồng thời environment biến cũ và context khác mà không hiểu precedence. Kiểm tra:
+
+```bash
+env | grep '^DOCKER_' || true
+docker context show
+```
+
+## Xác minh rootless thật sự
+
+```bash
+docker info
+```
+
+Trong `Security Options`, cần có `rootless`. Đồng thời kiểm tra socket/process:
+
+```bash
+printf 'uid=%s runtime=%s\n' "$(id -u)" "$XDG_RUNTIME_DIR"
+ls -l "$XDG_RUNTIME_DIR/docker.sock"
+ps -u "$USER" -f | grep -E 'dockerd|rootlesskit' | grep -v grep
+```
+
+Chạy smoke test:
+
+```bash
+docker run --rm hello-world
+docker run --rm alpine id
+```
+
+`id` trong container có thể in `uid=0(root)` trong container view; user namespace map identity đó sang subordinate/unprivileged ID trên host. Đừng dùng output bên trong container làm bằng chứng duy nhất; `docker info` và host process/socket mới xác nhận daemon rootless.
+
+## Test published port
+
+Dùng unprivileged host port:
+
+```bash
+docker run --name rootless-web -d \
+  -p 127.0.0.1:8080:80 nginx:alpine
+curl --fail http://127.0.0.1:8080/
+docker rm -f rootless-web
+```
+
+Port dưới `1024` thường cần thay đổi host setting hoặc cấp `CAP_NET_BIND_SERVICE` cho RootlessKit. Hai lựa chọn này mở rộng capability/policy trên host; ưu tiên reverse proxy rootful được quản lý hoặc port cao nếu architecture cho phép.
+
+## Resource limits và cgroup
+
+Docker documentation nêu các flag cgroup như `--cpus`, `--memory`, `--pids-limit` trong rootless mode được hỗ trợ khi host dùng **cgroup v2 và systemd**. Kiểm tra:
+
+```bash
+docker info --format 'CgroupDriver={{.CgroupDriver}} CgroupVersion={{.CgroupVersion}}'
+```
+
+Nếu Cgroup Driver là `none`, resource-related flags có thể bị bỏ qua. Với `systemd`, controller nào được delegate vẫn phụ thuộc host:
+
+```bash
+cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers"
+```
+
+Đừng tuyên bố memory/CPU isolation hoạt động chỉ vì `docker run --memory ...` không báo lỗi. Tạo workload lab, đọc `docker inspect`, cgroup files và quan sát enforcement. Delegating thêm controller là thay đổi admin-wide cần test với systemd version hiện tại.
+
+## Storage và backup
+
+Data root mặc định là:
+
+```bash
+printf '%s\n' "$HOME/.local/share/docker"
+```
+
+Docker khuyến cáo không đặt rootless data directory trên NFS. User namespace, ownership, overlay/snapshotter và filesystem capability có thể không tương thích.
+
+Kiểm tra driver thực tế:
+
+```bash
+docker info --format 'Driver={{.Driver}} DockerRootDir={{.DockerRootDir}}'
+df -h "$HOME"
+df -i "$HOME"
+```
+
+Backup application data theo volume/database semantics; copy nóng toàn bộ daemon directory không bảo đảm application-consistent. Nếu đổi `data-root`, dùng filesystem local hỗ trợ, dừng daemon, test migration/rollback và không cho hai daemon chia sẻ cùng directory.
+
+## Rootless không loại bỏ các rủi ro sau
+
+- Kernel vulnerability vẫn có thể ảnh hưởng shared host kernel.
+- Image/container code không tin cậy vẫn truy cập network và dữ liệu bạn mount vào.
+- Bind mount từ home có quyền của user; mount secret source code vẫn làm lộ secret cho container.
+- Docker API rootless cho phép toàn quyền với daemon/data của user đó.
+- `--privileged` trong rootless không trở thành host root, nhưng vẫn mở rộng quyền trong user namespace và có thể tăng attack surface.
+- Rootless Docker-in-Docker vẫn có thể cần `--privileged` ở outer container theo documented setup; không coi đó là multi-tenant isolation mặc định.
+
+## Troubleshooting
+
+### Setup báo thiếu subordinate IDs
+
+```bash
+command -v newuidmap newgidmap
+grep "^$(whoami):" /etc/subuid /etc/subgid
+```
+
+Nhờ admin cấp range theo host identity policy. Không tự copy range của user khác vì overlap làm sai security mapping.
+
+### User service không có session bus/runtime dir
+
+```bash
+printf 'XDG_RUNTIME_DIR=%s\n' "$XDG_RUNTIME_DIR"
+loginctl user-status "$USER"
+systemctl --user status docker
+```
+
+SSH/session manager tối giản có thể không tạo user systemd environment đúng. Sửa PAM/systemd login path theo distribution; không đặt socket runtime lâu dài dưới shared `/tmp` vì permission và TOCTOU risk.
+
+### CLI vẫn trỏ rootful daemon
+
+```bash
+docker context ls
+docker context show
+env | grep '^DOCKER_HOST=' || true
+```
+
+Unset `DOCKER_HOST` cũ hoặc chọn `rootless` context, rồi kiểm tra `Security Options` lại.
+
+### Container không bind được port thấp
+
+Dùng port `1024` trở lên trước để xác minh daemon/network. Nếu business requirement bắt buộc port thấp, review hai phương án chính thức (`setcap` cho RootlessKit hoặc `net.ipv4.ip_unprivileged_port_start`) cùng blast radius và patch lifecycle.
+
+### Memory/CPU limit không enforce
+
+```bash
+docker info | grep -A8 -E 'Cgroup|Warnings'
+systemctl --user status docker
+```
+
+Kiểm tra cgroup v2, systemd driver và delegated controller. Không dùng process-level `ulimit` như tương đương hoàn toàn container cgroup limit.
+
+## Gỡ rootless setup
+
+Thu inventory và backup volume trước. Gỡ user service/config được setup tool quản lý:
+
+```bash
+dockerd-rootless-setuptool.sh uninstall
+```
+
+Tool không nhất thiết xóa toàn bộ data. Docker cung cấp helper `rootlesskit rm -rf` để xóa data root, nhưng đây là thao tác phá hủy. Chỉ chạy sau khi thay `<DATA_ROOT>` bằng path đã xác minh và backup:
+
+```bash
+rootlesskit rm -rf <DATA_ROOT>
+```
+
+Sau đó gỡ package rootless extras bằng package manager nếu không còn daemon nào cần. Tắt lingering nếu account không còn user service:
+
+```bash
+sudo loginctl disable-linger "$USER"
+```
+
+## Bước tiếp theo
+
+Cấu hình rootless daemon nằm tại `~/.config/docker/daemon.json`; áp workflow validate/rollback ở [Cấu hình Docker daemon](/docs/cai-dat-va-moi-truong/daemon-configuration/) nhưng dùng `systemctl --user`. Cuối cùng chạy [Xác minh môi trường](/docs/cai-dat-va-moi-truong/verify-environment/) với context `rootless`.
+
+## Nguồn chính thức để đối chiếu
+
+- [Rootless mode](https://docs.docker.com/engine/security/rootless/)
+- [Rootless mode tips](https://docs.docker.com/engine/security/rootless/tips/)
+- [Rootless mode troubleshooting](https://docs.docker.com/engine/security/rootless/troubleshoot/)

@@ -1,0 +1,150 @@
+---
+title: "Tổng quan nền tảng container"
+description: "Bản đồ namespaces, cgroups, capabilities, seccomp, filesystem layers, OCI và runtime giúp hiểu một Linux container được tạo, giới hạn và bảo vệ như thế nào."
+---
+
+Docker làm cho container dễ sử dụng, nhưng container không phải một object nguyên khối do kernel cung cấp. Trên Linux, runtime phối hợp process, namespaces, cgroups, mount, capabilities, seccomp và Linux Security Modules để tạo một môi trường chạy có vẻ độc lập. Image và chuẩn OCI bổ sung format để môi trường đó có thể được build, phân phối và khởi chạy bằng nhiều công cụ.
+
+Phần này xây mental model từ kernel lên Docker. Sau khi hoàn thành, bạn phải giải thích được **một lệnh `docker run` đã yêu cầu những layer nào làm việc**, quan sát isolation/resource control bằng evidence trên host và nhận ra khi nào cấu hình đã làm thủng ranh giới container.
+
+## Container là sự phối hợp nhiều cơ chế
+
+Sơ đồ sau chỉ thể hiện control flow chính trên một Linux Docker host:
+
+```text
+Docker CLI
+    │ Docker API
+    ▼
+dockerd
+    │ chuẩn bị image, network, mount và runtime config
+    ▼
+containerd ── snapshotter / content store
+    │ quản lý lifecycle
+    ▼
+OCI runtime, thường là runc
+    │ clone/unshare, mount, cgroup, capability, seccomp, exec
+    ▼
+Process ứng dụng
+    │
+    └── dùng chung Linux kernel với host
+```
+
+Không layer nào trong sơ đồ tự tạo ra mọi đặc tính của container:
+
+| Câu hỏi | Cơ chế chính trả lời |
+|---|---|
+| Process nhìn thấy PID, hostname, interface và mount nào? | Linux namespaces |
+| Nhóm process dùng được bao nhiêu CPU, memory, PIDs hoặc I/O? | Cgroups |
+| Process root còn được thực hiện nhóm thao tác đặc quyền nào? | Linux capabilities |
+| Process được gọi syscall nào? | Seccomp |
+| Process được truy cập object/file nào theo security policy? | DAC cùng AppArmor, SELinux hoặc LSM khác |
+| Root filesystem được ghép và ghi thay đổi ở đâu? | Image layers, snapshotter/storage driver và mounts |
+| Image/runtime config được mô tả theo format chung nào? | OCI Image và Runtime Specifications |
+| Ai kéo image, tạo bundle và quản lý process? | Container engine, containerd, shim và OCI runtime |
+
+<Callout type="warn" title="Quan trọng">
+  Namespace tạo một view tách biệt, không phải một authorization policy hoàn chỉnh. Cgroups kiểm soát tài nguyên, không che process hoặc file. Capabilities và seccomp thu hẹp quyền, nhưng không thay thế kernel patching, LSM, user mapping hay threat model phù hợp.
+</Callout>
+
+## Một `docker run` đi qua những bước nào?
+
+Xét command khái niệm:
+
+```bash
+docker run --name web \
+  --memory 256m --cpus 0.5 --pids-limit 200 \
+  --cap-drop ALL --security-opt no-new-privileges=true \
+  -p 127.0.0.1:8080:8080 \
+  example/web@sha256:<digest>
+```
+
+Hãy thay `example/web@sha256:<digest>` bằng image reference thật trước khi chạy. Ở mức nền tảng, stack thực hiện chuỗi việc sau:
+
+1. CLI gửi request tới daemon trong Docker context hiện tại.
+2. Engine resolve image reference; nếu local store chưa có content, nó lấy manifest và blobs từ registry rồi kiểm tra digest.
+3. Snapshotter hoặc storage driver chuẩn bị root filesystem từ read-only image layers và writable snapshot/layer.
+4. Engine tạo runtime configuration: command, environment, mounts, namespaces, cgroup limits, capability set và seccomp/LSM options.
+5. Container runtime tạo container process, nối process vào namespaces và cgroup, dựng mount tree rồi áp security attributes.
+6. Runtime `exec` process ứng dụng. Container được coi là running khi process chính còn sống; application health là một trạng thái khác.
+7. Network data path chuyển traffic từ host loopback port `8080` tới endpoint của container theo cấu hình Engine.
+
+Thứ tự implementation chi tiết có thể thay đổi theo Engine version, platform, image store và runtime. Điều quan trọng là phân biệt **artifact path**, **control path** và **application data path**:
+
+- image blobs đi qua registry/content store;
+- CLI request đi qua Docker API và runtime stack;
+- HTTP request tới application không đi qua Docker CLI.
+
+## Ranh giới của container nằm ở đâu?
+
+Một Linux container thông thường dùng chung host kernel. Process có thể thấy PID 1 trong PID namespace của mình nhưng kernel vẫn schedule cùng process đó trên host. File `/etc/hostname` có thể đến từ mount riêng, nhưng syscall đọc file vẫn do host kernel xử lý.
+
+Vì vậy, isolation phụ thuộc đồng thời vào:
+
+- kernel và runtime được cập nhật;
+- namespace nào riêng, namespace nào được share;
+- UID/GID trong container được map thế nào trên host;
+- capability và syscall nào còn được phép;
+- device, socket, bind mount và host path nào được expose;
+- cgroup limit có ngăn resource exhaustion hay không;
+- AppArmor, SELinux hoặc policy tương đương có enforce đúng không.
+
+Các option như `--privileged`, `--network host`, `--pid host`, bind mount `/`, expose device hoặc mount Docker socket có thể làm ranh giới mỏng đi rất nhiều. Không đánh giá security chỉ từ việc process “đang ở trong container”.
+
+## Phạm vi Linux và Windows
+
+Phần lớn các trang tiếp theo phân tích Linux container vì namespaces, cgroups, capabilities và seccomp là Linux kernel interfaces. Windows containers có object model tương tự ở mức image/container nhưng dùng primitives của Windows và có hai isolation mode chính:
+
+- **process isolation:** container share Windows kernel với host;
+- **Hyper-V isolation:** mỗi container chạy trong một utility VM tối ưu hóa với kernel riêng.
+
+Trang [Windows containers](/docs/nen-tang-container/windows-containers/) tách riêng compatibility, base image và isolation mode để tránh áp mental model Linux một cách máy móc lên Windows.
+
+## Môi trường thực hành
+
+Các lab kernel-level trong phần này giả định:
+
+- Docker Engine chạy trên Linux;
+- bạn có quyền chạy Docker command;
+- host có `/proc` và `/sys/fs/cgroup`;
+- các utility như `ps`, `readlink` hoặc `lsns` có trên host khi bài yêu cầu.
+
+Trên Docker Desktop, Linux container thường nằm trong Linux VM do Desktop quản lý. Command chạy trên terminal macOS/Windows không nhất thiết thấy trực tiếp PID, namespace inode hoặc cgroup filesystem bên trong VM. Bạn vẫn có thể chạy các ví dụ quan sát từ trong container, nhưng phần đối chiếu với host cần Linux Engine native hoặc môi trường lab Linux riêng.
+
+Trước mỗi lab, kiểm tra target và platform:
+
+```bash
+docker context show
+docker version --format 'Client={{.Client.Version}} Server={{.Server.Version}}'
+docker info --format 'OSType={{.OSType}} CgroupVersion={{.CgroupVersion}}'
+```
+
+Nếu format field không tồn tại trên Engine cũ, dùng `docker version` và `docker info` đầy đủ. Không chạy command cleanup hay thay daemon configuration trên host dùng chung.
+
+## Lộ trình học trong phần này
+
+Các trang được sắp theo dependency nhận thức:
+
+1. [Lịch sử container](/docs/nen-tang-container/lich-su-container/) giải thích vì sao container phát triển từ process isolation thành một packaging/distribution ecosystem.
+2. [Process isolation](/docs/nen-tang-container/process-isolation/) đặt process và shared kernel làm trung tâm.
+3. [Linux namespaces](/docs/nen-tang-container/linux-namespaces/) giải thích view riêng về PID, mount, network, user và các resource khác.
+4. [Control groups](/docs/nen-tang-container/control-groups/) tách resource accounting khỏi isolation.
+5. [Linux capabilities](/docs/nen-tang-container/capabilities/) phân rã quyền root.
+6. [Seccomp](/docs/nen-tang-container/seccomp/) lọc syscall đi vào kernel.
+7. [Union filesystem và image layers](/docs/nen-tang-container/union-filesystem/) giải thích root filesystem, copy-on-write và writable layer.
+8. [OCI standards](/docs/nen-tang-container/oci-standards/) nối image format với runtime bundle và distribution API.
+9. [Container runtime](/docs/nen-tang-container/container-runtime/) theo trace từ Engine qua containerd, shim và OCI runtime.
+10. [Windows containers](/docs/nen-tang-container/windows-containers/) đối chiếu process isolation với Hyper-V isolation.
+
+Đọc theo thứ tự nếu đây là lần đầu bạn học container internals. Nếu đang troubleshooting, có thể vào thẳng trang liên quan nhưng vẫn nên giữ ba câu hỏi: **process thấy gì, dùng được gì và được phép làm gì?**
+
+## Kết quả cần tự kiểm tra
+
+Bạn đã nắm bản đồ phần này nếu có thể trả lời:
+
+1. Vì sao namespace và cgroup không thay thế nhau?
+2. Vì sao root trong container có thể yếu hơn root trên host nhưng vẫn phải được coi là rủi ro?
+3. Image layer khác writable container layer và volume ở điểm nào?
+4. OCI chuẩn hóa những interface nào, và điều gì vẫn phụ thuộc implementation?
+5. Vì sao Docker Desktop làm việc quan sát PID/cgroup từ host khác Linux Engine native?
+
+Bắt đầu với [Lịch sử container](/docs/nen-tang-container/lich-su-container/) để thấy từng primitive và standard đã giải quyết phần nào của bài toán.

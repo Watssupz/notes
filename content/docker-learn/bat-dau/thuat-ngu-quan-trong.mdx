@@ -1,0 +1,333 @@
+---
+title: "Thuật ngữ Docker quan trọng"
+description: "Glossary theo ngữ cảnh về image, container, layer, registry, network, storage, build, Compose và lifecycle để đọc command Docker chính xác."
+---
+
+Docker dùng nhiều từ quen thuộc như “image”, “volume” và “service” với nghĩa kỹ thuật cụ thể. Học đúng quan hệ giữa các term quan trọng hơn ghi nhớ định nghĩa riêng lẻ. Trang này nhóm thuật ngữ theo lifecycle và chỉ ra những cặp thường bị nhầm.
+
+Đây là glossary nhập môn, không phải reference đầy đủ. Khi cần option, field hoặc default chính xác, hãy dùng [Docker reference](https://docs.docker.com/reference/) và local help của version đang chạy.
+
+## Bản đồ quan hệ tối thiểu
+
+```text
+┌────────────────────────────┐
+│ Dockerfile + build context │
+└──────────────┬─────────────┘
+               │ BuildKit / builder
+               ▼
+        ┌─────────────┐      push / pull      ┌─────────────────────┐
+        │    Image    │ ◀───────────────────▶ │ Registry repository │
+        └──────┬──────┘                      └─────────────────────┘
+               │ create / run + runtime configuration
+               ▼
+        ┌─────────────┐
+        │  Container  │
+        └──────┬──────┘
+               ├─ Network / published port
+               ├─ Volume / bind mount
+               └─ Writable layer
+```
+
+Nếu chỉ nhớ một điều, hãy nhớ: **Dockerfile mô tả build; image là artifact; container là runtime instance; registry phân phối image.**
+
+## Image và build
+
+### Dockerfile
+
+File text chứa build instructions để tạo image, thường tên là `Dockerfile`. Các instruction như `FROM`, `RUN`, `COPY`, `USER`, `ENTRYPOINT` và `CMD` mô tả filesystem hoặc runtime metadata của image.
+
+Dockerfile không phải script shell thuần túy. Mỗi instruction có semantics riêng; `RUN` thực thi trong build, còn `CMD`/`ENTRYPOINT` liên quan command mặc định khi container chạy.
+
+### Build context
+
+Tập file mà builder có thể truy cập trong một build. Trong command sau, dấu `.` là current directory được dùng làm build context:
+
+```bash
+docker build -t demo:dev .
+```
+
+`COPY` không tùy ý đọc mọi file trên host; source của nó bị giới hạn bởi build context và `.dockerignore`. Context quá lớn làm build chậm, gửi file không cần thiết và có thể tăng nguy cơ lộ dữ liệu cho builder.
+
+### `.dockerignore`
+
+File loại đường dẫn khỏi build context theo matching rules của Docker. Nó giúp giảm context và tránh gửi file như `.git`, output build hoặc local secret. `.dockerignore` không phải security control duy nhất: secret không nên tồn tại trong context nếu có thể tránh, và build secret cần dùng cơ chế mount dành cho secret.
+
+### Image
+
+Template read-only và metadata dùng để tạo container. Image thường gồm nhiều content-addressed layers cùng image configuration.
+
+Dùng:
+
+```bash
+docker image ls
+```
+
+để liệt kê image trong local image store của daemon hiện tại.
+
+### Layer
+
+Một phần content của image hoặc writable layer tại runtime. Build cache có thể tái sử dụng kết quả khi input của operation không đổi. “Mỗi dòng Dockerfile luôn tạo layer có kích thước” là cách nói quá đơn giản: metadata-only instruction và BuildKit internals cần được hiểu theo output/build graph cụ thể.
+
+### Base image
+
+Image xuất hiện trong `FROM` làm nền cho stage. Base image có thể cung cấp OS user space, runtime hoặc chỉ filesystem tối thiểu. Chọn base image ảnh hưởng compatibility, attack surface, package management và cách debug.
+
+### Tag
+
+Nhãn dễ đọc trỏ đến image trong repository, ví dụ `1.4`, `alpine` hoặc `latest`. Tag có thể được cập nhật để trỏ tới content khác; vì vậy tag không phải định danh bất biến.
+
+`latest` không có nghĩa “phiên bản ổn định mới nhất” theo một chuẩn chung. Nó chỉ là tên tag thông thường và là tag mặc định trong nhiều cú pháp khi bạn không ghi tag.
+
+### Digest
+
+Định danh content-addressed, thường có dạng `sha256:...`. Pull/deploy theo digest giúp chọn đúng image content, nhưng vẫn cần metadata và policy để biết content đó có đáng tin và phù hợp hay không.
+
+### Builder
+
+BuildKit environment thực thi build. Builder có driver, platform support, cache và output behavior riêng. Builder có thể chạy cùng daemon local, trong container hoặc ở môi trường khác tùy cấu hình Buildx.
+
+### Build cache
+
+Kết quả trung gian được tái sử dụng để tránh thực thi lại operation khi input phù hợp. Cache không phải image release và không nên được xem là nguồn dữ liệu lâu bền mặc định. Thứ tự `COPY` và dependency install trong Dockerfile ảnh hưởng cache invalidation.
+
+## Container và process lifecycle
+
+### Container
+
+Runtime instance được tạo từ image cùng configuration. Container có ID, name, state, writable layer, network attachment và mount riêng. Một container đã stop vẫn tồn tại cho đến khi bị remove.
+
+### Container ID
+
+Định danh daemon gán khi tạo container. CLI thường chấp nhận ID rút gọn nếu không mơ hồ. ID thay đổi khi bạn remove container và tạo container mới, ngay cả khi dùng cùng image và name.
+
+### Container name
+
+Tên dễ đọc, duy nhất trong phạm vi một daemon tại một thời điểm. Có thể tham chiếu name trong command:
+
+```bash
+docker stop web-demo
+```
+
+Trên user-defined network, container name hoặc network alias có thể tham gia service discovery theo phạm vi network. Không suy luận rằng name luôn resolve từ host hoặc từ mọi network.
+
+### Container state
+
+Trạng thái Engine quản lý, chẳng hạn created, running, paused, exited hoặc restarting. “Container tồn tại” và “process đang chạy” không phải cùng một điều.
+
+Dùng:
+
+```bash
+docker container ls
+docker container ls --all
+```
+
+Command đầu mặc định chỉ hiện container running; command sau gồm cả container đã stop.
+
+### PID 1
+
+Process chính trong PID namespace của container. Lifecycle container gắn chặt với process chính: khi process đó exit, container chuyển sang stopped/exited. PID 1 còn có trách nhiệm đặc biệt về signal và child-process reaping trên Linux, nên startup command và init behavior ảnh hưởng shutdown đúng cách.
+
+### Foreground và detached mode
+
+- **Foreground/attached:** client gắn với standard streams của container theo option.
+- **Detached (`-d`):** container chạy nền và CLI trả control cho terminal.
+
+Detached không có nghĩa container trở thành service bền vững hoặc tự restart sau failure. Restart policy là cấu hình riêng.
+
+### Exit code
+
+Mã process chính trả về khi kết thúc. `0` thường biểu thị thành công theo Unix convention; non-zero biểu thị lỗi do application hoặc runtime context. Exit code chỉ là tín hiệu bắt đầu: cần đọc logs, inspect state và events để tìm nguyên nhân.
+
+### Restart policy
+
+Quy tắc daemon dùng để quyết định có restart container sau khi process dừng hoặc daemon khởi động lại hay không. Restart policy không sửa được application crash và không thay thế health monitoring hay orchestrator reconciliation.
+
+### Healthcheck
+
+Command kiểm tra health theo cấu hình image hoặc container. Health status khác running state: process có thể đang chạy nhưng application unhealthy. Healthcheck cũng không tự publish port hoặc đảm bảo external dependency hoạt động từ góc nhìn end user.
+
+### Writable layer
+
+Layer ghi riêng của container nằm trên image layers. File tạo ở đây gắn với container và mất khi container bị remove. Đây không phải nơi phù hợp cho dữ liệu phải tồn tại hoặc được chia sẻ độc lập với container lifecycle.
+
+## Storage
+
+### Volume
+
+Storage object do Docker quản lý và mount vào container. Named volume có identity/lifecycle riêng với container, nên có thể giữ dữ liệu sau khi container bị remove.
+
+Volume không tự động là backup. Nếu host hoặc volume backend hỏng, dữ liệu vẫn có thể mất; phải có backup, retention và restore test riêng.
+
+### Bind mount
+
+Mount host path vào container. Nó tạo liên kết trực tiếp với filesystem host, hữu ích cho source code hoặc file cấu hình local nhưng làm workload phụ thuộc path, permission và semantics của host.
+
+Bind mount có thể cho process container sửa file host nếu mount writable. Luôn hiểu source path, destination và read-only/read-write mode trước khi chạy.
+
+### `tmpfs` mount
+
+Mount lưu dữ liệu trong memory của host theo semantics platform hỗ trợ và không ghi vào writable layer theo cách thông thường. Phù hợp cho dữ liệu tạm nhạy cảm hoặc high-I/O trong một số scenario, nhưng dữ liệu không bền qua stop/restart host và vẫn tiêu thụ memory.
+
+### Mount
+
+Khái niệm chung cho việc gắn storage source vào path trong container. CLI có `--mount` với key-value syntax và `-v`/`--volume` dạng ngắn. Hai syntax có behavior khác ở một số edge case; dùng reference của command và storage type cụ thể.
+
+## Networking
+
+### Container port
+
+Port mà process trong network namespace của container bind/listen. Docker không làm application tự listen. Nếu process chỉ listen sai interface hoặc sai port, publishing đúng syntax vẫn không giúp request thành công.
+
+### Host port
+
+Port trên Docker host dùng làm đầu vào khi publish. Trong `127.0.0.1:8080:80`, `8080` là host port và `80` là container port.
+
+### Publish port
+
+Tạo mapping từ host address/port tới container port:
+
+```bash
+docker run -p 127.0.0.1:8080:80 IMAGE
+```
+
+Nếu không ghi host address, published port thường bind trên mọi host address theo behavior/platform configuration, có thể làm service truy cập được từ network ngoài dự kiến. Dùng loopback khi chỉ cần truy cập local và xác minh firewall/network policy ở production.
+
+### Expose
+
+Metadata mô tả port application dự kiến dùng, thường qua Dockerfile `EXPOSE`. Nó không tự publish port ra host. `-p`/`--publish` mới là runtime option tạo mapping cụ thể.
+
+### Docker network
+
+Docker object kết nối container endpoint. Default bridge, user-defined bridge, host, none, overlay, macvlan và ipvlan có behavior/use case khác nhau.
+
+User-defined bridge thường phù hợp hơn default bridge cho application local nhiều container vì có isolation theo network và DNS-based name resolution tốt hơn.
+
+### DNS/service discovery
+
+Cơ chế để workload tìm endpoint theo name thay vì hard-code container IP. Container IP có thể thay đổi khi recreate; Compose service name hoặc network alias thường là abstraction phù hợp trong network scope tương ứng.
+
+### `localhost`
+
+Loopback luôn được hiểu trong network namespace nơi process chạy. Bên trong container, `localhost` thường trỏ lại chính container đó, không mặc định trỏ tới host hoặc container khác. Đây là nguồn lỗi phổ biến khi application cố kết nối database ở container riêng bằng `localhost`.
+
+## Registry và phân phối
+
+### Registry
+
+Service triển khai API phân phối image. Registry giữ manifests và blobs; access có thể public hoặc yêu cầu authentication/authorization.
+
+### Repository
+
+Namespace logic chứa các image references có cùng repository name trong registry. Một repository có nhiều tags và manifests.
+
+### Image reference
+
+Tên dùng để pull/push/run image. Cấu trúc khái niệm:
+
+```text
+[registry/][namespace/]repository[:tag][@digest]
+```
+
+Ví dụ:
+
+```text
+ghcr.io/example/payments:1.3
+```
+
+### Pull
+
+Tải metadata/content image cần thiết từ registry vào environment sử dụng. `docker run` có thể tự pull khi image bị thiếu theo pull policy của command.
+
+### Push
+
+Upload manifests/blobs và cập nhật reference trên registry. Push cần naming và authorization phù hợp; nó không tự chứng minh image an toàn hoặc production-ready.
+
+### Login và credential
+
+`docker login` thiết lập authentication material qua credential store/configuration phù hợp. Tránh đưa password/token trực tiếp vào shell history hoặc Dockerfile. CI nên dùng secret mechanism, token scope hẹp và thời hạn phù hợp.
+
+## Compose
+
+### Compose file
+
+YAML file mô tả application model gồm services và có thể có networks, volumes, configs, secrets cùng extension/merge behavior. Compose file không phải Dockerfile: nó mô tả runtime application, không thay thế build instructions của một image.
+
+### Service
+
+Khai báo cách chạy một loại workload trong Compose. Service có thể chỉ tới `image` có sẵn hoặc `build` configuration. Compose tạo container dựa trên service configuration.
+
+### Project
+
+Đơn vị nhóm resource của Compose. Project name ảnh hưởng tên container/network/volume do Compose tạo và giúp phân tách nhiều instance. Project directory, CLI option và environment có thể ảnh hưởng cách xác định project name; dùng `docker compose config` để xem model đã resolve.
+
+### `docker compose up`
+
+Build/pull khi cần, create và start resource theo model/configuration. `up` không chỉ “start container hiện có”; nó có thể reconcile thay đổi và recreate container.
+
+### `docker compose down`
+
+Stop và remove các container/network thuộc project theo option. Named/external volume và image có lifecycle khác; không giả định mọi dữ liệu đã bị xóa hoặc được giữ nếu chưa đọc option và output.
+
+## Security và vận hành
+
+### Root trong container
+
+UID 0 bên trong container. Tùy user namespace và configuration, root trong container có thể có quyền đáng kể đối với host kernel/resource được expose. Chạy non-root, drop capability và hạn chế mount giúp giảm risk nhưng cần application support.
+
+### Linux capability
+
+Các nhóm quyền tách từ quyền root truyền thống. Docker giữ/drop capability theo default profile; `--cap-add` và `--cap-drop` thay đổi tập quyền. Chỉ cấp capability cụ thể cần thiết thay vì dùng `--privileged`.
+
+### Privileged container
+
+Container chạy với boundary bị nới rất rộng và quyền truy cập host mạnh. Đây không phải cách sửa chung cho lỗi permission. Mọi use case cần threat-model review và alternative hẹp quyền hơn.
+
+### Docker socket
+
+Unix socket hoặc endpoint để truy cập Docker API, thường là `/var/run/docker.sock` trên Linux. Mount socket vào container gần như trao cho process khả năng điều khiển daemon trong phạm vi API/authorization hiện có. Không coi đây là “chỉ để đọc danh sách container”.
+
+### Immutable container
+
+Operational pattern không patch thủ công container đang chạy. Thay đổi được đưa vào source/build configuration, tạo image mới rồi replace container. “Immutable” ở đây là cách vận hành; writable layer vẫn có thể tồn tại nếu chưa bật read-only filesystem.
+
+### Observability
+
+Khả năng hiểu hệ thống qua logs, metrics, traces và events. `docker logs`, `docker stats`, `docker inspect` và `docker events` cung cấp tín hiệu khác nhau; không một command nào thay thế toàn bộ observability stack.
+
+### Prune
+
+Nhóm command dọn resource không dùng theo tiêu chí của Docker. Prune có thể xóa cache, image, network, container hoặc volume tùy command/option. Luôn preview bằng list/usage, hiểu daemon context và backup dữ liệu trước thao tác có thể phá hủy.
+
+## Các cặp dễ nhầm
+
+| Cặp thuật ngữ | Điểm phân biệt |
+|---|---|
+| Image / container | Template read-only / runtime instance có state và configuration riêng |
+| Dockerfile / Compose file | Build một image / mô tả application runtime nhiều resource |
+| Tag / digest | Nhãn có thể thay đổi / content identifier bất biến theo nội dung |
+| Registry / repository | Dịch vụ phân phối / nhóm image references trong dịch vụ |
+| `EXPOSE` / `--publish` | Metadata image / mapping network ở runtime |
+| Volume / bind mount | Docker-managed storage object / host path được gắn trực tiếp |
+| Stop / remove | Dừng process / xóa container object |
+| Running / healthy | Process chính đang chạy / healthcheck báo trạng thái ứng dụng |
+| CLI / daemon | Client gửi request / server thực thi và quản lý objects |
+| Compose / orchestrator cluster | Application model và lifecycle theo Compose / scheduling và reconciliation nhiều node |
+
+## Command map để củng cố thuật ngữ
+
+Các command sau chỉ đọc trạng thái và phù hợp để quan sát environment:
+
+```bash
+docker version
+docker context show
+docker image ls
+docker container ls --all
+docker network ls
+docker volume ls
+docker compose version
+docker buildx version
+```
+
+Đừng cố ghi nhớ toàn bộ output. Hãy xác định command đang hỏi daemon nào, object type nào và liệu nó hiển thị local state hay thông tin từ registry.
+
+Bây giờ bạn đã có vocabulary cần thiết để làm [Ứng dụng container đầu tiên](/docs/bat-dau/ung-dung-container-dau-tien/) và giải thích từng object được tạo thay vì chỉ copy `docker run`.

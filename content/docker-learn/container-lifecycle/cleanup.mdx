@@ -1,0 +1,261 @@
+---
+title: "Xóa container và dọn dẹp"
+description: "Xóa container an toàn bằng docker rm, phân biệt stopped/running/anonymous volume/named volume, dùng prune có filter và xây dựng quy trình cleanup không mất evidence."
+---
+
+Dọn dẹp container không chỉ là giải phóng vài dòng trong `docker ps -a`. `docker container rm` xóa container object, metadata và writable layer của nó. Sau thời điểm đó, bạn không còn inspect được exit code, command, mount config, log path hoặc filesystem diff của container đó từ Docker object cũ.
+
+Vì vậy, cleanup cần trả lời hai câu hỏi trước:
+
+1. Container có còn cần evidence để điều tra hay rollback không?
+2. Dữ liệu quan trọng có nằm trong writable layer hoặc anonymous volume không?
+
+Nếu câu trả lời chưa rõ, hãy thu thập thông tin trước khi `rm`, `prune` hoặc dùng `--force`.
+
+## `rm` xóa gì và không xóa gì?
+
+| Thành phần | `docker container rm` | Ghi chú |
+|---|---|---|
+| Container ID/name/config | Xóa | Name được giải phóng để dùng lại |
+| Writable layer của container | Xóa | File ghi bên trong root filesystem không còn |
+| Logs do driver local quản lý gắn với container | Thường không còn đọc bằng `docker logs` | Remote backend có thể vẫn giữ bản đã ship |
+| Named volume | Không xóa mặc định | Volume có lifecycle riêng |
+| Anonymous volume | Không xóa mặc định; xóa nếu thêm `--volumes`/`-v` | Chỉ volume gắn với container và không có name |
+| Image | Không xóa | Dùng `docker image rm` hoặc prune image riêng |
+| Network/user-defined volume còn dùng nơi khác | Không xóa | Có command cleanup riêng |
+
+Tài liệu Docker ghi `docker rm -v` xóa anonymous volumes associated with container, nhưng named volume vẫn còn. Đây là điểm dễ nhầm khi container dùng cả hai loại mount.
+
+## Xóa một container đã dừng
+
+Quy trình an toàn tối thiểu:
+
+```bash
+docker container inspect CONTAINER \
+  --format 'id={{.Id}} status={{.State.Status}} exit={{.State.ExitCode}} image={{.Image}} mounts={{json .Mounts}}'
+docker container logs --timestamps --tail 200 CONTAINER
+```
+
+Nếu không cần giữ evidence:
+
+```bash
+docker container rm CONTAINER
+```
+
+Xác minh:
+
+```bash
+docker container inspect CONTAINER
+```
+
+Lệnh cuối phải báo không tìm thấy container. Nếu bạn muốn script idempotent, xử lý trường hợp “No such container” như trạng thái đã cleanup thay vì coi là lỗi nghiêm trọng.
+
+## Xóa container đang chạy
+
+`docker container rm` mặc định từ chối container đang chạy. Bạn có hai lựa chọn:
+
+1. Graceful path: `docker stop` rồi `docker rm`.
+2. Force path: `docker rm --force`, Docker gửi `SIGKILL` rồi xóa container.
+
+Ưu tiên graceful path:
+
+```bash
+docker container stop --time 30 api
+docker container rm api
+```
+
+Force remove:
+
+```bash
+docker container rm --force api
+```
+
+<Callout type="warn" title="Force remove là kill + delete">
+  `docker rm --force` có thể làm mất dữ liệu đang xử lý và xóa luôn evidence trong container object. Chỉ dùng khi bạn đã chấp nhận mất graceful shutdown hoặc container đang kẹt làm ảnh hưởng lớn hơn.
+</Callout>
+
+Nếu container thuộc service đang nhận traffic, hãy drain/rút instance khỏi traffic trước khi stop nếu deployment layer hỗ trợ.
+
+## Anonymous volume và `--volumes`
+
+Tạo container có một named volume và một anonymous volume:
+
+```bash
+docker volume create lifecycle-named-data
+
+docker container create \
+  --name lifecycle-volume-demo \
+  --label com.example.lab=cleanup \
+  --mount type=volume,source=lifecycle-named-data,target=/named \
+  --volume /anonymous \
+  alpine:3.22 \
+  sh -c 'echo named >/named/file; echo anonymous >/anonymous/file'
+```
+
+Xem mount:
+
+```bash
+docker container inspect lifecycle-volume-demo \
+  --format '{{range .Mounts}}{{println .Type .Name .Destination}}{{end}}'
+```
+
+Xóa container và anonymous volume gắn với nó:
+
+```bash
+docker container rm --volumes lifecycle-volume-demo
+```
+
+Named volume vẫn còn:
+
+```bash
+docker volume inspect lifecycle-named-data
+```
+
+Cleanup named volume khi chắc chắn không cần dữ liệu:
+
+```bash
+docker volume rm lifecycle-named-data
+```
+
+Không dùng `-v` theo thói quen nếu bạn chưa review `.Mounts`. Anonymous volume đôi khi chứa dữ liệu stateful do Dockerfile `VOLUME` hoặc `docker run -v /path` tạo ra.
+
+## Prune stopped containers
+
+`docker container prune` xóa **tất cả stopped containers** trong daemon theo filter. Không tác động container đang chạy, nhưng vẫn có thể xóa evidence của incident cũ hoặc container lab của người khác trên shared host.
+
+Xem trước inventory:
+
+```bash
+docker container ls --all \
+  --filter 'status=exited' \
+  --format 'table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Labels}}'
+```
+
+Prune có xác nhận:
+
+```bash
+docker container prune
+```
+
+Prune không hỏi lại khi có `--force`:
+
+```bash
+docker container prune --force
+```
+
+Dùng filter để giảm blast radius:
+
+```bash
+docker container prune --force \
+  --filter 'label=com.example.lab' \
+  --filter 'until=24h'
+```
+
+Theo tài liệu Docker, nhiều filter khác key được kết hợp AND; nhiều filter cùng key được kết hợp OR. `until` được tính theo thời gian của daemon machine, không nhất thiết là timezone của máy chạy CLI nếu dùng remote context.
+
+## Dọn theo label thay vì name pattern
+
+Name pattern dễ chọn nhầm. Label giúp xác định ownership và mục đích:
+
+```bash
+docker container ls --all \
+  --filter 'label=com.example.lab' \
+  --format '{{.ID}}\t{{.Names}}\t{{.Status}}'
+```
+
+Xóa toàn bộ container lab đã dừng:
+
+```bash
+docker container ls --all --quiet \
+  --filter 'label=com.example.lab' \
+  --filter 'status=exited' |
+  xargs --no-run-if-empty docker container rm
+```
+
+`xargs --no-run-if-empty` là GNU behavior; trên macOS/BSD có option khác hoặc không cần. Với script portable, dùng shell loop rõ ràng:
+
+```bash
+for id in $(docker container ls --all --quiet \
+  --filter 'label=com.example.lab' \
+  --filter 'status=exited'); do
+  docker container rm "$id"
+done
+```
+
+## `--rm` cho container tạm thời
+
+`docker run --rm` tự xóa container khi nó dừng:
+
+```bash
+docker container run --rm alpine:3.22 printf '%s\n' 'temporary job'
+```
+
+Dùng `--rm` cho command ngắn, deterministic, không cần post-mortem state. Không dùng cho job quan trọng khi bạn cần inspect container sau failure, xem `docker diff`, đọc logs local hoặc giữ writable layer để điều tra.
+
+`--rm` cũng xóa anonymous volumes associated with container theo behavior được tài liệu Docker mô tả cho auto-remove. Named volume vẫn có lifecycle riêng.
+
+## Quy trình cleanup sau incident
+
+Trước cleanup:
+
+```bash
+docker container inspect CONTAINER > CONTAINER.inspect.json
+docker container logs --timestamps CONTAINER > CONTAINER.logs.txt
+docker container diff CONTAINER > CONTAINER.diff.txt || true
+docker events --since '2h' --until '0s' --filter 'container=CONTAINER' > CONTAINER.events.txt
+```
+
+Sau đó review:
+
+- có volume/bind mount nào chứa dữ liệu cần backup không;
+- container ID có được ghi trong ticket/incident timeline chưa;
+- replacement container đã chạy và nhận traffic ổn định chưa;
+- rollback có cần container cũ hay chỉ cần image/config cũ.
+
+Chỉ khi các câu hỏi này đã rõ mới xóa container cũ.
+
+## Troubleshooting
+
+### `rm` báo container đang chạy
+
+Kiểm tra state và quyết định graceful hay force:
+
+```bash
+docker container inspect CONTAINER \
+  --format 'status={{.State.Status}} pid={{.State.Pid}} started={{.State.StartedAt}}'
+```
+
+Nếu service còn nhận traffic, drain trước. Nếu process treo và cần giải phóng host ngay, dùng `rm --force` nhưng ghi nhận mất graceful shutdown.
+
+### Name conflict sau khi cleanup tưởng đã xong
+
+Container cũ có thể vẫn tồn tại ở `created`, `exited`, `paused` hoặc `dead`:
+
+```bash
+docker container ls --all --filter 'name=^/NAME$' --no-trunc
+```
+
+Filter name là regular expression. Dùng exact pattern `^/NAME$` để tránh match nhầm container tên gần giống.
+
+### Prune xóa nhầm evidence
+
+Nếu container đã bị xóa, Docker không khôi phục được writable layer/container metadata từ daemon một cách thông thường. Tìm evidence còn lại ở logging backend, artifact CI, monitoring, image registry, ticket và backup volume. Sau incident, thêm label/retention policy để prune không xóa object đang cần điều tra.
+
+### Disk vẫn không giảm sau khi rm
+
+Dung lượng có thể nằm ở image layer, build cache, volume, logs của container khác hoặc filesystem host. Kiểm tra tổng quan:
+
+```bash
+docker system df
+docker volume ls
+docker image ls
+```
+
+Không xóa trực tiếp file trong Docker data root. Dùng command Docker tương ứng và hiểu resource nào đang được container/image khác tham chiếu.
+
+## Nguồn chính thức
+
+- [docker container rm](https://docs.docker.com/reference/cli/docker/container/rm/)
+- [docker container prune](https://docs.docker.com/reference/cli/docker/container/prune/)
+- [docker system df](https://docs.docker.com/reference/cli/docker/system/df/)
+- [docker container diff](https://docs.docker.com/reference/cli/docker/container/diff/)

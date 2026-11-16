@@ -1,0 +1,237 @@
+---
+title: "Build cache mounts"
+description: "Dùng RUN --mount=type=cache cho npm, apt, pip, Go và compiler cache mà không đưa package cache vào image layer."
+---
+
+Cache mount là directory mutable được BuildKit duy trì qua nhiều lần build. Nó đặc biệt hữu ích cho package manager và compiler: ngay cả khi regular layer cache bị invalidated, operation có thể chỉ tải hoặc biên dịch phần còn thiếu thay vì bắt đầu từ zero.
+
+```dockerfile
+RUN --mount=type=cache,target=/root/.npm npm ci
+```
+
+Nội dung `/root/.npm` tồn tại trong cache của builder, nhưng mount không được commit vào image layer. Chỉ thay đổi nằm ngoài mount target mới trở thành filesystem của step.
+
+## Layer cache và cache mount khác nhau thế nào?
+
+| Cơ chế | Điều kiện reuse | Dữ liệu | Khi operation chạy lại |
+|---|---|---|---|
+| Regular layer cache | Cache key khớp chính xác | Snapshot output của step | Toàn bộ command bị bỏ qua khi hit |
+| Cache mount | Mount có cùng identity trên builder | Directory mutable tích lũy | Command vẫn chạy nhưng tái dùng file đã tải/build |
+| External cache | Import record/layer từ backend | Cache metadata và blob đã export | Builder khác có thể nhận regular cache hit |
+
+Cache mount bổ sung, không thay layer ordering. Vẫn nên copy lockfile trước source:
+
+```dockerfile
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+COPY . .
+```
+
+Nếu source đổi, step `npm ci` có thể vẫn hit regular cache. Nếu lockfile đổi, step chạy lại nhưng npm cache giúp giảm download.
+
+## Cú pháp và option
+
+```dockerfile
+RUN --mount=type=cache,id=my-cache,target=/path,sharing=locked command
+```
+
+| Option | Vai trò |
+|---|---|
+| `target` | Path mount trong build container; bắt buộc |
+| `id` | Identity cache; mặc định thường dựa trên `target` |
+| `sharing` | `shared`, `private` hoặc `locked` |
+| `from` | Stage/context cung cấp seed filesystem |
+| `source` | Subpath trong source được mount |
+| `ro`/`readonly` | Chỉ đọc cache |
+| `mode`, `uid`, `gid` | Permission khi tạo cache directory mới |
+
+Semantics của `sharing`:
+
+- `shared`: nhiều writer có thể dùng đồng thời; mặc định, chỉ phù hợp tool tự đồng bộ an toàn.
+- `locked`: operation khác chờ writer hiện tại; dùng cho database/cache không chịu concurrent writer như apt.
+- `private`: mỗi writer concurrent nhận cache riêng; giảm xung đột nhưng reuse/storage kém hơn.
+
+<Callout type="warn" title="Quan trọng">
+  `sharing=locked` khóa việc dùng cache, không khóa dependency version. Reproducibility vẫn cần lockfile, version pin và package registry policy.
+</Callout>
+
+## Ví dụ theo ecosystem
+
+### npm
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM node:24-alpine AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,id=npm-cache,target=/root/.npm \
+    npm ci
+COPY . .
+RUN npm run build
+```
+
+Mount npm download cache, không mount `node_modules` một cách mù quáng. `npm ci` vẫn tạo dependency tree từ lockfile trong layer/stage, nên cache correctness dễ hiểu hơn.
+
+### pnpm
+
+```dockerfile
+ENV PNPM_HOME=/pnpm
+RUN corepack enable
+COPY package.json pnpm-lock.yaml ./
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
+    pnpm config set store-dir /pnpm/store && \
+    pnpm install --frozen-lockfile
+```
+
+Pin Corepack/package-manager version theo project policy. Store path phải trùng path pnpm thực sự sử dụng.
+
+### apt
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM debian:bookworm-slim
+
+RUN rm -f /etc/apt/apt.conf.d/docker-clean && \
+    printf 'Binary::apt::APT::Keep-Downloaded-Packages "true";\n' \
+      > /etc/apt/apt.conf.d/keep-cache
+
+RUN --mount=type=cache,id=apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=apt-lists,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends gcc ca-certificates
+```
+
+Chạy `apt-get update` và `apt-get install` trong cùng `RUN`. `sharing=locked` tránh nhiều build ghi apt database đồng thời. Base image có thể cấu hình tự xóa package cache, vì vậy cần xác minh path/cache behavior của image đang dùng.
+
+### pip
+
+```dockerfile
+FROM python:3.13-slim AS build
+WORKDIR /app
+COPY requirements.txt .
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
+    pip install --require-hashes --no-deps \
+      --target=/opt/python -r requirements.txt
+```
+
+`--require-hashes` chỉ dùng được khi requirements khai báo hash đầy đủ. Cache không thay việc pin package/version.
+
+### Go
+
+```dockerfile
+FROM --platform=$BUILDPLATFORM golang:1.25 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,id=go-mod,target=/go/pkg/mod \
+    go mod download
+COPY . .
+ARG TARGETOS TARGETARCH
+RUN --mount=type=cache,id=go-mod,target=/go/pkg/mod \
+    --mount=type=cache,id=go-build-${TARGETOS}-${TARGETARCH},target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
+    go build -trimpath -o /out/server ./cmd/server
+```
+
+Tách compiler cache theo target platform giúp tránh collision khó chẩn đoán. Go build cache thường tự quản lý architecture, nhưng identity tường minh hữu ích khi builder chạy matrix lớn.
+
+### Cargo/Rust
+
+```dockerfile
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=cargo-target,target=/src/target \
+    cargo build --locked --release && \
+    cp target/release/myapp /out/myapp
+```
+
+Artifact phải copy ra ngoài mount (`/out`) trong cùng operation. Nếu binary chỉ nằm trong `/src/target`, nó biến mất khỏi layer sau khi mount được tháo.
+
+## Identity và phạm vi cache
+
+Mặc định theo target path có thể gây dùng chung ngoài ý muốn giữa project. Đặt `id` có namespace ổn định:
+
+```dockerfile
+ARG CACHE_SCOPE=myapp
+RUN --mount=type=cache,id=${CACHE_SCOPE}-npm,target=/root/.npm npm ci
+```
+
+Tuy nhiên, build args tham gia cache semantics và scope do caller điều khiển. Tránh đưa branch/commit vào mọi cache ID vì sẽ phá reuse và tăng storage. Tách cache khi dữ liệu không tương thích, ví dụ:
+
+- package manager major version khác;
+- OS/libc hoặc target architecture khác;
+- tool có cache format không backward-compatible;
+- tenant/trust boundary không được phép chia sẻ.
+
+Không dùng cùng cache ID cho credential hoặc artifact cần integrity. Cache được xem là không đáng tin và có thể bị xóa bất kỳ lúc nào.
+
+## Cache mount và multi-stage
+
+Có thể dùng cùng `id` ở nhiều stage:
+
+```dockerfile
+FROM node:24 AS deps
+RUN --mount=type=cache,id=app-npm,target=/root/.npm npm --version
+
+FROM node:24 AS test
+RUN --mount=type=cache,id=app-npm,target=/root/.npm npm --version
+```
+
+Nhưng mount không phải channel chuyển artifact giữa stage. Dùng `COPY --from` cho artifact có contract rõ; cache mount chỉ tăng tốc.
+
+## CI và remote builder
+
+Cache mount sống với storage của builder. Runner mới nhưng dùng remote builder bền vững có thể reuse mount. Runner mới đồng thời tạo builder mới thường mất mount cache.
+
+External cache chủ yếu chia sẻ regular build records/layers. Không giả định mọi backend/version export và khôi phục mutable cache mount theo cách package manager cần. Nếu cache mount là phần quan trọng của hiệu năng CI:
+
+1. đo trên builder/backend thực tế;
+2. ưu tiên builder persistent hoặc service remote;
+3. vẫn dùng external layer cache;
+4. không dùng workaround đóng gói cache directory vào image nếu chưa review security/storage.
+
+## Quyền sở hữu
+
+Builder tạo cache directory lần đầu theo `uid`, `gid`, `mode`. Với non-root build user:
+
+```dockerfile
+RUN --mount=type=cache,id=app-cache,target=/home/app/.cache,uid=10001,gid=10001,mode=0750 \
+    runuser -u '#10001' -- my-compiler
+```
+
+Command/user utility phụ thuộc base image. Một cache đã tồn tại có ownership cũ có thể không đổi chỉ vì option mới; xóa/migrate cache có kiểm soát khi thay UID.
+
+## Chẩn đoán cache mount
+
+Dùng progress log và ghi signal không nhạy cảm:
+
+```bash
+docker buildx build --progress=plain --load -t app:cache-test .
+docker buildx du
+```
+
+Nếu không nhanh hơn:
+
+- xác nhận tool ghi đúng `target`;
+- kiểm tra tool có flag `--no-cache` hoặc tự xóa cache;
+- kiểm tra builder có thay đổi giữa hai lần chạy;
+- kiểm tra cache ID/platform/user;
+- kiểm tra concurrent writer cần `sharing=locked`;
+- phân biệt regular layer hit (command không chạy) với cache mount hit (command vẫn chạy).
+
+## Best practices
+
+- Mount đúng download/compiler cache, không mount toàn bộ application directory.
+- Artifact cần xuất phải được copy ra ngoài mount target.
+- Dùng lockfile và integrity hash; cache không bảo đảm dependency đúng.
+- Chọn `sharing` theo behavior của tool, không luôn dùng mặc định.
+- Namespace `id` vừa đủ để tránh collision nhưng vẫn reuse.
+- Build phải thành công với cache rỗng.
+- Đặt quota/GC cho builder và theo dõi `docker buildx du`.
+- Không lưu token, private key hoặc `.npmrc` trong cache mount; dùng secret mount.
+
+## Nguồn chính thức
+
+- [Optimize cache usage in builds](https://docs.docker.com/build/cache/optimize/)
+- [`RUN --mount=type=cache`](https://docs.docker.com/reference/dockerfile/#run---mounttypecache)
+- [Cache invalidation](https://docs.docker.com/build/cache/invalidation/)
+- [External cache backends](https://docs.docker.com/build/cache/backends/)

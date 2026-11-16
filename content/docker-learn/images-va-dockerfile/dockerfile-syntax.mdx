@@ -1,0 +1,262 @@
+---
+title: "Dockerfile syntax"
+description: "Đọc và viết Dockerfile đúng parser directive, instruction, shell/exec form, line continuation, heredoc và variable replacement của BuildKit."
+---
+
+Dockerfile là text file gồm các instruction mà builder xử lý để tạo stage, filesystem changes và image configuration. Instruction không chỉ là shell command: builder parse `FROM`, `COPY`, `ENV`, `CMD` theo grammar riêng; chỉ một số instruction mới gọi shell.
+
+Một Dockerfile tối thiểu:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM alpine:3.23
+RUN printf 'hello\n' > /message.txt
+CMD ["cat", "/message.txt"]
+```
+
+Build và chạy:
+
+```bash
+docker build --tag syntax-lab:test .
+docker run --rm syntax-lab:test
+```
+
+Expected output là `hello`. `RUN` tạo file lúc build; `CMD` chỉ lưu default command để chạy sau.
+
+## Cấu trúc instruction
+
+Dạng tổng quát:
+
+```text
+INSTRUCTION arguments
+```
+
+Tên instruction không phân biệt hoa/thường, nhưng convention dùng uppercase để tách khỏi argument. Builder xử lý theo thứ tự dependency. Dockerfile hợp lệ bắt đầu stage bằng `FROM`; chỉ global `ARG`, parser directive và comment có thể đứng trước `FROM` theo rule tương ứng.
+
+Các nhóm chính:
+
+| Nhóm | Instruction tiêu biểu | Kết quả |
+|---|---|---|
+| Stage/filesystem | `FROM`, `RUN`, `COPY`, `ADD` | Chọn base hoặc tạo filesystem diff |
+| Runtime config | `CMD`, `ENTRYPOINT`, `ENV`, `USER`, `WORKDIR` | Ghi default vào image config |
+| Metadata/runtime hint | `LABEL`, `EXPOSE`, `VOLUME`, `HEALTHCHECK`, `STOPSIGNAL` | Ghi metadata/config |
+| Build control | `ARG`, `SHELL`, `ONBUILD` | Điều khiển parse/build hoặc image con |
+
+Không phải mỗi dòng luôn tương ứng một filesystem layer vật lý. Hãy dùng “instruction tạo operation/config” chính xác hơn quy tắc cũ “mỗi instruction là một layer”.
+
+## Parser directive phải ở đầu file
+
+Parser directive có dạng comment đặc biệt:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+# check=error=true
+
+FROM alpine:3.23
+```
+
+Directive phải xuất hiện trước comment thường, dòng trống đầu tiên hoặc builder instruction làm parser dừng tìm directive. Mỗi directive chỉ dùng một lần và không hỗ trợ line continuation.
+
+### `syntax`
+
+```dockerfile
+# syntax=docker/dockerfile:1
+```
+
+Directive này chọn Dockerfile frontend. `docker/dockerfile:1` theo stable channel mới nhất tương thích builder, cho phép dùng feature frontend mới mà không chờ nâng toàn bộ Engine. Nếu CI coi build check là error, pin minor syntax thích hợp để check mới không bất ngờ làm pipeline fail, rồi nâng có kiểm soát.
+
+Không dùng `:labs` cho production chỉ để copy một ví dụ; labs feature có stability/compatibility khác và phải được test với builder thực tế.
+
+### `escape`
+
+Default escape là backslash:
+
+```dockerfile
+RUN apk add --no-cache \
+    ca-certificates \
+    curl
+```
+
+Windows Dockerfile thường cân nhắc ``# escape=` `` để backslash trong path không bị hiểu thành line continuation. Directive này tác động Dockerfile parsing; nó không biến shell Linux thành PowerShell hay ngược lại.
+
+### `check`
+
+Build checks phát hiện pattern như JSON arguments được khuyến nghị. Frontend mới hỗ trợ cấu hình skip/error, ví dụ:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+# check=skip=JSONArgsRecommended;error=true
+```
+
+Tên check và availability phụ thuộc syntax version. Chỉ skip check kèm lý do review được; không dùng `skip=all` như cách mặc định để làm build xanh.
+
+## Comment và whitespace
+
+Dòng bắt đầu bằng `#` là comment nếu không phải parser directive hợp lệ:
+
+```dockerfile
+# Comment toàn dòng
+RUN echo 'ký tự # này là argument của shell'
+```
+
+`#` giữa dòng không phải inline Dockerfile comment. Trong ví dụ trên, shell nhận phần còn lại theo quoting của shell.
+
+Comment line bị loại trước khi instruction chạy. Không đặt comment vào giữa continuation với kỳ vọng shell nhận nó theo đúng text gốc. Giữ comment ở trước instruction và giải thích **vì sao**, không diễn giải lại command hiển nhiên.
+
+Leading whitespace trước instruction/comment được bỏ qua vì compatibility nhưng không nên dùng; whitespace trong argument có thể có ý nghĩa.
+
+## Shell form và exec form
+
+`RUN`, `CMD` và `ENTRYPOINT` hỗ trợ hai form:
+
+```dockerfile
+# Shell form
+RUN echo "$HOME"
+CMD echo "$HOME"
+
+# Exec form: JSON array, bắt buộc nháy đôi
+RUN ["sh", "-c", "echo $HOME"]
+CMD ["sh", "-c", "echo $HOME"]
+```
+
+| Đặc điểm | Shell form | Exec form |
+|---|---|---|
+| Tự gọi shell | Có | Không |
+| Variable expansion/glob/pipe | Do shell xử lý | Không, trừ khi gọi shell rõ ràng |
+| Argument boundaries | Qua một command string | Mỗi JSON element là một argument |
+| Signal cho service process | Có thể bị shell trung gian giữ | Trực tiếp hơn cho `CMD`/`ENTRYPOINT` |
+
+Exec form phải là JSON hợp lệ:
+
+```dockerfile
+ENTRYPOINT ["/usr/local/bin/server", "--foreground"]
+```
+
+Dùng nháy đơn làm array không còn là JSON hợp lệ. Trên Windows, backslash trong JSON string phải escape, ví dụ `"C:\\Windows\\System32\\tasklist.exe"`.
+
+Với service, ưu tiên exec form để executable trở thành PID 1 và nhận signal trực tiếp. Với `RUN`, shell form thuận tiện cho `&&`, pipe và expansion, nhưng cần xử lý failure semantics của shell.
+
+## Line continuation và heredoc
+
+Một instruction dài có thể tiếp tục dòng:
+
+```dockerfile
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates \
+       curl \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+Đây vẫn là **một** `RUN`. Dùng `&&` để dừng khi command trước lỗi. Với pipe, `/bin/sh` thường chỉ trả status command cuối; chọn shell có `pipefail` hoặc exec form rõ ràng nếu failure upstream phải làm build fail.
+
+Heredoc giúp script nhiều dòng dễ đọc:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM alpine:3.23
+RUN <<'EOF'
+set -eu
+mkdir -p /app
+printf '%s\n' 'hello' > /app/message
+EOF
+```
+
+Quote delimiter theo behavior shell mong muốn: `<<'EOF'` ngăn shell expand variable trong heredoc; `<<EOF` cho phép expansion. Kiểm tra frontend syntax và shell của base image thay vì giả định Bash có sẵn.
+
+## Variable replacement có hai nơi thực hiện
+
+Builder thay biến trong một số instruction như `COPY`, `WORKDIR`, `USER`, `LABEL`, `EXPOSE`. Shell thay biến trong shell-form `RUN`, `CMD`, `ENTRYPOINT`.
+
+```dockerfile
+FROM alpine:3.23
+ENV APP_HOME=/opt/app
+WORKDIR ${APP_HOME}
+RUN printf '%s\n' "$APP_HOME" > location.txt
+```
+
+- `${APP_HOME}` ở `WORKDIR` do Dockerfile frontend xử lý.
+- `$APP_HOME` trong `RUN` do `/bin/sh -c` xử lý.
+
+Exec form không tự expand shell variable:
+
+```dockerfile
+# In literal $HOME because no shell expansion
+RUN ["echo", "$HOME"]
+
+# Explicit shell expansion
+RUN ["sh", "-c", "echo $HOME"]
+```
+
+Dùng `${NAME}` khi ký tự ngay sau tên có thể bị hiểu là một phần identifier. Các modifier được frontend hỗ trợ phụ thuộc syntax channel/version; không giả định mọi Bash parameter expansion hoạt động trong builder replacement.
+
+## Scope của `ARG`
+
+Global `ARG` có thể tham gia `FROM`:
+
+```dockerfile
+ARG ALPINE_VERSION=3.23
+FROM alpine:${ALPINE_VERSION}
+ARG ALPINE_VERSION
+RUN echo "$ALPINE_VERSION"
+```
+
+`ARG` trước `FROM` nằm ngoài stage. Khai báo lại `ARG ALPINE_VERSION` trong stage nếu cần dùng giá trị ở các instruction sau. Stage con `FROM <previous-stage>` có thể kế thừa state theo rule stage; đừng dựa vào scope ngầm khi Dockerfile có nhiều nhánh.
+
+## Một Dockerfile có cấu trúc dễ review
+
+```dockerfile
+# syntax=docker/dockerfile:1
+
+ARG ALPINE_VERSION=3.23
+FROM alpine:${ALPINE_VERSION} AS runtime
+
+LABEL org.opencontainers.image.title="example-api"
+
+RUN addgroup -S -g 10001 app \
+    && adduser -S -D -H -u 10001 -G app app
+
+WORKDIR /app
+COPY --chown=10001:10001 --chmod=755 app /app/app
+
+USER 10001:10001
+EXPOSE 8080
+ENTRYPOINT ["/app/app"]
+CMD ["--listen=:8080"]
+```
+
+Thứ tự này đi từ base và package/user ít đổi tới application artifact đổi thường xuyên, đồng thời đặt runtime contract ở cuối để review nhanh.
+
+## Validate và đọc lỗi
+
+Build với output đầy đủ:
+
+```bash
+docker build --progress=plain --tag syntax-check:test .
+```
+
+Sau build, inspect effective config thay vì chỉ đọc source:
+
+```bash
+docker image inspect syntax-check:test \
+  --format 'user={{.Config.User}} workdir={{.Config.WorkingDir}} entrypoint={{json .Config.Entrypoint}} cmd={{json .Config.Cmd}} ports={{json .Config.ExposedPorts}}'
+```
+
+Lỗi parse thường xuất hiện trước khi chạy stage: JSON không hợp lệ, unknown instruction, directive sai vị trí hoặc continuation ghép nhầm dòng. Lỗi `RUN` lại là exit status từ build container; bật `--progress=plain` và đọc đúng step đầu tiên fail.
+
+## Quy tắc review ngắn
+
+- Khai báo `# syntax=docker/dockerfile:1` và kiểm tra builder hỗ trợ feature dùng trong file.
+- Dùng uppercase instruction, absolute `WORKDIR`, exec form cho service command.
+- Không nhầm `RUN` với `CMD`/`ENTRYPOINT`.
+- Không dùng `ARG` hoặc `ENV` cho secret.
+- Đặt package update/install/cleanup trong cùng `RUN` khi cần.
+- Tách dependency manifest khỏi source để giữ cache.
+- Build rồi inspect image config; syntax đúng chưa đủ chứng minh runtime contract đúng.
+
+## Nguồn chính thức
+
+- [Dockerfile reference](https://docs.docker.com/reference/dockerfile/)
+- [Dockerfile overview](https://docs.docker.com/build/concepts/dockerfile/)
+- [Build checks](https://docs.docker.com/reference/build-checks/)
+- [Dockerfile best practices](https://docs.docker.com/build/building/best-practices/)

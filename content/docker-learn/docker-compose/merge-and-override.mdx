@@ -1,0 +1,262 @@
+---
+title: "Merge và override file"
+description: "Ghép nhiều Compose files theo đúng thứ tự và merge rules; dùng !reset, !override, compose.override.yaml và docker compose config để kiểm soát model cuối."
+---
+
+Compose có thể merge nhiều file thành một application model. Pattern phổ biến là base file giữ contract chung, override chỉ chứa delta theo development, CI hoặc production.
+
+```bash
+docker compose \
+  -f compose.yaml \
+  -f compose.production.yaml \
+  config
+```
+
+File sau override/extend file trước. Không phỏng đoán model cuối từ từng fragment; render bằng `docker compose config`.
+
+## Auto-loaded override
+
+Không truyền `-f`, Compose có thể đọc:
+
+1. `compose.yaml`;
+2. optional `compose.override.yaml` cùng directory.
+
+Vì vậy development override thường được auto-load:
+
+```yaml
+# compose.override.yaml
+services:
+  api:
+    build: .
+    volumes:
+      - .:/app
+    environment:
+      LOG_LEVEL: debug
+```
+
+Khi production chỉ định rõ hai file:
+
+```bash
+docker compose \
+  -f compose.yaml \
+  -f compose.production.yaml \
+  up --detach
+```
+
+`compose.override.yaml` không được tự chen vào danh sách `-f` rõ ràng này.
+
+## Merge rules cốt lõi
+
+### Mapping
+
+Key mới được thêm; conflict dùng value ở file sau:
+
+```yaml
+# base
+services:
+  api:
+    environment:
+      LOG_LEVEL: info
+      PORT: "8080"
+```
+
+```yaml
+# override
+services:
+  api:
+    environment:
+      LOG_LEVEL: warn
+```
+
+Kết quả giữ `PORT`, đổi `LOG_LEVEL`.
+
+### Sequence
+
+Sequence thường append. Một số field có uniqueness key đặc biệt:
+
+| Field | Unique key |
+|---|---|
+| `volumes` | container `target` |
+| `secrets` | `target` |
+| `configs` | `target` |
+| `ports` | `{ip, target, published, protocol}` |
+
+Nếu hai volume cùng target, entry file sau thay/merge entry đó:
+
+```yaml
+# base
+volumes:
+  - app-data:/var/lib/app
+```
+
+```yaml
+# override
+volumes:
+  - ./fixtures:/var/lib/app:ro
+```
+
+Final target `/var/lib/app` dùng bind mount override, không giữ cả hai.
+
+### Shell commands
+
+`command`, `entrypoint` và `healthcheck.test` được replace bởi file sau, không append như list thông thường.
+
+## `!reset`: xóa value kế thừa
+
+Base publish port và bind code:
+
+```yaml
+services:
+  api:
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - .:/app
+    environment:
+      DEBUG: "true"
+```
+
+Production override:
+
+```yaml
+services:
+  api:
+    ports: !reset []
+    volumes: !reset []
+    environment:
+      DEBUG: !reset null
+```
+
+`!reset` đưa field về default/null. Đây là custom YAML tag Compose; generic YAML tool có thể không hiểu.
+
+## `!override`: replace hoàn toàn
+
+Compose 2.24.4+ hỗ trợ `!override` để bỏ merge semantics:
+
+```yaml
+services:
+  api:
+    ports: !override
+      - "8443:8080"
+```
+
+Không có tag, port mới có thể được append vào port cũ nếu uniqueness key khác. Dùng `!override` khi intent là “chỉ danh sách này”, nhưng pin minimum Compose version.
+
+## Relative paths luôn theo base file
+
+```text
+repo/
+├── compose.yaml
+└── deploy/
+    └── compose.production.yaml
+```
+
+Một path `./config` trong `deploy/compose.production.yaml` thường vẫn resolve theo directory của base `compose.yaml`, không theo `deploy/`. Đây là quy tắc để fragment override không cần là file độc lập.
+
+```bash
+docker compose \
+  -f compose.yaml \
+  -f deploy/compose.production.yaml \
+  config
+```
+
+Nếu mỗi module cần path riêng theo vị trí file của nó, dùng [top-level `include`](/docs/docker-compose/extends-and-include/).
+
+## `COMPOSE_FILE`
+
+Có thể đặt danh sách qua environment variable, nhưng separator phụ thuộc platform (`:` trên Unix, `;` trên Windows trừ khi cấu hình khác):
+
+```bash
+COMPOSE_FILE=compose.yaml:compose.ci.yaml docker compose config
+```
+
+Trong script cross-platform, nhiều `-f` flags rõ hơn.
+
+## Lab: quan sát merge
+
+`compose.yaml`:
+
+```yaml
+name: compose-merge-lab
+
+services:
+  app:
+    image: alpine:3.23
+    command: ["sleep", "300"]
+    environment:
+      MODE: base
+      KEEP: "yes"
+    ports:
+      - "127.0.0.1:8080:8080"
+```
+
+`compose.test.yaml`:
+
+```yaml
+services:
+  app:
+    environment:
+      MODE: test
+    ports: !reset []
+```
+
+Render và kiểm tra:
+
+```bash
+docker compose \
+  -f compose.yaml \
+  -f compose.test.yaml \
+  config
+```
+
+Expected: `MODE=test`, `KEEP=yes`, không còn `ports`. Chạy đúng file set:
+
+```bash
+docker compose \
+  -f compose.yaml \
+  -f compose.test.yaml \
+  up --detach
+```
+
+Dùng cùng flags khi `ps`, `logs`, `down` để project/model nhất quán:
+
+```bash
+docker compose -f compose.yaml -f compose.test.yaml down
+```
+
+## CI guardrails
+
+```bash
+docker compose -f compose.yaml -f compose.production.yaml config --quiet
+docker compose -f compose.yaml -f compose.production.yaml config > resolved.yaml
+```
+
+Kiểm tra resolved model cho:
+
+- development bind mounts còn sót;
+- port/admin UI expose ngoài ý muốn;
+- image tag mutable;
+- resource limit/restart/logging bị mất;
+- secret value được interpolate vào output;
+- duplicate port hoặc volume target;
+- path trỏ sai host directory.
+
+Xóa `resolved.yaml` nếu có dữ liệu nhạy cảm; tốt hơn validate bằng policy tool không lưu artifact public.
+
+## Khi override trở nên quá phức tạp
+
+Dấu hiệu cần refactor:
+
+- hơn vài layer `-f` và khó biết field đến từ đâu;
+- dùng nhiều `!reset` để xóa development defaults;
+- module path bị bẻ theo base file;
+- team khác nhau sửa cùng service/resource name;
+- một thay đổi phải test quá nhiều combination.
+
+Khi đó, đặt base tối thiểu, dùng file môi trường rõ ràng, chuyển module độc lập sang `include`, hoặc tách deployment model.
+
+## Nguồn chính thức
+
+- [Merge Compose files](https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/)
+- [Compose merge rules](https://docs.docker.com/reference/compose-file/merge/)
+- [`docker compose config`](https://docs.docker.com/reference/cli/docker/compose/config/)

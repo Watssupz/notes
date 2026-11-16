@@ -1,0 +1,302 @@
+---
+title: "Union filesystem và image layers"
+description: "Mental model về image layers, OverlayFS lowerdir/upperdir, copy-up, whiteout, writable container layer, volumes và tác động tới performance, dữ liệu."
+---
+
+Container cần một root filesystem có application, runtime và libraries, nhưng việc copy toàn bộ filesystem cho mỗi container sẽ tốn thời gian và dung lượng. Image layers cùng snapshotter/storage driver giải quyết bài toán này bằng cách tái sử dụng content read-only và tạo phần writable riêng cho từng container.
+
+**Union filesystem** là khái niệm ghép nhiều directory/layer thành một view. Trên Linux, OverlayFS là implementation phổ biến. Trong Docker, implementation cụ thể còn phụ thuộc Engine version, image store và platform; không dùng “UnionFS”, “OverlayFS”, `overlay2` và snapshotter như từ đồng nghĩa tuyệt đối.
+
+## Từ image đến root filesystem container
+
+```text
+Container view: / (merged snapshot)
+┌─────────────────────────────────────┐
+│ Writable container layer / snapshot │  thay đổi runtime
+├─────────────────────────────────────┤
+│ Image layer N                       │  read-only
+├─────────────────────────────────────┤
+│ ...                                 │
+├─────────────────────────────────────┤
+│ Image layer 1                       │  read-only
+└─────────────────────────────────────┘
+```
+
+Khi process đọc `/etc/app/config`, filesystem lookup đi từ layer trên xuống cho đến khi gặp entry hiệu lực. Nếu writable layer có version mới, nó che version trong image. Nếu không, process đọc content từ image layer.
+
+Mỗi container tạo từ cùng image có writable state riêng:
+
+```text
+                 ┌── writable A ── container A
+Image layers ────┤
+                 └── writable B ── container B
+```
+
+Hai container tái sử dụng read-only content nhưng file ghi vào writable A không tự xuất hiện trong writable B.
+
+## OCI image layer là changeset
+
+Theo OCI Image Specification, layer là filesystem changeset được serialize, thường dưới dạng tar archive có media type/compression xác định. Image manifest tham chiếu layer blobs bằng descriptors; image configuration lưu ordered `rootfs.diff_ids` và runtime metadata/history liên quan.
+
+Layer mô tả thay đổi so với layer trước, không nhất thiết là một “folder hoàn chỉnh”. Khi unpack theo thứ tự, changesets tạo final root filesystem.
+
+Cần phân biệt ba identifier/context:
+
+- **compressed blob digest:** digest descriptor trong manifest dùng để fetch/verify blob;
+- **DiffID:** digest của uncompressed layer tar stream trong image config;
+- **ChainID/snapshot key nội bộ:** implementation có thể dùng để nhận diện chuỗi applied layers/snapshots.
+
+Không suy disk path nội bộ từ image digest. Storage implementation được phép tổ chức content khác nhau.
+
+## OverlayFS mental model
+
+OverlayFS ghép:
+
+- `lowerdir`: một hoặc nhiều directory dưới, thường read-only;
+- `upperdir`: directory writable trên cùng;
+- `workdir`: scratch directory OverlayFS cần nội bộ;
+- `merged`: unified mount process nhìn thấy.
+
+```text
+lowerdir(s) + upperdir + workdir
+              │ overlay mount
+              ▼
+            merged
+```
+
+Trong storage driver `overlay2` legacy của Docker, image layers làm lower directories và container layer làm upper directory. Với containerd image store, containerd snapshotter đảm nhiệm snapshot lifecycle; tên driver/layout quan sát được có thể khác dù kernel OverlayFS vẫn tham gia.
+
+<Callout type="info" title="Lưu ý">
+  Docker Engine documentation hiện ghi Engine 29.0+ dùng containerd image store mặc định và xem `overlay2` là legacy storage driver được thay bởi containerd `overlayfs` snapshotter trong cấu hình đó. Khi troubleshooting, kiểm tra Engine version và image store thực tế thay vì hard-code `/var/lib/docker/overlay2`.
+</Callout>
+
+## Read, write và delete hoạt động thế nào?
+
+### Đọc file chưa bị thay đổi
+
+Nếu file chỉ có ở lower layer, OverlayFS đọc file đó từ lower layer. Nhiều container có thể dùng chung read-only backing content và page cache theo kernel behavior, giúp tiết kiệm disk/memory.
+
+### Ghi lần đầu: copy-up
+
+Khi container ghi file đã tồn tại trong lower layer, OverlayFS thực hiện **copy-up**: copy file lên upper layer rồi ghi bản upper. Với OverlayFS, copy-up diễn ra ở cấp file; sửa một phần nhỏ của file lớn vẫn có thể phải copy toàn file lần đầu.
+
+```text
+Trước write: lower/app.db (1 GiB)
+Write 4 KiB
+      │
+      ├── copy-up file lên upper
+      └── sửa bản upper
+```
+
+Đây là một lý do không đặt database write-heavy vào writable container layer.
+
+### Tạo file mới
+
+File mới được ghi trực tiếp vào upper layer. Nó tồn tại cùng lifecycle container và không trở thành image layer mới chỉ vì container đang chạy.
+
+### Xóa file từ image
+
+Lower layer là read-only nên file không bị xóa vật lý khỏi layer cũ. Upper layer ghi **whiteout** để che file đó trong merged view. Xóa directory có thể dùng opaque marker theo format/filesystem semantics.
+
+Điều này giải thích vì sao xóa secret hoặc package ở Dockerfile layer sau không loại bytes khỏi layer trước. Nếu secret từng được `COPY` vào một layer đã export, whiteout ở layer sau chỉ che path; blob cũ vẫn có thể chứa content.
+
+## Dockerfile instruction và layer
+
+BuildKit chuyển Dockerfile thành build graph và output image. Nhiều filesystem-changing instructions tạo changesets, còn metadata-only instructions có thể tạo history entry không có filesystem diff. Multi-stage build chỉ export stage/output được chọn; layer/cache internals không nên bị giản lược thành “mỗi dòng luôn là một layer có size”.
+
+Một anti-pattern:
+
+```dockerfile
+COPY production-secret.txt /tmp/secret.txt
+RUN use-secret /tmp/secret.txt && rm /tmp/secret.txt
+```
+
+Secret có thể tồn tại trong layer tạo bởi `COPY`. Dùng BuildKit secret mount để secret không đi vào image filesystem layer:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+RUN --mount=type=secret,id=app_token \
+    use-secret /run/secrets/app_token
+```
+
+Build command và secret source được trình bày chi tiết ở phần [BuildKit](/docs/buildkit/).
+
+## Writable layer không phải persistent storage
+
+Writable layer gắn với container object:
+
+- stop/start cùng container thường giữ writable changes;
+- remove container xóa writable layer/snapshot của container;
+- recreate từ cùng image tạo writable state mới;
+- commit có thể tạo image từ changes nhưng không phải deployment workflow khuyến nghị.
+
+Dữ liệu cần lifecycle độc lập nên dùng:
+
+| Storage | Lifecycle và use case |
+|---|---|
+| Named volume | Docker-managed object, tồn tại độc lập với container; phù hợp persistent application data theo driver/backend |
+| Bind mount | Host path trực tiếp; phù hợp source/config hoặc integration cần host path, kèm permission/portability trade-off |
+| `tmpfs` | Dữ liệu tạm trong memory theo platform support; không bền |
+| External storage/service | Database, object/block/file service có availability/backup model riêng |
+
+Volume thường bypass writable storage-driver path cho data mount và tránh copy-up overhead. Tuy nhiên performance còn phụ thuộc volume driver, filesystem, Docker Desktop file sharing và storage backend.
+
+## Lab 1: quan sát writable changes
+
+Tạo container nhưng giữ nó chạy:
+
+```bash
+docker run --name layer-demo -d alpine:3.20 sleep 300
+```
+
+Thêm, sửa và xóa file:
+
+```bash
+docker exec layer-demo sh -c \
+  'echo created >/created.txt; echo changed >>/etc/hostname; rm /etc/motd 2>/dev/null || true'
+```
+
+Xem diff từ góc nhìn Docker:
+
+```bash
+docker container diff layer-demo
+```
+
+Output dùng ký hiệu:
+
+- `A`: added;
+- `C`: changed;
+- `D`: deleted.
+
+Output thực tế có thể gồm file runtime tự thay đổi, không chỉ ba path lab. `docker diff` cho biết path-level changes trong writable layer theo Engine implementation; nó không phải backup format và không giải thích volume content.
+
+Xác minh file mới không có trong container khác từ cùng image:
+
+```bash
+docker run --rm alpine:3.20 test ! -e /created.txt && echo isolated
+```
+
+Dọn lab:
+
+```bash
+docker rm -f layer-demo
+```
+
+## Lab 2: volume che content tại mount point
+
+Tạo volume và ghi marker:
+
+```bash
+docker volume create layer-volume-demo
+docker run --rm \
+  --mount type=volume,src=layer-volume-demo,dst=/data \
+  alpine:3.20 sh -c 'echo persistent >/data/value.txt'
+```
+
+Đọc bằng container mới:
+
+```bash
+docker run --rm \
+  --mount type=volume,src=layer-volume-demo,dst=/data,readonly \
+  alpine:3.20 cat /data/value.txt
+```
+
+Expected output:
+
+```text
+persistent
+```
+
+Container đầu đã bị remove nhưng volume vẫn tồn tại. Dọn volume:
+
+```bash
+docker volume rm layer-volume-demo
+```
+
+Nếu image có sẵn file tại `/data`, mount volume lên `/data` có thể che content bên dưới trong container view. Docker có behavior copy-up/populate cho empty volume trong một số trường hợp; đọc storage documentation cụ thể và không dựa vào implicit copy cho migration quan trọng.
+
+## Kiểm tra storage implementation
+
+Bắt đầu từ supported interface:
+
+```bash
+docker info
+docker image inspect IMAGE
+docker container inspect CONTAINER
+docker system df -v
+```
+
+Trong `docker info`, tìm image store/storage driver, backing filesystem và warnings. Field/output thay đổi theo version; lưu full output trong incident evidence.
+
+<Callout type="warn" title="Cảnh báo">
+  Không sửa, di chuyển hoặc xóa trực tiếp file dưới Docker data root như `/var/lib/docker/`. Content store, metadata database, snapshots và reference counting do Engine/containerd quản lý. Thao tác trực tiếp có thể làm corrupt state và khiến image/container không truy cập được.
+</Callout>
+
+Nếu cần đổi storage driver/image store:
+
+1. kiểm tra support matrix và backing filesystem;
+2. backup/push images tự build và backup volume data bằng procedure riêng;
+3. dừng workload/daemon theo maintenance plan;
+4. chuẩn bị rollback;
+5. thay cấu hình theo Docker docs của đúng version;
+6. xác minh `docker info`, pull/run test image và restore test;
+7. không kỳ vọng local images/containers của store cũ tự xuất hiện trong store mới.
+
+## Performance implications
+
+### Copy-up latency
+
+Lần ghi đầu vào file lower lớn có thể tạo latency spike. Đặt write-heavy/mutable data vào volume hoặc external storage. Không tối ưu chỉ bằng giảm số layer; file size và access pattern quan trọng hơn một con số layer đơn giản.
+
+### Image depth và lookup
+
+Nhiều layers có thể tăng lookup/metadata overhead theo implementation, nhưng build cache và layer reuse cũng có giá trị. Tối ưu Dockerfile theo cache invalidation, image size, security và reproducibility; không squash mọi image như quy tắc tuyệt đối.
+
+### Page cache và shared content
+
+Container dùng chung image files có thể hưởng lợi từ shared page cache. Memory accounting theo cgroup vẫn có semantics phức tạp; đừng cộng RSS từng container rồi giả định bằng host physical memory chính xác.
+
+### Inode và small-file pressure
+
+Image hoặc writable workload tạo lượng lớn small files có thể cạn inode trước disk bytes. Theo dõi cả capacity bytes, inodes, metadata latency và Docker data-root growth.
+
+## Data và security failure modes
+
+### “Dữ liệu mất sau deploy”
+
+Nguyên nhân thường gặp là application ghi vào writable layer rồi container bị recreate. Xác minh mounts:
+
+```bash
+docker inspect --format '{{json .Mounts}}' CONTAINER
+```
+
+Fix bằng storage lifecycle rõ ràng, migration và backup/restore test; không giữ container cũ vô hạn như một database server thủ công.
+
+### “Image nhỏ nhưng disk host tăng nhanh”
+
+Kiểm tra writable layer, volumes, logs và build cache riêng. `docker system df -v` là điểm bắt đầu, nhưng external volume backend/logging driver cần tool riêng.
+
+### “Đã xóa secret ở layer sau”
+
+Coi secret là compromised nếu đã build/push trong layer. Rotate secret, xóa/retention-manage artifact ở registry/cache, sửa build dùng secret mount và rebuild từ clean context.
+
+### “Ứng dụng báo `EXDEV` khi rename”
+
+OverlayFS có edge case với rename directory qua layers và có thể trả cross-device error. Application nên hỗ trợ copy-and-unlink fallback khi phù hợp; đặt mutable data trên volume có filesystem semantics phù hợp.
+
+## Tự kiểm tra
+
+1. Lower, upper, merged và work directories có vai trò gì trong OverlayFS?
+2. Vì sao sửa vài byte có thể copy-up cả file?
+3. Whiteout khác xóa bytes khỏi image blob thế nào?
+4. Vì sao stop/start giữ writable state nhưng recreate không giữ?
+5. Khi nào dùng volume thay writable layer?
+
+Tiếp theo, [OCI standards](/docs/nen-tang-container/oci-standards/) mô tả cách image layers, manifests, runtime bundle và distribution API được chuẩn hóa để nhiều công cụ cùng hiểu.
+
+## Nguồn đối chiếu
+
+- [OverlayFS storage driver — Docker Docs](https://docs.docker.com/engine/storage/drivers/overlayfs-driver/)
+- [Storage drivers — Docker Docs](https://docs.docker.com/engine/storage/drivers/)
+- [OCI Image Specification](https://github.com/opencontainers/image-spec)
+- [Build secrets — Docker Docs](https://docs.docker.com/build/building/secrets/)

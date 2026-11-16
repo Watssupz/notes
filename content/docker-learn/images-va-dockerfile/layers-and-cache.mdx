@@ -1,0 +1,240 @@
+---
+title: "Image layers và build cache"
+description: "Hiểu quan hệ giữa filesystem layer và BuildKit cache, quy tắc cache invalidation, cách sắp Dockerfile và quy trình chẩn đoán cache hit hoặc miss."
+---
+
+Image layer là phần thay đổi filesystem được export trong image. Build cache là dữ liệu builder dùng để quyết định có thể tái sử dụng kết quả của một build operation hay không. Hai khái niệm liên quan nhưng **không đồng nhất**: cache có thể chứa metadata, intermediate result và cache mount không xuất hiện trong final image; một metadata instruction cũng có cache result dù không tạo filesystem payload đáng kể.
+
+Mục tiêu tối ưu cache không phải “ép mọi step thành `CACHED`”, mà là giữ các dependency đắt tiền ổn định khi source thay đổi và vẫn rebuild đúng khi input thực sự đổi.
+
+## BuildKit tìm cache theo chuỗi dependency
+
+Builder xử lý graph operation bắt đầu từ base image và instruction/input tương ứng. Ở mental model tuần tự đơn giản:
+
+```text
+FROM -> COPY lockfile -> RUN install -> COPY source -> RUN test/build
+                     cache ổn định          thay đổi thường xuyên
+```
+
+Nếu `COPY lockfile` đổi, cache của bước đó và các bước phụ thuộc phía sau không còn dùng được. Nếu chỉ source đổi sau bước install, dependency layer vẫn có thể được tái sử dụng.
+
+Dockerfile kém hiệu quả:
+
+```dockerfile
+FROM node:24-alpine
+WORKDIR /app
+COPY . .
+RUN npm ci
+RUN npm run build
+```
+
+Bất kỳ file nào trong context được `COPY . .` thay đổi đều có thể làm `npm ci` chạy lại. Tách input dependency:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM node:24-alpine AS build
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci
+
+COPY . .
+RUN npm run build
+```
+
+Cấu trúc mới chỉ đúng khi `package-lock.json` thật sự khóa dependency và script build không cần source trước `npm ci`.
+
+## Quy tắc invalidation quan trọng
+
+### Instruction thông thường
+
+Builder so operation và các input liên quan với cache record. Thay text instruction, base/reference, build argument được sử dụng hoặc dependency trước đó có thể tạo cache miss.
+
+Với:
+
+```dockerfile
+RUN apk add --no-cache curl
+```
+
+Registry package có phiên bản mới **không tự làm instruction đổi**. Rebuild có thể dùng cache cũ vì builder không chạy command rồi so filesystem remote.
+
+### `COPY`, `ADD` và bind mount trong `RUN`
+
+Builder tính checksum từ file metadata/content liên quan. Theo Docker cache rules, `mtime` không được dùng để quyết định checksum; chỉ chạm timestamp mà không đổi nội dung không bảo đảm cache miss.
+
+`.dockerignore` tác động tập input trước bước này. Một file đã bị loại khỏi context không thể ảnh hưởng checksum và cũng không thể được `COPY`.
+
+### Khi một bước miss
+
+Các operation phụ thuộc sau đó phải được đánh giá/build lại. Với BuildKit graph, stage/branch không phụ thuộc có thể vẫn dùng cache hoặc bị bỏ qua; không nên hình dung mọi Dockerfile đa stage luôn là một danh sách tuyến tính duy nhất.
+
+## `--no-cache`, `--pull` và cache busting
+
+Ba cơ chế giải quyết ba vấn đề khác nhau:
+
+| Cơ chế | Tác động chính | Không bảo đảm |
+|---|---|---|
+| `--no-cache` | Không dùng instruction cache cho build | Không tự pull base image mới |
+| `--pull` | Kiểm tra/pull base image mới hơn theo reference | Không bắt mọi `RUN` chạy lại |
+| Đổi input/ARG có chủ đích | Invalidate operation phụ thuộc | Không cập nhật nguồn remote nếu command vẫn dùng dữ liệu cố định |
+
+Clean rebuild đầy đủ thường dùng:
+
+```bash
+docker build --pull --no-cache --progress=plain --tag app:test .
+```
+
+Đây là công cụ xác minh, không phải mặc định cho mọi build CI. Tắt cache thường xuyên làm chậm pipeline và tăng tải registry/package repository mà không thay thế dependency pinning.
+
+Với multi-stage build, Buildx/BuildKit còn hỗ trợ `--no-cache-filter <STAGE>` để invalidate stage cụ thể khi frontend/builder tương thích.
+
+## Package manager và cache đúng
+
+Với Debian/Ubuntu, đặt update và install trong cùng instruction:
+
+```dockerfile
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates \
+       curl \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+Không tách `apt-get update` thành layer cache độc lập trước `apt-get install`; install có thể dùng package index cũ. Cleanup phải nằm trong **cùng instruction** để file cache không tồn tại trong layer trước.
+
+Với Alpine:
+
+```dockerfile
+RUN apk add --no-cache ca-certificates curl
+```
+
+Package version pinning cải thiện reproducibility nhưng tạo trách nhiệm cập nhật. “Luôn lấy mới nhất” và “byte-for-byte giống lần trước” là hai mục tiêu khác nhau; pipeline cần chọn policy và ghi nhận digest/lockfile.
+
+## Cache mount không đi vào final image
+
+BuildKit cache mount giữ cache package/compiler giữa các build invocation:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM golang:1.25 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go build -o /out/server ./cmd/server
+```
+
+Nội dung cache mount:
+
+- không tự trở thành filesystem layer;
+- có thể bị builder garbage collection xóa;
+- có thể được process/build khác cập nhật tùy `sharing`;
+- chỉ được dùng để tăng tốc, không được là nguồn duy nhất để build đúng.
+
+Build phải thành công với cache rỗng. Nếu package manager cần exclusive writer, chọn `sharing=locked` theo hướng dẫn của tool thay vì giả định cache dùng chung luôn an toàn.
+
+## Secret và cache
+
+Nội dung secret mount không tham gia cache checksum. Đổi token nhưng giữ operation giống nhau có thể vẫn hit cache. Nếu output hợp lệ phụ thuộc phiên bản/identity sau secret, đưa một non-secret cache-bust value vào `ARG`:
+
+```dockerfile
+ARG PRIVATE_DEPS_REVISION
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc,required=true \
+    npm ci
+```
+
+```bash
+docker build \
+  --secret id=npmrc,src="$HOME/.npmrc" \
+  --build-arg PRIVATE_DEPS_REVISION='<LOCKFILE_OR_RELEASE_REV>' \
+  .
+```
+
+Không đưa chính token vào `ARG`: build argument có thể lộ qua metadata, provenance, log hoặc cache. Đọc [Build secrets và SSH mounts](/docs/buildkit/secret-and-ssh-mounts/) để quản lý credential.
+
+## Đọc build log
+
+Dùng plain progress để thấy operation và trạng thái:
+
+```bash
+docker build --progress=plain --tag cache-lab:test .
+```
+
+Build lại không sửa file. Các step ổn định nên hiện `CACHED` hoặc được reuse theo output builder. Sau đó sửa đúng một source file và so sánh step nào chạy lại.
+
+Đừng dùng thời gian tổng duy nhất để kết luận cache hoạt động. Network, exporter, image loading và registry metadata vẫn có thể tốn thời gian dù phần compile hit cache.
+
+Thu thông tin builder khi behavior khác dự kiến:
+
+```bash
+docker buildx ls
+docker buildx inspect --bootstrap
+docker system df -v
+docker buildx du
+```
+
+`docker buildx du` áp dụng cho builder hiện tại; image store của Engine và cache của một remote/container builder có thể nằm ở nơi khác.
+
+## Chẩn đoán cache miss bất ngờ
+
+Đi theo thứ tự input thay vì xóa toàn bộ cache ngay:
+
+1. Xác nhận builder/driver và target stage có đổi không.
+2. Kiểm tra base tag/digest hoặc `--pull` có resolve content mới không.
+3. Dùng `git diff`, `.dockerignore` và context path để tìm file input đổi.
+4. Kiểm tra build arg, secret/SSH mount ID, mount option, platform và Dockerfile syntax.
+5. Đọc plain progress để xác định operation đầu tiên miss; các miss sau có thể chỉ là hệ quả.
+6. Kiểm tra external cache import/export có cùng scope/ref và credential không.
+7. Chỉ prune sau khi đã thu bằng chứng cần thiết.
+
+Cache miss giữa hai máy CI thường là expected nếu không import external cache. Đọc [External cache](/docs/buildkit/external-cache/) cho registry/local/GHA cache backend.
+
+## Chẩn đoán cache hit sai kỳ vọng
+
+Triệu chứng phổ biến là package hoặc remote artifact không cập nhật dù build chạy lại:
+
+- `RUN` command text không đổi nên cache vẫn hợp lệ;
+- secret content đổi nhưng không invalidate cache;
+- dependency range/tag mutable nhưng lockfile không đổi;
+- context đang trỏ nhầm thư mục;
+- build target không phụ thuộc stage bạn vừa sửa.
+
+Dùng `--no-cache-filter`, thay input version có chủ đích hoặc clean build để xác nhận giả thuyết. Không thêm `RUN date` ngẫu nhiên vào Dockerfile production: nó phá reproducibility và mọi cache phía sau mà không biểu diễn dependency thật.
+
+## Xóa cache có kiểm soát
+
+Trước prune:
+
+```bash
+docker buildx du
+```
+
+Sau khi xác nhận đúng builder và impact:
+
+```bash
+docker builder prune --filter 'until=168h'
+```
+
+Filter/khối lượng reclaim phụ thuộc cache record hiện có; đọc candidate/confirmation. Prune không có rollback và build sau sẽ phải tải/compile lại. `docker image prune` và `docker builder prune` nhắm object khác nhau, dù storage implementation có thể chia sẻ dữ liệu bên dưới.
+
+## Checklist thiết kế cache
+
+- [ ] Copy lockfile/manifest dependency trước source thay đổi thường xuyên.
+- [ ] Context nhỏ và `.dockerignore` loại secret, artifact, VCS data không cần.
+- [ ] Package index và install nằm cùng instruction khi tool yêu cầu.
+- [ ] Cache mount chỉ tăng tốc; build vẫn đúng với cache rỗng.
+- [ ] Base image và dependency có update/pinning policy rõ ràng.
+- [ ] Secret dùng secret mount, không dùng `ARG`/`ENV`.
+- [ ] CI import/export cache theo trust boundary; cache không tin cậy không được chứa secret.
+- [ ] Plain build log cho thấy miss đầu tiên phù hợp input đã đổi.
+
+## Nguồn chính thức
+
+- [Build cache invalidation](https://docs.docker.com/build/cache/invalidation/)
+- [Optimize cache usage in builds](https://docs.docker.com/build/cache/optimize/)
+- [Dockerfile best practices](https://docs.docker.com/build/building/best-practices/)
+- [`RUN --mount`](https://docs.docker.com/reference/dockerfile/#run---mount)

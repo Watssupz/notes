@@ -1,0 +1,464 @@
+---
+title: "Ứng dụng container đầu tiên"
+description: "Tutorial chạy một web application bằng Docker, xác minh image/container/port/logs, thực hành stop-start-remove và chẩn đoán các lỗi đầu tiên."
+---
+
+Trong bài thực hành này, bạn sẽ chạy một web application có sẵn từ image `docker/welcome-to-docker`, mở nó qua `http://localhost:8080`, quan sát lifecycle rồi dọn container. Mục tiêu không chỉ là thấy trang web: sau bài này, bạn phải giải thích được image đến từ đâu, process chạy ở đâu và vì sao request tới host port lại đến được container port.
+
+## Kết quả cuối cùng
+
+Luồng request sẽ có dạng:
+
+```text
+┌──────────────────────────────┐
+│           Browser            │
+└──────────────┬───────────────┘
+               │ HTTP http://localhost:8080
+               ▼
+┌──────────────────────────────┐
+│ Docker host 127.0.0.1:8080   │
+└──────────────┬───────────────┘
+               │ published port
+               ▼
+┌──────────────────────────────┐
+│ Container port 80            │
+├──────────────────────────────┤
+│ Web process                  │
+│ docker/welcome-to-docker     │
+└──────────────────────────────┘
+```
+
+Bạn sẽ tạo một container tên `welcome-docker`. Tên cố định làm các command sau dễ đọc và giúp nhận biết lỗi name conflict.
+
+## Prerequisites
+
+Bạn cần:
+
+- Docker Desktop đang chạy trên macOS, Windows hoặc Linux; **hoặc** Docker Engine đã cài và daemon đang chạy trên Linux;
+- terminal có thể gọi Docker CLI;
+- kết nối tới registry để pull image trong lần đầu;
+- host port `8080` chưa bị process khác chiếm;
+- quyền hợp lệ để truy cập Docker daemon.
+
+Nếu chưa cài, chuyển đến [Cài đặt và môi trường](/docs/cai-dat-va-moi-truong/). Không dùng `sudo` như phản xạ chung để che lỗi permission; hãy làm theo post-install hoặc rootless guidance phù hợp với hệ điều hành và threat model.
+
+<Callout type="info" title="Lưu ý">
+  Command Docker trong bài giống nhau trên Bash, zsh và PowerShell vì không dùng shell-specific substitution. Output như container ID, digest, thời gian và port formatting có thể khác theo version/platform.
+</Callout>
+
+## Bước 1: Xác minh client và daemon
+
+Chạy:
+
+```bash
+docker version
+```
+
+Environment sẵn sàng phải trả về thông tin của cả **Client** và **Server**. Output minh họa rút gọn:
+
+```text
+Client: Docker Engine - Community
+ Version: ...
+ Context: ...
+
+Server: Docker Engine - Community
+ Engine:
+  Version: ...
+```
+
+Tên product và field có thể khác trên Docker Desktop. Dấu hiệu quan trọng là phần Server đọc được, không có lỗi kiểu “Cannot connect to the Docker daemon”.
+
+Kiểm tra context daemon đích:
+
+```bash
+docker context show
+```
+
+Trong môi trường học local, context thường là context local do Engine hoặc Desktop cung cấp. Nếu context trỏ tới remote host, các bước tiếp theo sẽ chạy và publish port trên remote host chứ không phải laptop của bạn.
+
+<Callout type="error" title="Thận trọng">
+  Dừng lại nếu context đang trỏ tới shared, staging hoặc production daemon. Tutorial sẽ pull image, tạo container và publish port trên daemon đích.
+</Callout>
+
+## Bước 2: Bảo đảm tên và port còn trống
+
+Kiểm tra container cùng tên:
+
+```bash
+docker container ls --all --filter name=welcome-docker
+```
+
+Nếu output chỉ có header, chưa có container khớp. Nếu đã có `welcome-docker` từ lần thực hành trước, đọc trạng thái rồi xóa **chỉ container lab này** nếu không cần dữ liệu của nó:
+
+```bash
+docker container rm --force welcome-docker
+```
+
+`--force` có thể stop/kill process trước khi remove, vì vậy không dùng với container chưa xác định. Bài lab này không gắn volume và không chứa dữ liệu cần giữ.
+
+Nếu nghi port `8080` đang được dùng, bạn có thể chọn host port khác, ví dụ `8081`, rồi thay nhất quán trong command và URL. Container port vẫn là `80`.
+
+## Bước 3: Pull image một cách tường minh
+
+`docker run` có thể tự pull image nếu local store chưa có. Bài này tách bước pull để bạn thấy rõ image và container là hai object khác nhau:
+
+```bash
+docker image pull docker/welcome-to-docker
+```
+
+Lần đầu, Docker tải manifest và các layer còn thiếu. Lần sau, content đã có có thể được tái sử dụng. Output phụ thuộc platform, cache và registry nên không cần giống từng dòng trong tài liệu.
+
+Liệt kê image vừa pull:
+
+```bash
+docker image ls docker/welcome-to-docker
+```
+
+Bạn cần thấy ít nhất một row cho repository đó. Nếu command pull dùng reference không ghi tag, Docker áp tag mặc định theo naming rules, thường được hiển thị là `latest`. Đây là tag có thể thay đổi, phù hợp cho tutorial nhưng không phải chiến lược pin release production.
+
+Có thể xem digest/repo metadata mà local daemon biết bằng:
+
+```bash
+docker image inspect docker/welcome-to-docker \
+  --format '{{json .RepoDigests}}'
+```
+
+Trên PowerShell, command một dòng tránh khác biệt continuation character:
+
+```powershell
+docker image inspect docker/welcome-to-docker --format '{{json .RepoDigests}}'
+```
+
+Output là JSON array hoặc `[]` tùy image source/state. Không copy digest minh họa từ tài liệu; dùng digest thực tế đã pull trong environment của bạn.
+
+## Bước 4: Tạo và chạy container
+
+Chạy web container ở detached mode:
+
+```bash
+docker run --name welcome-docker \
+  --detach \
+  --publish 127.0.0.1:8080:80 \
+  docker/welcome-to-docker
+```
+
+PowerShell có thể chạy command trên một dòng:
+
+```powershell
+docker run --name welcome-docker --detach --publish 127.0.0.1:8080:80 docker/welcome-to-docker
+```
+
+Nếu thành công, CLI in container ID. Các option quyết định behavior:
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `docker run` | Create một container mới rồi start nó |
+| `--name welcome-docker` | Gán tên dễ tham chiếu |
+| `--detach` / `-d` | Chạy nền và trả terminal sau khi start |
+| `--publish 127.0.0.1:8080:80` | Forward host loopback port `8080` tới container port `80` |
+| `docker/welcome-to-docker` | Image reference dùng làm template |
+
+Host address `127.0.0.1` giới hạn mapping vào IPv4 loopback cho lab local. Nếu dùng `-p 8080:80` không ghi host address, port có thể được bind trên mọi interface theo daemon/platform configuration và trở thành truy cập được từ network ngoài dự kiến.
+
+`--publish` không làm web server tự khởi động; process mặc định do image configuration khởi động. Nó cũng không chứng minh application bên trong listen đúng port. Bước xác minh tiếp theo kiểm tra cả container state và request path.
+
+## Bước 5: Xác minh container đang chạy
+
+Chạy:
+
+```bash
+docker container ls --filter name=welcome-docker
+```
+
+Bạn cần quan sát:
+
+- `NAMES` là `welcome-docker`;
+- `STATUS` bắt đầu bằng trạng thái running như `Up ...`;
+- `PORTS` thể hiện mapping từ `127.0.0.1:8080` tới `80/tcp` theo format của version hiện tại.
+
+Output minh họa rút gọn:
+
+```text
+CONTAINER ID   IMAGE                      STATUS         PORTS                      NAMES
+...            docker/welcome-to-docker   Up ...         127.0.0.1:8080->80/tcp     welcome-docker
+```
+
+Nếu container không xuất hiện, đừng chạy lại ngay. Xem cả stopped containers:
+
+```bash
+docker container ls --all --filter name=welcome-docker
+```
+
+Nếu status là `Exited`, chuyển tới phần troubleshooting và đọc logs.
+
+Docker có thể xác nhận port mapping:
+
+```bash
+docker port welcome-docker
+```
+
+Output cần chỉ ra container port `80/tcp` được map tới host address/port đã chọn.
+
+## Bước 6: Gửi request tới application
+
+Mở browser tại:
+
+```text
+http://localhost:8080
+```
+
+Bạn cần thấy trang “Welcome to Docker”. Nếu có `curl`, có thể xác minh qua terminal:
+
+```bash
+curl --fail --show-error http://127.0.0.1:8080/
+```
+
+`curl` sẽ in HTML; nội dung có thể dài và thay đổi theo image version. Exit code `0` cùng HTTP response thành công là tín hiệu quan trọng hơn việc khớp toàn bộ HTML.
+
+Kiểm tra exit code ngay sau `curl`:
+
+```bash
+echo $?
+```
+
+Trong PowerShell, dùng:
+
+```powershell
+curl.exe --fail --show-error http://127.0.0.1:8080/
+$LASTEXITCODE
+```
+
+Lúc này bạn đã kiểm tra hai layer:
+
+1. Docker báo container process đang running.
+2. Request thật đi qua published port và nhận response từ application.
+
+Chỉ kiểm tra `docker ps` chưa đủ để kết luận web application phục vụ được request.
+
+## Bước 7: Đọc logs và inspect configuration
+
+Xem logs hiện có:
+
+```bash
+docker logs welcome-docker
+```
+
+Sau khi browser hoặc `curl` gửi request, log có thể chứa access record. Log format thuộc application/image và có thể đổi; mục tiêu là liên hệ request vừa gửi với output process container.
+
+Theo dõi log mới trong terminal:
+
+```bash
+docker logs --follow welcome-docker
+```
+
+Mở lại URL, quan sát log rồi nhấn `Ctrl+C` để dừng **client theo dõi logs**. Thao tác này không stop container vì `docker logs --follow` chỉ là process CLI attach vào log stream.
+
+Xem một vài field runtime:
+
+```bash
+docker inspect welcome-docker \
+  --format 'image={{.Config.Image}} status={{.State.Status}} pid={{.State.Pid}}'
+```
+
+PowerShell dùng cùng command trên một dòng:
+
+```powershell
+docker inspect welcome-docker --format 'image={{.Config.Image}} status={{.State.Status}} pid={{.State.Pid}}'
+```
+
+Bạn cần thấy image reference, `status=running` và PID khác `0`. PID này thuộc host/runtime view và sẽ thay đổi khi container/process được tạo lại; không dùng nó làm identity bền vững.
+
+## Bước 8: Thực hành stop và start
+
+Stop container theo cơ chế graceful stop của Docker/image:
+
+```bash
+docker stop welcome-docker
+```
+
+Kiểm tra:
+
+```bash
+docker container ls --all --filter name=welcome-docker
+```
+
+Container vẫn tồn tại nhưng trạng thái là exited/stopped. Request tới `http://localhost:8080` lúc này phải thất bại vì không có running container nhận traffic qua mapping đó.
+
+Start lại **cùng container**:
+
+```bash
+docker start welcome-docker
+```
+
+Xác minh lại:
+
+```bash
+docker container ls --filter name=welcome-docker
+curl --fail --show-error http://127.0.0.1:8080/
+```
+
+Nếu không có `curl`, reload browser. Bài thử này chứng minh:
+
+- `stop` không remove container;
+- `start` dùng lại container và configuration đã tồn tại;
+- `run` không phải command đúng để start container cùng tên đã có.
+
+## Bước 9: Remove container và kiểm tra image còn lại
+
+Stop rồi remove container:
+
+```bash
+docker stop welcome-docker
+docker container rm welcome-docker
+```
+
+Xác minh container không còn:
+
+```bash
+docker container ls --all --filter name=welcome-docker
+```
+
+Sau đó kiểm tra image:
+
+```bash
+docker image ls docker/welcome-to-docker
+```
+
+Image vẫn còn vì lifecycle image độc lập với container. Bạn có thể chạy container mới từ image mà không cần tải lại content nếu local store vẫn giữ đủ layers.
+
+### Dọn image tùy chọn
+
+Nếu muốn trả environment gần trạng thái ban đầu và không có container khác dùng image:
+
+```bash
+docker image rm docker/welcome-to-docker
+```
+
+Đây là bước tùy chọn. Docker có thể từ chối nếu image còn được container tham chiếu; hãy kiểm tra object phụ thuộc thay vì dùng force ngay.
+
+## Điều bài lab vừa chứng minh
+
+Bạn đã đi qua lifecycle:
+
+```text
+┌──────────────────────────────────────────┐
+│ Pull image                               │
+└────────────────────┬─────────────────────┘
+                     ▼
+┌──────────────────────────────────────────┐
+│ Create + start container (`docker run`)  │
+└────────────────────┬─────────────────────┘
+                     ▼
+┌──────────────────────────────────────────┐
+│ Inspect state + request + logs           │
+└────────────────────┬─────────────────────┘
+                     ▼
+┌──────────────────────────────────────────┐
+│ Stop → start lại cùng container          │
+└────────────────────┬─────────────────────┘
+                     ▼
+┌──────────────────────────────────────────┐
+│ Stop + remove container                  │
+├──────────────────────────────────────────┤
+│ Image vẫn tồn tại cho đến khi được xóa   │
+└──────────────────────────────────────────┘
+```
+
+Các boundary cần ghi nhớ:
+
+- Image là input; container là instance.
+- Container running không đảm bảo application healthy.
+- Host port và container port là hai endpoint khác nhau.
+- Stop giữ container object; remove xóa nó.
+- Xóa container không tự xóa image.
+
+## Troubleshooting theo bằng chứng
+
+### `Cannot connect to the Docker daemon`
+
+**Giả thuyết:** daemon/Desktop chưa chạy, context sai hoặc user không có quyền endpoint.
+
+**Thu thập bằng chứng:**
+
+```bash
+docker context show
+docker version
+```
+
+Nếu Client có nhưng Server lỗi, kiểm tra Docker Desktop status hoặc service Docker Engine theo platform. Không thay đổi socket permission thành world-writable và không dùng `sudo` trước khi hiểu installation model.
+
+### `Conflict. The container name ... is already in use`
+
+**Nguyên nhân:** stopped hoặc running container tên `welcome-docker` vẫn tồn tại.
+
+**Kiểm tra:**
+
+```bash
+docker container ls --all --filter name=welcome-docker
+```
+
+Nếu đúng là container lab cũ, remove rồi chạy lại. Nếu đang running và phục vụ đúng, không cần tạo container mới.
+
+### `port is already allocated` hoặc bind failed
+
+**Nguyên nhân:** process/container khác đang giữ host port `8080`, hoặc host address không thể bind.
+
+**Kiểm tra container publishing port:**
+
+```bash
+docker container ls --format 'table {{.Names}}\t{{.Ports}}'
+```
+
+Nếu không phải Docker container, dùng công cụ network của host để tìm listener. Cách ít tác động nhất cho lab là đổi host port:
+
+```bash
+docker run --name welcome-docker -d -p 127.0.0.1:8081:80 docker/welcome-to-docker
+```
+
+Sau đó mở `http://localhost:8081`.
+
+### Container chuyển sang `Exited`
+
+**Thu thập state và logs trước khi remove:**
+
+```bash
+docker inspect welcome-docker \
+  --format 'status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}'
+docker logs welcome-docker
+```
+
+PowerShell chạy command inspect trên một dòng. Exit code và logs giúp phân biệt application exit với lỗi runtime. Xóa/recreate ngay có thể làm mất writable-layer evidence cần điều tra.
+
+### Container `Up` nhưng browser không truy cập được
+
+Chẩn đoán theo request path:
+
+1. `docker port welcome-docker` có đúng `127.0.0.1:8080` không?
+2. `docker logs welcome-docker` có startup error không?
+3. Request bằng `curl --verbose http://127.0.0.1:8080/` trả connection refused, timeout hay HTTP error?
+4. Bạn có đang điều khiển remote context không? Nếu có, `localhost` trong browser là laptop, còn port được publish trên remote host.
+5. Proxy, VPN hoặc endpoint security có can thiệp loopback traffic không?
+
+Không đổi sang `--network host` hoặc `--privileged` để “thử cho chạy”; hai option đó thay đổi boundary và không xử lý đúng nguyên nhân phổ biến của lab.
+
+### Pull bị denied, timeout hoặc rate limit
+
+Kiểm tra image reference có đúng, network/DNS/proxy của daemon có hoạt động và registry có yêu cầu authentication không. Docker daemon/BuildKit có thể có network path khác shell host. Trong môi trường doanh nghiệp, cần cấu hình proxy hoặc registry mirror theo policy thay vì tắt TLS verification.
+
+## Bài thử mở rộng
+
+Sau khi dọn container, thử trả lời trước rồi mới chạy:
+
+1. Nếu đổi host port thành `8082` nhưng giữ container port `80`, URL nào hoạt động?
+2. Nếu bỏ `--detach`, terminal và log stream thay đổi thế nào? Dùng `Ctrl+C` có thể gửi signal tới foreground container tùy attach behavior.
+3. Nếu chạy hai container từ cùng image, chúng có thể cùng publish host port `8080` trên cùng address không?
+4. `docker container ls` và `docker container ls --all` khác nhau ở container stopped thế nào?
+
+Bạn đã sẵn sàng học cấu trúc command có hệ thống tại [Docker CLI](/docs/docker-cli/) hoặc chuẩn bị environment đúng platform tại [Cài đặt và môi trường](/docs/cai-dat-va-moi-truong/).
+
+## Nguồn chính thức để đối chiếu
+
+- [Get Docker Desktop và first container](https://docs.docker.com/get-started/introduction/get-docker-desktop/)
+- [`docker container run`](https://docs.docker.com/reference/cli/docker/container/run/)
+- [`docker container ls`](https://docs.docker.com/reference/cli/docker/container/ls/)
+- [`docker container logs`](https://docs.docker.com/reference/cli/docker/container/logs/)

@@ -1,0 +1,254 @@
+---
+title: "Docker contexts"
+description: "Tạo, chọn, kiểm tra, export và bảo vệ Docker context để một CLI quản lý nhiều daemon local hoặc remote mà không thao tác nhầm môi trường."
+---
+
+Docker context là một named client configuration chứa endpoint và metadata cần để CLI kết nối một daemon. Thay vì export `DOCKER_HOST` thủ công cho từng terminal, bạn có thể tạo context `local`, `staging`, `production-readonly` rồi chọn target rõ ràng.
+
+Context không tạo daemon và không cấp quyền mới. User vẫn cần quyền trên Unix socket, SSH account hoặc TLS credential tương ứng.
+
+## Context chứa gì?
+
+Một context thường có:
+
+- name và description;
+- endpoint của Docker daemon;
+- tùy chọn xác minh TLS;
+- TLS material nếu endpoint sử dụng certificate;
+- metadata do client quản lý.
+
+Liệt kê và inspect:
+
+```bash
+docker context ls
+docker context inspect default
+```
+
+Dấu `*` trong `docker context ls` chỉ context đang active theo effective client environment. Nếu `DOCKER_CONTEXT` đang được đặt, nó có thể override context đã chọn bằng `docker context use`.
+
+```bash
+docker context show
+env | grep -E '^DOCKER_(CONTEXT|HOST|TLS|CERT_PATH)=' || true
+```
+
+<Callout type="error" title="Context là một phần của security boundary">
+  Context có thể trỏ tới daemon production và có thể đi kèm TLS material. Không commit `~/.docker/contexts`, file export `.dockercontext` hoặc Docker config directory vào Git.
+</Callout>
+
+## Chọn endpoint phù hợp
+
+| Endpoint | Ví dụ | Đặc điểm |
+|---|---|---|
+| Unix socket | `unix:///var/run/docker.sock` | Local Linux Engine; quyền filesystem kiểm soát truy cập |
+| SSH | `ssh://docker-admin@host.example.com` | Tận dụng SSH authentication và forwarding tới daemon socket remote |
+| TLS TCP | `tcp://host.example.com:2376` | Cần daemon TLS configuration, CA và client certificate phù hợp |
+| Windows named pipe | `npipe:////./pipe/docker_engine` | Local Windows daemon |
+
+Không dùng unauthenticated TCP `2375` trên network. Docker API trao quyền quản lý host rất mạnh; firewall đơn thuần không thay thế mutual TLS hoặc SSH access control.
+
+## Tạo context qua SSH
+
+Prerequisite:
+
+- SSH từ client tới host hoạt động;
+- remote user được phép truy cập Docker socket;
+- Docker daemon đang chạy trên remote host;
+- host key đã được xác minh theo policy của tổ chức.
+
+Tạo context:
+
+```bash
+docker context create staging \
+  --description 'Shared staging Engine' \
+  --docker 'host=ssh://docker-admin@staging.example.com'
+```
+
+Xác minh metadata trước khi gửi request:
+
+```bash
+docker context inspect staging
+docker --context staging version
+docker --context staging info
+```
+
+`docker version` phải hiển thị Server. Nếu SSH thành công nhưng Docker trả permission denied, remote user chưa có quyền socket; không khắc phục bằng cách chmod socket thành world-writable.
+
+## Chọn context: persistent và per-command
+
+Chọn persistent cho terminal/user hiện tại:
+
+```bash
+docker context use staging
+docker context show
+```
+
+Cách này tiện khi làm việc tương tác nhưng dễ để lại target khác với dự kiến. Với script và command có side effect, pin context trên command:
+
+```bash
+docker --context staging container ls
+docker --context staging system df
+```
+
+Environment variable cũng có thể chọn context:
+
+```bash
+export DOCKER_CONTEXT=staging
+docker context show
+```
+
+`DOCKER_CONTEXT` override `DOCKER_HOST` và context được chọn bằng `docker context use`. Global flag `--context` dùng để chọn target cho command cụ thể. Tránh đặt đồng thời `--context`, `--host`, `DOCKER_CONTEXT` và `DOCKER_HOST`; cấu hình dư thừa làm code review khó xác định endpoint effective.
+
+### Guard chống nhầm production
+
+Tên context chỉ là label do người dùng đặt, không chứng minh endpoint đúng. Script nên kiểm tra cả name và endpoint allowlist:
+
+```bash
+set -euo pipefail
+
+: "${TARGET_CONTEXT:?Set TARGET_CONTEXT}"
+
+endpoint=$(docker context inspect "$TARGET_CONTEXT" \
+  --format '{{.Endpoints.docker.Host}}')
+
+case "$endpoint" in
+  ssh://docker-admin@staging.example.com*) ;;
+  *)
+    echo "Refusing unexpected endpoint: $endpoint" >&2
+    exit 1
+    ;;
+esac
+
+docker --context "$TARGET_CONTEXT" version >/dev/null
+```
+
+Trong production, guard nên đến từ deployment policy, separate account và approval, không chỉ từ string comparison.
+
+## Update, rename và remove
+
+Cập nhật description hoặc endpoint:
+
+```bash
+docker context update staging \
+  --description 'Staging Engine - platform team'
+```
+
+Kiểm tra option được hỗ trợ trên client hiện tại:
+
+```bash
+docker context update --help
+```
+
+Docker context có command `create`, `inspect`, `ls`, `use`, `update`, `export`, `import` và `rm`. Nếu cần đổi tên trong workflow kiểm soát, cách dễ audit là tạo context mới, xác minh, chuyển consumer rồi xóa context cũ; không sửa trực tiếp file metadata trong `~/.docker/contexts`.
+
+Trước khi xóa:
+
+```bash
+docker context show
+docker context inspect old-staging
+docker context rm old-staging
+```
+
+Xóa context chỉ xóa client-side connection metadata. Nó không xóa daemon hoặc Docker object trên endpoint.
+
+## Export và import
+
+Export hữu ích khi chuyển endpoint config giữa workstation:
+
+```bash
+docker context export staging
+```
+
+Command tạo file `staging.dockercontext` nếu không chỉ định output khác. Import:
+
+```bash
+docker context import staging staging.dockercontext
+docker context inspect staging
+docker --context staging version
+```
+
+<Callout type="warn" title="Review file export như credential">
+  Context export có thể chứa endpoint và TLS material. Chỉ truyền qua channel được phê duyệt, hạn chế quyền file, không gửi vào ticket/chat và xóa an toàn sau khi import.
+</Callout>
+
+Không coi import thành công là acceptance test. Luôn inspect endpoint, xác minh certificate/SSH identity và chạy một read-only request trước side effect.
+
+## Context và remote filesystem
+
+Khi context là remote:
+
+- image pull diễn ra từ network của remote daemon;
+- bind-mount source path được resolve trên remote daemon host;
+- published port lắng nghe trên remote host;
+- volume và container logs nằm ở remote daemon;
+- `localhost` trong terminal không phải `localhost` của remote host.
+
+Ví dụ này yêu cầu `/srv/app` tồn tại trên remote host, không phải laptop:
+
+```bash
+docker --context staging container run --rm \
+  --mount 'type=bind,src=/srv/app,dst=/app,readonly' \
+  alpine:latest ls -la /app
+```
+
+Đây là nguyên nhân phổ biến của lỗi bind source path hoặc việc publish port nhưng truy cập `127.0.0.1` trên client không thấy service.
+
+## Context với Docker Desktop
+
+Docker Desktop quản lý context và endpoint riêng theo platform. Không hard-code `/var/run/docker.sock` nếu `docker context inspect` cho thấy endpoint khác. Khi Desktop chuyển backend hoặc reset environment, context do Desktop quản lý có thể thay đổi; dùng CLI để inspect thay vì sửa file nội bộ.
+
+## Troubleshooting theo layer
+
+### Context không tồn tại
+
+```bash
+docker context ls
+docker context inspect staging
+```
+
+Kiểm tra typo, `DOCKER_CONFIG` có trỏ sang client config directory khác không, và context có được import cho đúng OS user không.
+
+### SSH context timeout
+
+```bash
+ssh -v docker-admin@staging.example.com true
+docker --debug --context staging version
+```
+
+Phân biệt DNS/network, host-key, SSH authentication và permission Docker socket. Không copy private key vào context directory tùy tiện.
+
+### TLS error
+
+Inspect `SkipTLSVerify`, endpoint và TLS path:
+
+```bash
+docker context inspect staging
+```
+
+Kiểm tra hostname trong certificate, CA chain, expiration và client certificate. Không chuyển sang `SkipTLSVerify=true` như permanent fix.
+
+### Command vẫn tới daemon khác
+
+```bash
+docker context show
+docker context ls
+env | grep '^DOCKER_' || true
+type docker
+```
+
+Shell alias/wrapper, `DOCKER_CONTEXT`, `DOCKER_HOST`, `--context` hoặc `--host` có thể override expectation. Chạy `command docker ...` để bỏ shell function/alias khi cần chẩn đoán.
+
+## Best practices
+
+- Đặt name phản ánh environment và owner; description ghi purpose/contact.
+- Dùng account/credential khác nhau cho production và non-production.
+- Pin `--context` trong automation; không phụ thuộc active context.
+- Xác minh endpoint allowlist trước destructive command.
+- Ưu tiên SSH hoặc mutual TLS; không expose daemon plaintext.
+- Rotate credential theo policy và thu hồi context export cũ.
+- Không chia sẻ nguyên `$HOME/.docker`; chỉ provision đúng context và credential cần thiết.
+
+## Nguồn chính thức
+
+- [Docker contexts](https://docs.docker.com/engine/manage-resources/contexts/)
+- [docker context create](https://docs.docker.com/reference/cli/docker/context/create/)
+- [Protect the Docker daemon socket](https://docs.docker.com/engine/security/protect-access/)

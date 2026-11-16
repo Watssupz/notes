@@ -1,0 +1,261 @@
+---
+title: "Create, run và start"
+description: "Phân biệt docker create, run và start; hiểu thời điểm container chốt cấu hình, cách chọn foreground/detached/interactive mode và xác minh state sau mỗi thao tác."
+---
+
+`docker container create`, `run` và `start` không phải ba cách viết của cùng một hành động. Chúng nằm ở các ranh giới khác nhau trong lifecycle:
+
+```text
+docker create = tạo container object
+docker start  = khởi chạy process chính của object đã có
+docker run    = create + start + attach mặc định
+```
+
+Phân biệt đúng ba command giúp tránh hai lỗi phổ biến: dùng `start` với hy vọng nhận cấu hình/image mới, hoặc dùng `run` nhiều lần rồi vô tình tạo nhiều container khác nhau.
+
+## So sánh nhanh
+
+| Command | Input chính | Tạo object mới | Start process | Mặc định nối terminal |
+|---|---|---:|---:|---:|
+| `docker container create` | Image + config | Có | Không | Không |
+| `docker container run` | Image + config | Có | Có | Có |
+| `docker container start` | Container đã tồn tại | Không | Có | Không |
+
+`start --attach` có thể nối `STDOUT`/`STDERR`; thêm `--interactive` nếu cần nối `STDIN`. Việc attach không thay đổi identity hay cấu hình container.
+
+## `docker create`: chốt runtime configuration
+
+Cú pháp:
+
+```text
+docker container create [OPTIONS] IMAGE [COMMAND] [ARG...]
+```
+
+Ở bước create, Docker chuẩn bị container object và writable layer nhưng chưa chạy command. Những lựa chọn quan trọng được lưu vào object tại đây:
+
+- image, `ENTRYPOINT`, `CMD` và environment;
+- user, working directory và hostname;
+- mounts, published ports và network mode ban đầu;
+- resource limit, security option và capabilities;
+- logging driver, healthcheck, stop signal và restart policy.
+
+Sau khi create, `docker start` không đọc lại Dockerfile, tag hay option từ shell. `docker container update` chỉ sửa được một tập cấu hình runtime giới hạn; thay đổi image, mount hoặc phần lớn cấu hình yêu cầu tạo container mới.
+
+Inspect cấu hình đã chốt:
+
+```bash
+docker container inspect CONTAINER \
+  --format 'image={{.Config.Image}} cmd={{json .Config.Cmd}} env={{json .Config.Env}}'
+```
+
+## `docker run`: đường tắt tạo rồi chạy
+
+Cú pháp:
+
+```text
+docker container run [OPTIONS] IMAGE [COMMAND] [ARG...]
+```
+
+Nếu image chưa có theo pull policy, CLI/daemon lấy image trước khi create. Sau đó Docker tạo container, start PID 1 và mặc định attach terminal hiện tại vào output của process.
+
+Một command one-shot an toàn cho lab:
+
+```bash
+docker container run --rm alpine:3.22 printf '%s\n' 'run-ok'
+```
+
+`--rm` yêu cầu Docker tự xóa container khi nó dừng. Đây là lựa chọn tốt cho tác vụ ngắn không cần giữ writable layer hoặc post-mortem state; không nên dùng khi bạn cần inspect container sau failure.
+
+### Boundary giữa option của Docker và command trong container
+
+Mọi option Docker phải đứng trước `IMAGE`:
+
+```bash
+docker container run --rm --name run-demo alpine:3.22 echo hello
+```
+
+Sau `alpine:3.22`, `echo hello` là command/argument trong container. Lệnh sau không đặt tên container:
+
+```bash
+# Sai: --name được truyền cho process của image
+docker container run alpine:3.22 --name run-demo
+```
+
+Quy tắc này đặc biệt quan trọng trong script vì lỗi có thể xuất hiện như lỗi application, không giống lỗi Docker CLI.
+
+## `docker start`: chạy lại đúng object cũ
+
+Cú pháp:
+
+```text
+docker container start [OPTIONS] CONTAINER [CONTAINER...]
+```
+
+`start` dùng lại:
+
+- container ID và name;
+- cấu hình đã chốt ở create;
+- writable layer hiện có;
+- named/anonymous volume còn được attach;
+- network/mount object theo cấu hình và state còn hợp lệ.
+
+Nó tạo process mới từ command đã lưu. PID cũ không sống lại và memory state không được khôi phục.
+
+<Callout type="warn" title="Start không deploy image mới">
+  Nếu tag `app:stable` đã được pull sang image mới, `docker start app` vẫn chạy image đã gắn với container `app` lúc create. Hãy recreate container và xác minh image ID/digest khi rollout.
+</Callout>
+
+## Foreground, detached, interactive và TTY
+
+Bốn khái niệm thường bị gộp thành “chạy nền” hoặc “chạy tương tác”:
+
+| Option/mode | Tác dụng |
+|---|---|
+| Foreground mặc định | CLI attach vào output và chờ process kết thúc |
+| `--detach` / `-d` | CLI trả container ID rồi thoát; container tiếp tục chạy |
+| `--interactive` / `-i` | Giữ `STDIN` mở ngay cả khi chưa attach |
+| `--tty` / `-t` | Cấp pseudo-TTY, phù hợp terminal cho người dùng |
+
+Interactive shell:
+
+```bash
+docker container run --rm -it alpine:3.22 sh
+```
+
+Pipeline không cần TTY:
+
+```bash
+printf 'alpha\nbeta\n' |
+  docker container run --rm -i alpine:3.22 grep beta
+```
+
+Không dùng `-t` theo thói quen trong CI hoặc pipeline. TTY thay đổi buffering, ký tự xuống dòng và cách signal/input được xử lý; một số runner còn báo `the input device is not a TTY`.
+
+## Lab: create trước, start sau
+
+### Tạo container có cấu hình quan sát được
+
+```bash
+docker container create \
+  --name lifecycle-create-demo \
+  --label com.example.lab=create-run-start \
+  --env APP_ENV=demo \
+  alpine:3.22 \
+  sh -c 'echo "APP_ENV=$APP_ENV"; touch /tmp/started; exec sleep 300'
+```
+
+Expected state:
+
+```bash
+docker container inspect lifecycle-create-demo \
+  --format 'status={{.State.Status}} running={{.State.Running}} started={{.State.StartedAt}}'
+```
+
+State phải là `created`; timestamp start chưa đại diện cho một lần chạy thành công.
+
+### Start và xác minh
+
+```bash
+docker container start lifecycle-create-demo
+docker container inspect lifecycle-create-demo \
+  --format 'status={{.State.Status}} pid={{.State.Pid}}'
+docker container logs lifecycle-create-demo
+```
+
+Expected: state `running`, PID khác `0`, log có `APP_ENV=demo`.
+
+Xác minh file trong writable layer:
+
+```bash
+docker container exec lifecycle-create-demo test -f /tmp/started
+```
+
+### Stop rồi start lại
+
+```bash
+docker container stop lifecycle-create-demo
+docker container start lifecycle-create-demo
+docker container exec lifecycle-create-demo test -f /tmp/started
+```
+
+File vẫn tồn tại vì container object và writable layer chưa bị xóa. Đây không phải persistence contract phù hợp cho dữ liệu quan trọng; phần [Docker storage](/docs/storage/) giải thích volume và bind mount.
+
+Cleanup:
+
+```bash
+docker container rm --force lifecycle-create-demo
+```
+
+## Naming, identity và script idempotent
+
+Name phải unique trong một daemon. Chạy lại:
+
+```bash
+docker container run --name api app:1.0
+```
+
+khi `api` đã tồn tại sẽ báo conflict, kể cả container cũ đang `exited`. Không khắc phục bằng `rm -f` mù quáng trong production.
+
+Một deploy script cần quyết định rõ:
+
+1. Nếu object đúng cấu hình và chỉ đang stopped: `start` có thể phù hợp.
+2. Nếu image/config thay đổi: capture evidence cần thiết, tạo replacement và chuyển traffic.
+3. Nếu name cũ cần reuse: xóa/rename object cũ chỉ sau khi xác nhận rollback và dữ liệu.
+
+Dùng label để nhận diện ownership thay vì pattern name mong manh:
+
+```bash
+docker container ls --all \
+  --filter 'label=com.example.service=api' \
+  --format '{{.ID}}\t{{.Names}}\t{{.Status}}'
+```
+
+## Troubleshooting
+
+### Container vừa start đã `exited`
+
+Container sống theo PID 1. Nếu command hoàn tất, crash hoặc daemon không invoke được executable, container dừng ngay.
+
+```bash
+docker container inspect CONTAINER --format '{{json .State}}'
+docker container logs --timestamps --tail 200 CONTAINER
+docker events --since '5m' --until '0s' --filter 'container=CONTAINER'
+```
+
+Đọc `.State.Error`, `.State.ExitCode`, `.State.OOMKilled`, command và logs trước khi recreate.
+
+### `start` không nhận environment/image mới
+
+Đây là behavior đúng: `start` không create lại. So sánh desired config với:
+
+```bash
+docker container inspect CONTAINER \
+  --format 'image-id={{.Image}} image-ref={{.Config.Image}} env={{json .Config.Env}}'
+```
+
+Sau đó tạo replacement thay vì patch object cũ.
+
+### `run` báo name conflict
+
+```bash
+docker container ls --all --filter 'name=^/NAME$' --no-trunc
+```
+
+Thay `NAME` bằng tên literal phù hợp và review object tìm được. Filter name dùng regular expression; exact pattern giảm nguy cơ chọn nhầm container có tên gần giống.
+
+### Command không tìm thấy hoặc không chạy được
+
+Kiểm tra image platform, `ENTRYPOINT`/`CMD`, executable path, permission và shebang:
+
+```bash
+docker image inspect IMAGE --format 'platform={{.Os}}/{{.Architecture}} entrypoint={{json .Config.Entrypoint}} cmd={{json .Config.Cmd}}'
+```
+
+Các exit code `125`, `126`, `127` được phân tích tại [Exit codes](/docs/container-lifecycle/exit-codes/).
+
+## Nguồn chính thức
+
+- [docker container create](https://docs.docker.com/reference/cli/docker/container/create/)
+- [docker container run](https://docs.docker.com/reference/cli/docker/container/run/)
+- [docker container start](https://docs.docker.com/reference/cli/docker/container/start/)
+- [Running containers](https://docs.docker.com/engine/containers/run/)

@@ -1,0 +1,276 @@
+---
+title: "Kiểm tra kiến thức nền"
+description: "Bài tự đánh giá terminal, process, filesystem, networking, YAML và security giúp xác định kiến thức cần ôn trước khi học Docker sâu."
+---
+
+Bạn có thể chạy container đầu tiên mà không cần kiến thức hệ thống sâu. Tuy nhiên, Docker bộc lộ rõ các khái niệm của operating system: process, signal, filesystem, user, port, DNS và resource. Nếu các khái niệm này chưa chắc, error của application thường bị hiểu nhầm thành lỗi Docker.
+
+Bài tự đánh giá này không nhằm loại người mới khỏi lộ trình. Mục tiêu là chỉ ra **phần cần ôn đúng lúc**. Hãy trả lời trước khi mở đáp án và đánh dấu mức tự tin của từng câu:
+
+- **Chắc:** trả lời được và giải thích lý do.
+- **Mơ hồ:** nhận ra term nhưng chưa dự đoán behavior.
+- **Chưa biết:** cần học nền trước hoặc song song.
+
+## Mức sẵn sàng tối thiểu
+
+Bạn sẵn sàng làm tutorial nhập môn nếu có thể:
+
+- mở terminal và chạy command;
+- phân biệt file với directory, relative path với absolute path;
+- hiểu một process có thể chạy, dừng và trả exit code;
+- biết `localhost` chỉ máy/network namespace hiện tại;
+- hiểu một TCP port chỉ là endpoint, không đảm bảo application hoạt động;
+- đọc được YAML indentation cơ bản;
+- nhận ra password/token không nên đặt trong source hoặc command history.
+
+Không cần thành thạo Linux internals. Các chủ đề namespaces, cgroups, capabilities và union filesystem sẽ được giải thích trong [Nền tảng container](/docs/nen-tang-container/).
+
+## Phần A: Terminal và command
+
+### Câu hỏi
+
+1. Trong command sau, đâu là command, option và argument?
+
+   ```bash
+   docker container logs --follow web
+   ```
+
+2. Vì sao copy command nhiều dòng dùng `\` từ Bash sang PowerShell có thể lỗi?
+3. Relative path `./config` được resolve dựa trên đâu? Absolute path khác gì?
+4. Exit code `0` thường biểu thị điều gì? Vì sao vẫn cần kiểm tra output/state sau một command thành công?
+5. Điều gì nguy hiểm khi chạy một command với `sudo` chỉ để “hết permission denied”?
+6. Environment variable của shell hiện tại có tự động xuất hiện trong mọi container không?
+
+### Đáp án và giải thích
+
+1. `docker` là executable command; `container` và `logs` chọn command group/action; `--follow` là option; `web` là argument nhận diện container. Cú pháp chính xác do CLI định nghĩa, vì vậy không suy luận mọi token chỉ dựa vị trí.
+2. Line continuation và quoting thuộc shell. Bash thường dùng backslash cuối dòng; PowerShell có cú pháp riêng. Docker nhận arguments sau khi shell parse, nên lỗi có thể xảy ra trước khi request tới daemon.
+3. Relative path được resolve từ working directory hoặc base directory mà tool/documentation quy định. Absolute path bắt đầu từ filesystem root/drive. Compose và build context có thêm quy tắc resolve path, do đó phải đọc đúng manual.
+4. Theo Unix convention, `0` thường là success của process. Nó chỉ nói command hoàn thành theo tiêu chí của command; container có thể start rồi application hỏng sau đó, nên phải kiểm tra state, logs hoặc request thật.
+5. `sudo` đổi identity và quyền, có thể tạo file root-owned, dùng Docker config/context khác hoặc trao quyền tác động host rộng hơn. Nó che nguyên nhân permission thay vì sửa installation/access model.
+6. Không. Container chỉ nhận environment được image/runtime/Compose cấu hình. Shell variable còn phải được expansion hoặc truyền qua option/file theo semantics cụ thể.
+
+**Nếu còn mơ hồ:** ôn shell parsing, quoting, working directory, exit status và user/permission. Khi đọc tài liệu, luôn chọn đúng tab Bash/PowerShell/CMD.
+
+## Phần B: Process, signal và lifecycle
+
+### Câu hỏi
+
+1. Process khác program file ở điểm nào?
+2. Điều gì xảy ra với container khi process chính của nó kết thúc?
+3. `SIGTERM` và `SIGKILL` khác nhau về cơ hội cleanup thế nào trên Linux?
+4. Một process đang “running” có chắc application healthy không?
+5. Vì sao chạy database bằng process background trong một shell container rồi để shell exit có thể làm lifecycle khó hiểu?
+6. Restart policy có sửa được bug làm application crash không?
+
+### Đáp án và giải thích
+
+1. Program là code/artifact lưu trên disk; process là một instance đang thực thi với PID, memory, open files, credentials và state. Một program có thể tạo nhiều process.
+2. Container gắn lifecycle với process chính; khi process đó exit, container chuyển sang exited/stopped. Container object có thể vẫn tồn tại để inspect, đọc logs hoặc start lại.
+3. `SIGTERM` có thể được process bắt để graceful shutdown; `SIGKILL` không thể bị bắt/ignore và kernel kết thúc process. Docker stop thường cho process một khoảng thời gian xử lý stop signal trước khi buộc dừng theo configuration.
+4. Không. Process có thể sống nhưng deadlock, không kết nối database hoặc trả lỗi. Healthcheck và external request kiểm tra layer khác với process state.
+5. Container có process model riêng. Nếu shell là process chính và exit, container stop dù child/background behavior không như mong đợi. Image nên có foreground process và signal handling rõ.
+6. Không. Restart policy chỉ quyết định daemon thử restart theo rule; crash loop vẫn tồn tại, có thể làm tăng load và che triệu chứng nếu không có observability.
+
+**Nếu còn mơ hồ:** đọc [Container lifecycle](/docs/container-lifecycle/) sau trang nhập môn, đặc biệt process, exit code, stop/kill và restart policy.
+
+## Phần C: Filesystem, user và dữ liệu
+
+### Câu hỏi
+
+1. File permission “read-only” và filesystem/mount “read-only” có hoàn toàn giống nhau không?
+2. Vì sao UID `1000` bên trong container có thể gây lỗi với file bind-mounted từ host?
+3. Dữ liệu ghi vào writable layer của container ra sao khi container bị remove?
+4. Volume và backup có phải cùng một khái niệm không?
+5. Bind mount khác volume ở ownership/lifecycle source như thế nào?
+6. Vì sao copy secret vào image rồi xóa ở build step sau vẫn có thể không an toàn?
+
+### Đáp án và giải thích
+
+1. Không. Permission bits/ACL áp theo identity và filesystem policy; read-only mount ngăn write ở mount boundary. Root/capability, ownership và platform còn ảnh hưởng behavior. Cần biết control nằm ở layer nào.
+2. Kernel/filesystem thường xét numeric UID/GID và permission. Tên user giống nhau không đảm bảo ID mapping giống; Docker Desktop file sharing hoặc user namespace còn thêm layer mapping.
+3. Writable layer gắn với container và bị xóa cùng container. Dữ liệu phải bền cần volume, bind mount hoặc external store phù hợp.
+4. Không. Volume là nơi lưu data có lifecycle riêng; backup là bản sao/strategy có failure domain, retention và restore verification. Volume trên host hỏng có thể mất cùng host.
+5. Bind mount trỏ trực tiếp tới host path do operator chọn. Volume là Docker object với location/driver do Docker quản lý. Cả hai vẫn cần permission, backup và security review.
+6. Image layer/content hoặc build cache có thể giữ secret từ step trước. Dùng BuildKit secret mount và thiết kế context để secret không được gửi/copy vào layer.
+
+**Nếu còn mơ hồ:** học [Storage](/docs/storage/) và phần `USER`, `COPY`, build secret trong [Images và Dockerfile](/docs/images-va-dockerfile/) / [BuildKit](/docs/buildkit/).
+
+## Phần D: Networking
+
+### Câu hỏi
+
+1. Trong mapping `127.0.0.1:8080:80`, đâu là host address, host port và container port?
+2. `localhost` bên trong container thường trỏ tới đâu?
+3. `EXPOSE 80` trong Dockerfile có tự mở host port `80` không?
+4. DNS name và IP address khác nhau thế nào khi container được recreate?
+5. “Connection refused”, “timeout” và HTTP `500` gợi ý lỗi ở các layer khác nhau ra sao?
+6. Vì sao application chỉ listen trên `127.0.0.1` bên trong container có thể không nhận traffic qua container network interface?
+
+### Đáp án và giải thích
+
+1. `127.0.0.1` là host bind address, `8080` là host port, `80` là container port.
+2. Loopback của chính network namespace/container đó, không mặc định là Docker host hoặc container database khác.
+3. Không. `EXPOSE` chủ yếu là image metadata. Runtime publishing dùng `-p`/`--publish` hoặc cấu hình tương đương.
+4. Container IP thường là runtime detail và có thể đổi. DNS/service name cung cấp abstraction ổn định hơn trong network scope phù hợp.
+5. Refused thường có endpoint reachable nhưng không listener/reject; timeout gợi ý packet path/firewall/routing hoặc service không phản hồi; HTTP `500` chứng minh đã tới HTTP application nhưng application xử lý lỗi. Đây là giả thuyết ban đầu, cần evidence.
+6. Process bind loopback chỉ nhận traffic tới loopback trong namespace đó; packet tới interface/container IP khác không match listener. Web service trong container thường cần listen address phù hợp như `0.0.0.0`/specific interface, tùy threat model.
+
+**Nếu còn mơ hồ:** học [Networking](/docs/networking/), bắt đầu từ network model, container communication và port publishing.
+
+## Phần E: Configuration, YAML và secret
+
+### Câu hỏi
+
+1. YAML indentation có ý nghĩa hay chỉ để dễ đọc?
+2. String `"false"` và boolean `false` có chắc được tool hiểu giống nhau không?
+3. Vì sao không nên commit file chứa token dù repository private?
+4. Build-time `ARG` và runtime environment variable giải quyết cùng một lifecycle không?
+5. Một Compose file có `${DATABASE_URL}` đảm bảo variable này có giá trị không?
+6. Vì sao cần xem configuration đã resolve trước khi chạy stack?
+
+### Đáp án và giải thích
+
+1. Có ý nghĩa cấu trúc. Sai indentation có thể chuyển field sang object khác hoặc làm YAML invalid.
+2. Không. Một giá trị là string, một giá trị là boolean; schema và parser quyết định type/coercion. Dùng reference thay vì đoán.
+3. Secret đi vào Git history, clone, cache, CI log hoặc backup và khó thu hồi hoàn toàn. Private repository không loại bỏ insider/credential compromise risk. Secret cần store/delivery/rotation riêng.
+4. Không. `ARG` tồn tại trong build scope; runtime environment được cấp khi chạy container. Dùng `ARG`/`ENV` cho secret còn có nguy cơ lộ metadata/layer; cần BuildKit secret mechanism.
+5. Không. Interpolation có thể cho empty/default/error tùy syntax và source. Dùng `docker compose config` cùng kiểm tra environment source, nhưng lọc secret trước khi chia sẻ output.
+6. Compose có interpolation, merge, override, profiles và default. Resolved model mới gần với configuration sẽ được áp, giúp phát hiện path/value/service sai trước side effect.
+
+**Nếu còn mơ hồ:** ôn YAML mapping/list/scalar, environment-variable scope và secret hygiene trước [Docker Compose](/docs/docker-compose/).
+
+## Phần F: Security và trust boundary
+
+### Câu hỏi
+
+1. Chạy process non-root có làm mọi mount trở nên an toàn không?
+2. `--privileged` thay đổi risk theo hướng nào?
+3. Vì sao quyền truy cập Docker socket thường được xem gần với quyền quản trị host?
+4. Image từ public registry có tự động đáng tin vì pull thành công không?
+5. Pin digest giải quyết được điều gì và không giải quyết điều gì?
+6. Container và VM có isolation boundary giống nhau không?
+
+### Đáp án và giải thích
+
+1. Không. Non-root giảm một số quyền, nhưng writable bind mount, exposed credential, capability, setuid binary, device hoặc socket vẫn có thể nguy hiểm.
+2. Nó nới rộng nhiều isolation/security control và trao quyền host rất mạnh. Chỉ dùng cho use case được threat-model, không dùng như fix permission chung.
+3. API cho phép tạo container với mount, namespace và privilege có thể ảnh hưởng host. Read-only filesystem mount của socket không làm API chỉ-read.
+4. Không. Pull thành công chỉ xác nhận registry trả content theo protocol. Cần kiểm tra publisher, reference/digest, provenance/signature/policy, vulnerabilities và behavior runtime.
+5. Digest chọn content bất biến, giúp reproducibility/promotion. Nó không chứng minh content không có malware/vulnerability, không đảm bảo source provenance và không tự cập nhật patch.
+6. Không. Linux container thường chia sẻ host kernel; VM có guest kernel riêng. Boundary phù hợp phụ thuộc threat model và configuration.
+
+**Nếu còn mơ hồ:** đọc [Container và virtual machine](/docs/bat-dau/container-va-virtual-machine/) rồi theo [Security](/docs/security/).
+
+## Phần G: Docker mental model nhanh
+
+Trả lời đúng/sai và giải thích:
+
+1. Xóa container luôn xóa image đã tạo nó.
+2. Stopped container không còn tồn tại.
+3. `docker run` và `docker start` luôn tương đương.
+4. Một image có thể tạo nhiều container.
+5. Container running chứng minh application sẵn sàng nhận request.
+6. Docker CLI và daemon luôn phải nằm cùng máy.
+7. Compose service và container là cùng một object.
+8. Named volume thường có lifecycle độc lập với container.
+9. Image tag luôn bất biến.
+10. Docker tự động cung cấp high availability cho container trên một host.
+
+### Đáp án
+
+1. **Sai.** Image và container có lifecycle riêng.
+2. **Sai.** Container object vẫn tồn tại cho tới khi remove.
+3. **Sai.** `run` create container mới rồi start; `start` dùng container đã tồn tại.
+4. **Đúng.** Mỗi container có runtime configuration/state riêng.
+5. **Sai.** Cần healthcheck hoặc request/application signal phù hợp.
+6. **Sai.** CLI có thể dùng context để gọi remote daemon.
+7. **Sai.** Service là Compose model/configuration; Compose tạo container từ service.
+8. **Đúng.** Vì vậy remove container không mặc định đồng nghĩa remove named volume.
+9. **Sai.** Tag có thể được cập nhật; digest nhận diện content.
+10. **Sai.** Single host/container vẫn có failure modes; HA cần architecture và orchestration/operations phù hợp.
+
+Nếu sai hơn hai câu, đọc lại [Docker là gì?](/docs/bat-dau/docker-la-gi/) và [Thuật ngữ Docker quan trọng](/docs/bat-dau/thuat-ngu-quan-trong/) trước phần chuyên sâu.
+
+## Bài kiểm tra thực hành an toàn
+
+Các bài sau tạo resource nhỏ và có cleanup cụ thể. Chỉ chạy trên local/disposable daemon sau khi `docker context show` xác nhận đúng target.
+
+### Bài 1: Phân biệt image và container
+
+1. Pull `docker/welcome-to-docker`.
+2. Chạy container tên `knowledge-check` với host loopback port tự chọn.
+3. Dùng ba command khác nhau để chứng minh image tồn tại, container running và port mapping có hiệu lực.
+4. Stop container rồi chứng minh object vẫn tồn tại.
+5. Remove container rồi chứng minh image vẫn còn.
+
+Một sequence tham khảo sau khi bạn tự lập kế hoạch:
+
+```bash
+docker image pull docker/welcome-to-docker
+docker run --name knowledge-check -d -p 127.0.0.1:8089:80 docker/welcome-to-docker
+docker image ls docker/welcome-to-docker
+docker container ls --filter name=knowledge-check
+docker port knowledge-check
+curl --fail --show-error http://127.0.0.1:8089/
+docker stop knowledge-check
+docker container ls --all --filter name=knowledge-check
+docker container rm knowledge-check
+docker image ls docker/welcome-to-docker
+```
+
+Nếu không có `curl`, dùng browser. Image cleanup là tùy chọn vì có thể được lab khác dùng.
+
+### Bài 2: Chẩn đoán lỗi có chủ đích
+
+Chạy hai container cùng publish host port:
+
+```bash
+docker run --name port-a -d -p 127.0.0.1:8090:80 docker/welcome-to-docker
+docker run --name port-b -d -p 127.0.0.1:8090:80 docker/welcome-to-docker
+```
+
+Dự đoán command thứ hai, đọc error, sau đó kiểm tra:
+
+```bash
+docker container ls --all --filter name=port-
+```
+
+Tùy Engine behavior, container thứ hai có thể đã được tạo nhưng không start thành công. Thu thập `inspect`/state trước cleanup. Cuối cùng:
+
+```bash
+docker container rm --force port-a port-b
+```
+
+Bài này kiểm tra bạn có phân biệt create/start failure, name và port ownership hay không.
+
+<Callout type="error" title="Thận trọng">
+  Chỉ force-remove hai container lab có tên chính xác ở trên. Không dùng pattern rộng hoặc `docker system prune` để dọn bài tập.
+</Callout>
+
+## Đọc kết quả tự đánh giá
+
+### Có thể bắt đầu ngay
+
+Bạn trả lời chắc phần terminal, process, filesystem và networking cơ bản; các câu Docker sai có thể học trong phần nhập môn. Tiếp tục [Ứng dụng container đầu tiên](/docs/bat-dau/ung-dung-container-dau-tien/) rồi [Cài đặt và môi trường](/docs/cai-dat-va-moi-truong/) theo platform.
+
+### Nên ôn song song
+
+Bạn chạy được command nhưng mơ hồ về signal, permission, port hoặc DNS. Vẫn có thể học Docker, nhưng mỗi khi gặp term hãy dừng và làm ví dụ nhỏ ở host trước. Ưu tiên [Nền tảng container](/docs/nen-tang-container/), [Storage](/docs/storage/) và [Networking](/docs/networking/).
+
+### Cần củng cố nền trước thao tác production
+
+Nếu bạn chưa phân biệt context/host, không biết command nào phá hủy data hoặc chưa có thói quen giữ secret khỏi source/log, chỉ thực hành trên disposable environment. Không vận hành shared/production daemon cho đến khi có review và runbook.
+
+## Checklist sẵn sàng rời phần Bắt đầu
+
+- [ ] Giải thích được image → container → registry flow.
+- [ ] Phân biệt container với VM và hiểu shared-kernel boundary.
+- [ ] `docker version` đọc được Client/Server và biết context hiện tại.
+- [ ] Chạy, xác minh, stop, start và remove được container lab.
+- [ ] Biết published port khác `EXPOSE` và khác application listener.
+- [ ] Biết writable layer, volume và backup không đồng nghĩa.
+- [ ] Biết tìm local `--help`, official manual/reference và release notes.
+- [ ] Không dùng secret, Docker socket, `--privileged` hoặc prune mà chưa hiểu blast radius.
+
+Khi hoàn thành checklist, quay lại [Lộ trình học Docker](/docs/bat-dau/) để chọn mốc tiếp theo trong curriculum.

@@ -1,0 +1,282 @@
+---
+title: "Build context"
+description: "Chọn và kiểm soát filesystem, Git, tar, stdin và named contexts mà BuildKit được phép đọc; tối ưu hiệu năng, cache và trust boundary."
+---
+
+Build context là tập file builder được phép truy cập cho một build. Positional argument cuối của command chọn default context:
+
+```text
+docker build [OPTIONS] PATH | URL | -
+                               ^ context
+```
+
+Trong command phổ biến:
+
+```bash
+docker build --file docker/Dockerfile --tag app:test .
+```
+
+- Dockerfile là `docker/Dockerfile`;
+- context là directory hiện tại `.`;
+- `COPY` source được resolve từ root của context, không từ directory chứa Dockerfile;
+- `.dockerignore` ở context root lọc input, trừ khi Dockerfile-specific ignore file được chọn.
+
+Chọn context quá rộng làm build chậm, cache invalidation khó đoán và tăng nguy cơ gửi secret tới builder.
+
+## Context là security boundary
+
+Builder không được `COPY` tùy ý file ngoài context:
+
+```dockerfile
+COPY ../secrets.txt /app/
+```
+
+Path traversal bị loại/không tìm thấy theo builder semantics. Cơ chế này không bảo vệ file **đã nằm trong context**. Nếu context là home directory, `.ssh`, cloud credential, env file và source khác có thể được gửi/đọc bởi Dockerfile độc hại dù cuối cùng không xuất hiện trong image.
+
+<Callout type="error" title="Không build Dockerfile không tin cậy với context hoặc secret nhạy cảm">
+  Dockerfile có thể dùng COPY, bind mount, network và build secret để đọc hoặc exfiltrate input. Chỉ cấp context tối thiểu và credential theo từng build operation cho source đã review.
+</Callout>
+
+## Local directory context
+
+Cấu trúc tốt:
+
+```text
+myapp/
+├── .dockerignore
+├── Dockerfile
+├── package.json
+├── package-lock.json
+└── src/
+```
+
+```bash
+cd myapp
+docker build --progress=plain --tag myapp:test .
+```
+
+BuildKit tải metadata/input khi cần và log thường có step `load build context`. Context 2 byte trong output có thể nghĩa gần như mọi file bị ignore; hàng trăm MB báo hiệu `.git`, dependency directory hoặc artifact chưa loại.
+
+`COPY`:
+
+```dockerfile
+COPY package.json package-lock.json /app/
+COPY src/ /app/src/
+```
+
+không thể đọc file sibling của `myapp/`. Nếu monorepo cần shared library ở parent, chọn monorepo root làm context rồi dùng Dockerfile-specific ignore, hoặc dùng named context; không dùng symlink để thoát boundary.
+
+## Dockerfile path và context path độc lập
+
+Giả sử:
+
+```text
+repo/
+├── services/api/Dockerfile
+├── services/api/src/
+└── libs/common/
+```
+
+Build từ repo root:
+
+```bash
+docker build \
+  --file services/api/Dockerfile \
+  --tag api:test \
+  .
+```
+
+Dockerfile có thể:
+
+```dockerfile
+COPY services/api/src/ /src/api/
+COPY libs/common/ /src/common/
+```
+
+Nếu build với context `services/api`, shared library không còn accessible. Positional argument là phần đầu tiên cần kiểm tra khi `COPY` báo not found.
+
+## Dockerfile từ stdin nhưng vẫn có local context
+
+Dùng `-f-` để đọc Dockerfile từ stdin và giữ filesystem context:
+
+```bash
+docker build --file - --tag stdin-lab:test . <<'EOF'
+FROM alpine:3.23
+COPY README.md /README.md
+EOF
+```
+
+Dấu `-` sau `--file` là Dockerfile stdin; dấu `.` vẫn là context. Cách này hữu ích để thử patch/build recipe, nhưng production nên lưu Dockerfile trong source control để review và provenance đầy đủ.
+
+## Empty context
+
+Nếu positional input `-` là plain-text Dockerfile, build không có filesystem context:
+
+```bash
+docker build --tag empty-context:test - <<'EOF'
+FROM alpine:3.23
+RUN printf 'no local files\n' > /message
+EOF
+```
+
+`COPY local.txt /...` sẽ fail vì không có local file set. Empty context giảm input mạnh cho image chỉ dựa base/remote artifact, nhưng không phù hợp application cần source local.
+
+Phân biệt:
+
+```bash
+# Dockerfile từ stdin, context là current directory
+docker build -f- .
+
+# Dockerfile từ stdin, không có filesystem context
+docker build -
+```
+
+## Local tar context
+
+Có thể pipe tar archive:
+
+```bash
+tar -czf context.tar.gz Dockerfile src package.json
+docker build - < context.tar.gz
+```
+
+Builder dùng nội dung tar làm filesystem context và tìm Dockerfile bên trong, hoặc chọn `--file` tương đối với tar root. Tạo tar bằng allowlist; `tar *` có thể bỏ dotfile cần thiết hoặc thêm artifact ngoài ý muốn.
+
+Tar context hữu ích cho hệ thống truyền artifact, nhưng source archive phải được tạo reproducibly và scan. Với local workflow, directory context + `.dockerignore` thường dễ maintain hơn.
+
+## Git context
+
+BuildKit có thể lấy repository trực tiếp:
+
+```bash
+docker buildx build https://github.com/example/repository.git
+```
+
+Pin branch/tag/commit và subdirectory theo URL syntax mà Buildx version hỗ trợ. Structured URL query mới cho phép kết hợp `branch`, `tag`, `ref`, `subdir` và `checksum` để kiểm tra reference resolve đúng commit; kiểm tra minimum Buildx/Dockerfile version trước khi dùng trong CI.
+
+Ví dụ ý tưởng:
+
+```bash
+docker buildx build \
+  'https://github.com/example/repository.git?tag=v1.4.2&checksum=<COMMIT>'
+```
+
+Thay `<COMMIT>` bằng commit trusted. Mutable branch/tag không kèm checksum làm cùng command có thể build source khác theo thời gian.
+
+BuildKit thường loại `.git` khỏi Git context. Nếu build cần revision metadata, có thể giữ Git directory bằng build arg được hỗ trợ, nhưng điều đó mở rộng input/cache; tốt hơn truyền verified revision từ CI vào label/provenance khi phù hợp.
+
+### Private Git context
+
+SSH:
+
+```bash
+docker buildx build --ssh default git@github.com:example/private-repo.git
+```
+
+Token:
+
+```bash
+GIT_AUTH_TOKEN='<REDACTED>' \
+docker buildx build \
+  --secret id=GIT_AUTH_TOKEN \
+  'https://github.com/example/private-repo.git'
+```
+
+Không dùng `--build-arg` cho token. Build trên pull request không tin cậy không được nhận production credential.
+
+## Remote tar context chạy ở builder host
+
+```bash
+docker build https://downloads.example.com/context.tar.gz
+```
+
+CLI gửi URL tới builder; BuildKit daemon tải archive. Nếu dùng remote Docker context/remote builder, network, DNS, proxy và trust store của **builder host** quyết định download, không phải laptop gọi command.
+
+Remote tar mutable làm build khó audit. Pin immutable URL/checksum bằng cơ chế phân phối hoặc fetch/verify artifact trước khi đưa thành context.
+
+## Named contexts
+
+Named context bổ sung input tách biệt khỏi default context:
+
+```bash
+docker build \
+  --build-context docs=./docs \
+  --build-context config=./configs/prod \
+  --tag app:test \
+  .
+```
+
+Dockerfile dùng như stage:
+
+```dockerfile
+COPY --from=docs . /usr/share/app/docs/
+COPY --from=config app.yaml /etc/app/app.yaml
+```
+
+Hoặc bind trong một step mà không bake source:
+
+```dockerfile
+RUN --mount=from=docs,target=/mnt/docs,ro \
+    /app/bin/generate-index /mnt/docs > /app/docs-index.json
+```
+
+Use cases:
+
+- monorepo nhưng mỗi build chỉ cấp đúng shared directory;
+- kết hợp local source và remote assets;
+- override base/source trong Bake pipeline;
+- tách config generated khỏi application source.
+
+Named context vẫn là trusted input và ảnh hưởng cache. Đặt tên theo vai trò, pin remote source và giới hạn credential.
+
+## Context, remote daemon và path
+
+CLI có thể kết nối daemon/builder ở host khác. Local directory context được client/build tooling chuyển tới builder theo protocol; bind mount runtime lại resolve path trên daemon host. Đừng nhầm hai behavior:
+
+```bash
+docker --context remote build .
+docker --context remote run --mount type=bind,src="$PWD",dst=/src app:test
+```
+
+Build context `.` đến từ client-side source theo build implementation; runtime bind source `$PWD` phải tồn tại trên remote daemon host. Luôn kiểm tra `docker context show` và builder endpoint.
+
+## Đo và giảm context
+
+```bash
+docker build --progress=plain --tag app:test .
+```
+
+Đọc `load build context` và `transferring context`. Sau đó:
+
+1. thêm `.dockerignore` cho dependency, build output, VCS, log và secret;
+2. thu hẹp positional directory;
+3. thay `COPY . .` bằng allowlist input;
+4. tách shared input bằng named context;
+5. kiểm tra symlink/generated file và case sensitivity.
+
+Context nhỏ không tự tạo image nhỏ: chỉ file được `COPY`/`ADD` mới vào image. Nhưng context nhỏ giảm transfer, checksum work, leak surface và cache miss ngoài ý muốn.
+
+## Troubleshooting
+
+### `failed to calculate checksum` hoặc source not found
+
+Kiểm tra context argument, `.dockerignore`, case, source path từ context root và stage/named context name. Dùng `pwd`, `find` có kiểm soát ở client; không thêm `COPY / /` để debug.
+
+### Build local được, CI fail
+
+CI checkout có thể thiếu submodule, Git LFS content, generated artifact hoặc dùng context khác. In file tree allowlist và revision; không dump secret file names/content vào public logs.
+
+### Context transfer quá lớn
+
+Tìm `.git`, `node_modules`, virtualenv, test report, binary, archive và local database. Dùng `du`/`find` trên workspace rồi sửa `.dockerignore`; đừng prune Docker cache vì context size là input problem.
+
+### Remote Git/tar không tải được
+
+Điều tra network/proxy/CA/credential trên builder host và URL immutability. `curl` thành công ở client không chứng minh remote builder truy cập được.
+
+## Nguồn chính thức
+
+- [Build context](https://docs.docker.com/build/concepts/context/)
+- [Named contexts](https://docs.docker.com/build/concepts/context/#named-contexts)
+- [Build secrets](https://docs.docker.com/build/building/secrets/)
+- [`docker buildx build`](https://docs.docker.com/reference/cli/docker/buildx/build/)

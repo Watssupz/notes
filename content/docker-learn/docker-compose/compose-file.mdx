@@ -1,0 +1,263 @@
+---
+title: "Compose file"
+description: "Đọc, viết và validate compose.yaml theo Compose Specification; hiểu top-level elements, project directory, path resolution và canonical model."
+---
+
+Compose file là input để Docker Compose tạo **application model**. YAML bạn viết chưa phải model cuối: Compose còn merge file, interpolate biến, resolve path, normalize short syntax và kiểm tra quan hệ giữa resource.
+
+```text
+YAML files + environment
+          │
+          ▼
+ merge → interpolate → resolve paths → normalize → validate
+          │
+          ▼
+  docker compose config
+          │
+          ▼
+ Docker Engine resources
+```
+
+Vì vậy, review `compose.yaml` bằng mắt chưa đủ. `docker compose config` mới hiển thị gần nhất cấu hình Compose sẽ áp dụng.
+
+## Tên file và cách Compose tìm file
+
+Tên được ưu tiên là `compose.yaml`; `compose.yml`, `docker-compose.yaml` và `docker-compose.yml` vẫn được hỗ trợ để tương thích. Nếu không truyền `-f`, Compose tìm file trong current directory và các parent directory.
+
+```bash
+docker compose -f deploy/compose.yaml config
+```
+
+Với nhiều file, thứ tự `-f` quyết định merge và file đầu tiên là base file:
+
+```bash
+docker compose \
+  -f compose.yaml \
+  -f compose.production.yaml \
+  config
+```
+
+Phần lớn relative path trong override được resolve theo base Compose file, không theo vị trí override. Khi module cần path riêng, cân nhắc top-level `include`.
+
+## Top-level elements
+
+Một file tối thiểu chỉ cần `services`:
+
+```yaml
+services:
+  api:
+    image: ghcr.io/example/api:1.4.2
+```
+
+Model đầy đủ thường có:
+
+```yaml
+name: inventory
+
+services:
+  api:
+    image: ghcr.io/example/api:1.4.2
+    networks: [frontend, backend]
+    volumes:
+      - uploads:/srv/uploads
+    configs:
+      - app_config
+    secrets:
+      - db_password
+
+networks:
+  frontend: {}
+  backend:
+    internal: true
+
+volumes:
+  uploads: {}
+
+configs:
+  app_config:
+    file: ./config/app.yaml
+
+secrets:
+  db_password:
+    file: ./secrets/db-password.txt
+```
+
+Khai báo top-level chỉ tạo tên logic. Service phải được cấp resource rõ ràng qua `networks`, `volumes`, `configs` hoặc `secrets` ở service level.
+
+## Không dùng `version` để chọn schema
+
+Compose Specification đã hợp nhất format 2.x và 3.x. File mới không cần:
+
+```yaml
+version: "3.8"
+```
+
+Compose CLI hiện đại luôn validate theo schema/feature mà phiên bản CLI đó hỗ trợ. Nếu dùng attribute mới như `include`, `develop.watch` hoặc `!override`, hãy pin minimum Compose version trong README/CI thay vì đổi `version`.
+
+Kiểm tra version:
+
+```bash
+docker compose version
+docker version
+```
+
+<Callout type="warn" title="Compose CLI và Docker Engine là hai version boundary">
+  CLI parse model và quyết định feature Compose; Engine thực thi container, network, volume và platform capability. File parse thành công vẫn có thể thất bại khi Engine không hỗ trợ driver, mount hoặc runtime option.
+</Callout>
+
+## YAML types và quoting
+
+YAML tự suy luận kiểu dữ liệu. Quote những giá trị cần giữ dạng string, đặc biệt boolean-looking value, port và permission:
+
+```yaml
+services:
+  app:
+    environment:
+      ENABLE_CACHE: "false"
+      FEATURE_CODE: "0012"
+    ports:
+      - "127.0.0.1:8080:8080"
+    configs:
+      - source: app_config
+        target: /etc/app/config.yaml
+        mode: "0444"
+```
+
+Dùng mapping cho `environment` và `labels` khi có thể; diff và merge key rõ hơn list `KEY=value`.
+
+YAML anchor có ích trong một file nhưng chỉ là cơ chế YAML, không hiểu semantics Compose:
+
+```yaml
+x-runtime: &runtime
+  init: true
+  restart: unless-stopped
+
+services:
+  api:
+    <<: *runtime
+    image: example/api:1
+  worker:
+    <<: *runtime
+    image: example/worker:1
+```
+
+Các key bắt đầu bằng `x-` là extension fields và được Compose bỏ qua về runtime. Anchor không thay thế `include` cho module độc lập hoặc override rules giữa nhiều file.
+
+## Short syntax và canonical model
+
+Nhiều field có short/long syntax:
+
+```yaml
+services:
+  app:
+    ports:
+      - "8080:80"
+    volumes:
+      - data:/var/lib/app
+```
+
+Long syntax rõ hơn khi cần option:
+
+```yaml
+services:
+  app:
+    ports:
+      - target: 80
+        published: "8080"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    volumes:
+      - type: volume
+        source: data
+        target: /var/lib/app
+        read_only: false
+```
+
+Xem model đã normalize:
+
+```bash
+docker compose config
+```
+
+Các chế độ audit hữu ích:
+
+```bash
+docker compose config --quiet
+docker compose config --environment
+docker compose config --variables
+docker compose config --services
+docker compose config --images
+docker compose config --format json
+```
+
+`--quiet` validate mà không in model. `--environment` cho biết nguồn interpolation; nó không phải environment cuối bên trong từng container.
+
+## Project directory và path resolution
+
+Project directory ảnh hưởng:
+
+- file `.env` mặc định;
+- relative path của build context, bind mount, config, secret và `env_file`;
+- project name mặc định trong một số trường hợp.
+
+Có thể đặt rõ:
+
+```bash
+docker compose \
+  --project-directory /srv/inventory \
+  -f /srv/inventory/deploy/compose.yaml \
+  config
+```
+
+Không dùng absolute host path nếu file cần chạy trên máy khác. Với bind mount production cố định, document host provisioning và kiểm tra path tồn tại trước deploy.
+
+## Validate một fixture
+
+Tạo `compose.yaml`:
+
+```yaml
+name: compose-file-lab
+
+services:
+  echo:
+    image: alpine:3.23
+    command: ["sh", "-c", "echo mode=$${APP_MODE}; sleep 300"]
+    environment:
+      APP_MODE: "${APP_MODE:-development}"
+```
+
+Kiểm tra interpolation input và model:
+
+```bash
+docker compose config --environment
+docker compose config
+APP_MODE=test docker compose config
+```
+
+`$${APP_MODE}` được escape để Compose giữ `$APP_MODE` cho shell bên trong container. `${APP_MODE:-development}` được Compose resolve trước khi create container.
+
+Chạy và xác minh:
+
+```bash
+docker compose up --detach
+docker compose logs echo
+docker compose exec echo sh -c 'printf "%s\n" "$APP_MODE"'
+```
+
+## Checklist review
+
+- [ ] Dùng Compose Specification, không dựa vào `version` legacy.
+- [ ] Image tag/digest và build context được khai báo rõ.
+- [ ] Port nhạy cảm bind vào host IP phù hợp.
+- [ ] Dữ liệu bền vững không nằm trong writable layer.
+- [ ] Secret không nằm trong YAML, `.env` commit hoặc image.
+- [ ] Relative path được kiểm tra từ đúng base/project directory.
+- [ ] `docker compose config --quiet` chạy trong CI.
+- [ ] Resolved config được review khi dùng interpolation/merge/include.
+
+## Nguồn chính thức
+
+- [Compose file reference](https://docs.docker.com/reference/compose-file/)
+- [`docker compose config`](https://docs.docker.com/reference/cli/docker/compose/config/)
+- [Specify a project name](https://docs.docker.com/compose/how-tos/project-name/)
+- [Compose Specification](https://github.com/compose-spec/compose-spec)

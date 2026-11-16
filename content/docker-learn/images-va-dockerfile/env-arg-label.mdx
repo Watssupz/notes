@@ -1,0 +1,277 @@
+---
+title: "ENV, ARG và LABEL"
+description: "Phân biệt build argument, runtime environment và image metadata; quản lý scope, override, cache, OCI labels và tránh làm lộ secret."
+---
+
+`ARG`, `ENV` và `LABEL` đều lưu hoặc truyền giá trị trong quá trình build, nhưng chúng có scope và security behavior khác nhau:
+
+| Instruction | Dùng khi build | Persist trong final image config | Runtime override trực tiếp |
+|---|---|---|---|
+| `ARG` | Có, sau khi khai báo trong scope | Không như environment mặc định, nhưng có thể lộ qua metadata/provenance/cache | Không |
+| `ENV` | Có ở instruction sau | Có | Có, bằng `docker run --env` hoặc orchestrator |
+| `LABEL` | Có thể nhận variable replacement | Có dưới dạng metadata | Không; muốn đổi phải tạo image/config khác |
+
+Không instruction nào là secret store. Password, token, private key phải đi qua BuildKit secret/SSH mount lúc build hoặc secret mechanism lúc runtime.
+
+## `ARG`: tham số lúc build
+
+Khai báo default:
+
+```dockerfile
+ARG APP_VERSION=dev
+RUN printf '%s\n' "$APP_VERSION" > /app-version
+```
+
+Override:
+
+```bash
+docker build --build-arg APP_VERSION=1.4.2 --tag app:1.4.2 .
+```
+
+Nếu CLI truyền `--build-arg NAME` không có `=`, builder có thể lấy giá trị từ environment client theo CLI semantics. Trong CI nên truyền explicit value từ release metadata để build log/intent rõ.
+
+### Scope qua `FROM`
+
+```dockerfile
+ARG ALPINE_VERSION=3.23
+FROM alpine:${ALPINE_VERSION} AS build
+
+ARG ALPINE_VERSION
+RUN echo "$ALPINE_VERSION"
+```
+
+Global `ARG` dùng được trong `FROM`, nhưng phải khai báo lại trong stage để dùng ở instruction sau. Một stage bắt đầu `FROM` stage khác có inheritance behavior; với Dockerfile nhiều nhánh, khai báo ở scope gần nơi dùng giúp review dễ hơn.
+
+### Cache và predefined args
+
+Giá trị build arg được operation sử dụng có thể ảnh hưởng cache. Không tạo `CACHEBUST=$(date)` mặc định; cache-bust value nên biểu diễn dependency revision thực.
+
+BuildKit cung cấp automatic platform args như `BUILDPLATFORM`, `TARGETPLATFORM`, `TARGETOS`, `TARGETARCH` ở global scope. Khai báo lại trong stage trước khi shell sử dụng:
+
+```dockerfile
+FROM --platform=$BUILDPLATFORM golang:1.25 AS build
+ARG TARGETOS TARGETARCH
+RUN GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -o /out/app ./cmd/app
+```
+
+## `ENV`: default environment của image
+
+```dockerfile
+ENV APP_HOME=/opt/app \
+    APP_LOG_LEVEL=info
+WORKDIR ${APP_HOME}
+```
+
+`ENV` có hiệu lực cho instruction sau trong stage và persist vào image config. Container nhận default này:
+
+```bash
+docker run --rm app:test env
+```
+
+Runtime có thể override:
+
+```bash
+docker run --rm --env APP_LOG_LEVEL=debug app:test
+```
+
+Image không đổi. Xác minh:
+
+```bash
+docker image inspect app:test --format '{{json .Config.Env}}'
+```
+
+### Chọn default an toàn
+
+Chỉ đặt giá trị không nhạy cảm và dùng được ở nhiều environment:
+
+```dockerfile
+ENV PORT=8080 LOG_FORMAT=json
+```
+
+Không bake:
+
+```dockerfile
+ENV DATABASE_PASSWORD=secret
+ENV AWS_ACCESS_KEY_ID=...
+```
+
+Giá trị nằm trong image config, registry artifact, cache và output inspect. Unset ở instruction sau không xóa dấu vết khỏi history/layer/config trước.
+
+Config bắt buộc khác nhau theo deployment nên được inject và validate khi startup. Không đặt fake secret default; ứng dụng nên fail rõ nếu thiếu.
+
+### Build-only environment
+
+Nếu biến chỉ áp dụng một command:
+
+```dockerfile
+RUN DEBIAN_FRONTEND=noninteractive \
+    apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+Cách này tránh `DEBIAN_FRONTEND` persist rồi làm người chạy container gặp behavior khó hiểu. Hoặc dùng `ARG` nếu giá trị cần nhiều build step nhưng không phải secret.
+
+## Variable replacement và quoting
+
+Dùng cú pháp key=value:
+
+```dockerfile
+ENV MY_NAME="Nguyen Van A"
+ENV PATH="/opt/app/bin:${PATH}"
+```
+
+Builder hỗ trợ `$NAME` hoặc `${NAME}` trong một số instruction. Shell-form `RUN` do shell expand; exec form không tự expand:
+
+```dockerfile
+ENV HOME=/home/app
+RUN echo "$HOME"                  # shell expands
+RUN ["echo", "$HOME"]           # literal $HOME
+RUN ["sh", "-c", "echo $HOME"] # shell expands
+```
+
+Cẩn thận `ENV PATH=...:$PATH`: giá trị base image hiện tại tham gia final config. Inspect effective `PATH` và không làm mất system paths cần thiết.
+
+## `LABEL`: metadata cho người và automation
+
+```dockerfile
+ARG APP_VERSION
+ARG VCS_REF
+LABEL org.opencontainers.image.title="payments-api" \
+      org.opencontainers.image.version="$APP_VERSION" \
+      org.opencontainers.image.revision="$VCS_REF" \
+      org.opencontainers.image.source="https://github.com/example/payments"
+```
+
+OCI Image Spec định nghĩa nhóm annotation `org.opencontainers.image.*` phổ biến. Label custom nên dùng namespace reverse-DNS để tránh collision, ví dụ `com.example.team=payments`.
+
+Các label hữu ích:
+
+- source repository và revision;
+- semantic version/release identifier;
+- license và documentation URL;
+- owner/team/service metadata phục vụ inventory;
+- build policy identifier không chứa secret.
+
+Không nhét SBOM lớn vào label; dùng attestation/artifact mechanism. Không ghi access token, internal credential URL hoặc dữ liệu cá nhân.
+
+Inspect:
+
+```bash
+docker image inspect app:1.4.2 --format '{{json .Config.Labels}}'
+```
+
+Filter local image/container theo label khi command hỗ trợ:
+
+```bash
+docker image ls --filter 'label=org.opencontainers.image.title=payments-api'
+```
+
+Label image là metadata mặc định. Container có labels riêng được copy/override lúc create; đổi container label không sửa image.
+
+## Labels kế thừa qua stage
+
+Image con kế thừa label từ base; label mới cùng key override giá trị trước. Trong multi-stage build, final image chỉ nhận labels từ ancestry của final `FROM` và labels khai báo trong final stage. Label ở stage chỉ được tham chiếu bằng `COPY --from` không tự đi theo artifact.
+
+```dockerfile
+FROM golang:1.25 AS build
+LABEL com.example.stage=build
+# compile
+
+FROM alpine:3.23
+COPY --from=build /out/app /usr/local/bin/app
+LABEL com.example.stage=runtime
+```
+
+Final image có runtime label, không kế thừa build label chỉ vì đã copy file.
+
+## Truyền version nhất quán
+
+Một release thường cần cùng version ở tag, binary và label:
+
+```dockerfile
+ARG VERSION
+ARG REVISION
+RUN test -n "$VERSION" && test -n "$REVISION"
+LABEL org.opencontainers.image.version="$VERSION" \
+      org.opencontainers.image.revision="$REVISION"
+```
+
+Build:
+
+```bash
+VERSION='1.4.2'
+REVISION="$(git rev-parse HEAD)"
+
+docker build \
+  --build-arg VERSION="$VERSION" \
+  --build-arg REVISION="$REVISION" \
+  --tag "registry.example/team/app:$VERSION" \
+  .
+```
+
+Nếu source tree dirty, commit hash không mô tả đầy đủ input. CI nên build từ clean checkout, ghi provenance và quyết định policy cho uncommitted source.
+
+Xác minh label/tag và application version:
+
+```bash
+docker image inspect "registry.example/team/app:$VERSION" \
+  --format '{{index .Config.Labels "org.opencontainers.image.version"}} {{index .Config.Labels "org.opencontainers.image.revision"}}'
+
+docker run --rm "registry.example/team/app:$VERSION" --version
+```
+
+Hai output phải khớp release metadata theo application contract.
+
+## Secret đúng cách
+
+Build credential:
+
+```dockerfile
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc,required=true \
+    npm ci
+```
+
+```bash
+docker build --secret id=npmrc,src="$HOME/.npmrc" .
+```
+
+Runtime secret:
+
+```bash
+docker run --rm \
+  --env-file /secure/path/app.env \
+  app:test
+```
+
+`--env-file` vẫn đặt secret vào container environment và có thể bị process/inspect/access boundary đọc; dùng file secret/secret store nếu application và platform hỗ trợ. Không commit env file.
+
+## Lỗi thường gặp
+
+### `ARG` rỗng sau `FROM`
+
+Khai báo lại trong stage. Dùng `RUN test -n "$ARG_NAME"` để fail sớm nếu bắt buộc.
+
+### Runtime override không có tác dụng
+
+Ứng dụng có thể không đọc biến đó, entrypoint render config sai, hoặc tên biến khác. Inspect container effective env:
+
+```bash
+docker inspect <CONTAINER> --format '{{json .Config.Env}}'
+```
+
+### Label version không khớp tag
+
+Tag, label và binary version là ba input riêng. Tạo chúng từ một release variable trong CI và thêm verification gate; Docker không tự đồng bộ.
+
+### Secret đã xuất hiện trong history
+
+Rotate/revoke secret trước, purge cache/artifact theo incident procedure, rồi sửa Dockerfile dùng secret mount. Rebuild image mới không thu hồi credential cũ.
+
+## Nguồn chính thức
+
+- [`ARG` reference](https://docs.docker.com/reference/dockerfile/#arg)
+- [`ENV` reference](https://docs.docker.com/reference/dockerfile/#env)
+- [`LABEL` reference](https://docs.docker.com/reference/dockerfile/#label)
+- [OCI image annotations](https://github.com/opencontainers/image-spec/blob/main/annotations.md)
+- [Build secrets](https://docs.docker.com/build/building/secrets/)

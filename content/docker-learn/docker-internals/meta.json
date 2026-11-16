@@ -1,0 +1,18 @@
+{
+  "title": "Docker internals",
+  "pages": [
+    "index",
+    "client-daemon-architecture",
+    "moby",
+    "containerd",
+    "runc",
+    "shim-process",
+    "image-content-store",
+    "snapshotters-storage-drivers",
+    "networking-internals",
+    "lifecycle-internals",
+    "engine-api",
+    "plugins",
+    "daemon-troubleshooting"
+  ]
+}

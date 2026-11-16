@@ -1,0 +1,227 @@
+---
+title: "Container và virtual machine"
+description: "So sánh container với virtual machine theo isolation, kernel, startup, tài nguyên, portability và security để chọn mô hình triển khai phù hợp."
+---
+
+Container và virtual machine (VM) đều tạo môi trường tách biệt để chạy workload, nhưng chúng đặt ranh giới cách ly ở layer khác nhau. VM ảo hóa phần cứng và chạy guest operating system với kernel riêng. Linux container thường cách ly một hoặc nhiều process nhưng dùng chung kernel của host.
+
+Khác biệt này giải thích phần lớn trade-off về tốc độ khởi động, overhead, compatibility và security. Nó cũng cho thấy đây không phải hai lựa chọn loại trừ nhau: một VM có thể là Docker host cho nhiều container.
+
+## Hai kiến trúc khác nhau
+
+### Virtual machine ảo hóa một máy tính
+
+Hypervisor cung cấp virtual CPU, memory, disk và network device cho mỗi VM. Bên trong VM có guest OS, kernel, system services, library và application.
+
+```text
+┌──────────────────────────┬──────────────────────────┐
+│ Virtual machine A        │ Virtual machine B        │
+├──────────────────────────┼──────────────────────────┤
+│ Application A            │ Application B            │
+│ Libraries                │ Libraries                │
+│ Guest OS + guest kernel  │ Guest OS + guest kernel  │
+└─────────────┬────────────┴─────────────┬────────────┘
+              │                          │
+┌─────────────▼──────────────────────────▼────────────┐
+│            Hypervisor / virtual hardware            │
+├─────────────────────────────────────────────────────┤
+│               Host OS / physical hardware           │
+└─────────────────────────────────────────────────────┘
+```
+
+Mỗi guest kernel tạo một ranh giới mạnh và cho phép workload dùng operating system hoặc kernel khác với workload ở VM kế bên, trong giới hạn hypervisor và hardware support.
+
+### Container cách ly process
+
+Với Linux container thông thường, Docker dùng kernel features để tạo góc nhìn tách biệt về process, network, mount, hostname và các resource khác. Cgroups giúp account và giới hạn tài nguyên. Image cung cấp user space cần cho application, nhưng các container không mang guest Linux kernel riêng.
+
+```text
+┌──────────────────────────┬──────────────────────────┐
+│ Container A              │ Container B              │
+├──────────────────────────┼──────────────────────────┤
+│ App A + user space       │ App B + user space       │
+│ Process(es)              │ Process(es)              │
+└─────────────┬────────────┴─────────────┬────────────┘
+              │                          │
+┌─────────────▼──────────────────────────▼────────────┐
+│           Container runtime + Docker Engine         │
+├─────────────────────────────────────────────────────┤
+│                  Shared host kernel                 │
+├─────────────────────────────────────────────────────┤
+│                Host OS / physical hardware          │
+└─────────────────────────────────────────────────────┘
+```
+
+“Dùng chung kernel” không có nghĩa các process nhìn thấy toàn bộ host. Namespace tạo view khác nhau, filesystem layer và mount tạo root filesystem riêng, còn security control giới hạn syscall/capability. Tuy vậy, kernel vẫn là phần dùng chung và là một trust boundary phải bảo vệ.
+
+## So sánh theo tiêu chí quyết định
+
+| Tiêu chí | Container | Virtual machine |
+|---|---|---|
+| Đơn vị chính | Process hoặc nhóm process được cách ly | Một máy tính ảo với guest OS |
+| Kernel | Thường dùng host kernel | Mỗi VM có guest kernel riêng |
+| Artifact | Image chứa user space và metadata runtime | VM image thường chứa cả guest OS |
+| Startup | Thường nhanh vì khởi động process, không boot guest OS đầy đủ | Thường lâu hơn vì phải boot guest OS và services |
+| Overhead | Thường thấp hơn; nhiều workload chia sẻ kernel | Thường cao hơn do mỗi VM dành tài nguyên cho guest OS |
+| OS compatibility | Phụ thuộc kernel family và image platform | Có thể chạy guest OS/kernel khác nếu hypervisor hỗ trợ |
+| Isolation boundary | Chia sẻ kernel; chất lượng isolation phụ thuộc nhiều control | Guest kernel riêng tạo boundary mạnh hơn cho nhiều threat model |
+| Mật độ workload | Thường cao hơn trên cùng tài nguyên | Thường thấp hơn nếu mỗi workload cần một guest OS |
+| Update unit | Rebuild/redeploy image và container | Patch guest OS, image và application trong VM |
+| Trường hợp phổ biến | Service, worker, CI job, packaged tool | Tenant không tin cậy, OS khác biệt, legacy workload, host boundary |
+
+Các từ “nhanh hơn”, “nhẹ hơn” và “mạnh hơn” trong bảng là xu hướng kiến trúc, không phải cam kết định lượng. Kết quả thực tế phụ thuộc image, guest OS, runtime, storage, workload và platform.
+
+## Isolation của container đến từ đâu?
+
+Một container không phải một primitive duy nhất của Linux kernel. Runtime phối hợp nhiều cơ chế:
+
+- **PID namespace:** process trong container có view process riêng.
+- **Mount namespace:** container có mount tree và root filesystem riêng.
+- **Network namespace:** interface, route và port có thể tách khỏi host và container khác.
+- **UTS namespace:** hostname và domain name có thể riêng.
+- **IPC namespace:** tách một số cơ chế inter-process communication.
+- **User namespace:** có thể ánh xạ user trong container sang UID/GID khác trên host.
+- **Cgroups:** account, ưu tiên hoặc giới hạn CPU, memory, PIDs và I/O tùy platform/configuration.
+- **Capabilities, seccomp, AppArmor/SELinux:** giảm quyền, lọc syscall và áp mandatory access control khi được cấu hình.
+
+Các cơ chế trên tạo isolation có thể điều chỉnh. Một container dùng `--network host`, mount host filesystem, chạy `--privileged` hoặc nhận Docker socket đã làm mỏng đáng kể ranh giới mặc định.
+
+<Callout type="warn" title="Cảnh báo">
+  Không coi container là sandbox an toàn chỉ vì process nằm trong container. Image không tin cậy, quyền root, Linux capabilities, device, bind mount, kernel vulnerability và Docker socket đều có thể thay đổi threat model.
+</Callout>
+
+## Resource model: cách ly không đồng nghĩa giới hạn
+
+Namespace quyết định process nhìn thấy gì; cgroups liên quan đến tài nguyên process có thể dùng. Đây là hai câu hỏi khác nhau.
+
+Một container có process list và network namespace riêng nhưng vẫn có thể cạnh tranh CPU hoặc memory với workload khác nếu không đặt limit phù hợp. Ngược lại, limit quá chặt có thể làm application bị throttling hoặc bị OOM kill.
+
+VM thường được cấp virtual CPU và memory ở boundary VM. Container có thể đặt limit chi tiết theo workload, nhưng operator phải cấu hình, đo và theo dõi. Vì vậy, mật độ cao hơn đi kèm trách nhiệm capacity planning và noisy-neighbor control.
+
+## Filesystem và dữ liệu
+
+VM thường có virtual disk được quản lý như disk của một máy. Container thường bắt đầu từ read-only image layers cộng writable layer gắn với lifecycle container.
+
+Writable layer phù hợp cho file tạm và thay đổi không cần tồn tại. Dữ liệu application quan trọng nên nằm trong:
+
+- **Volume** do Docker quản lý;
+- **Bind mount** trỏ tới host path với boundary và permission được hiểu rõ;
+- **External storage/service** như database hoặc object storage.
+
+Sự khác biệt này thúc đẩy pattern **replace container thay vì sửa container lâu dài**. Bạn rebuild image rồi tạo container mới, thay vì SSH vào và patch thủ công như một server truyền thống.
+
+## Portability có giới hạn
+
+Một Linux image không mang theo Linux kernel. Nó kỳ vọng kernel trên Docker host cung cấp syscall và feature phù hợp. Image còn có platform như `linux/amd64` hoặc `linux/arm64`; host phải chạy đúng platform hoặc có cơ chế emulation tương ứng.
+
+Do đó:
+
+- Linux container không trực tiếp biến thành Windows container.
+- Image chỉ có `amd64` không tự nhiên chạy native trên `arm64`.
+- Workload cần kernel module, device hoặc syscall đặc biệt có thể không portable.
+- Mount path, filesystem semantics và network policy khác nhau vẫn làm behavior thay đổi.
+
+VM mang theo guest kernel nên linh hoạt hơn khi cần OS/kernel khác, nhưng VM image cũng không hoàn toàn độc lập với hypervisor, virtual hardware và CPU architecture.
+
+## Vì sao Docker Desktop dùng VM?
+
+Linux container cần Linux kernel. Trên macOS, host không chạy Linux kernel; trên Windows, Docker Desktop có thể dùng WSL 2 hoặc backend ảo hóa để cung cấp môi trường Linux. Docker Desktop quản lý VM/backend đó rồi kết nối Docker CLI với daemon bên trong.
+
+Luồng khái niệm là:
+
+```text
+┌─────────────────────────────┐
+│ macOS / Windows terminal    │
+│ Docker CLI                  │
+└──────────────┬──────────────┘
+               │ Docker API
+               ▼
+┌───────────────────────────────────────────────┐
+│ Docker Desktop managed Linux environment      │
+├───────────────────────────────────────────────┤
+│ Docker Engine                                 │
+│ └─ Linux containers sharing its Linux kernel  │
+└───────────────────────────────────────────────┘
+```
+
+Điều này giải thích một số khác biệt về file sharing, path, resource allocation và network giữa Docker Desktop với Docker Engine chạy native trên Linux. Khi troubleshooting, cần xác định lỗi nằm ở application container, Engine, VM/backend hay host OS.
+
+Docker Desktop cũng có bản Linux, nhưng kiến trúc và use case không nên suy luận hoàn toàn từ Docker Engine cài native. Hãy dùng tài liệu đúng platform và product.
+
+## Container và VM bổ sung nhau thế nào?
+
+Kiến trúc production phổ biến đặt Docker Engine hoặc container runtime trong VM:
+
+```text
+┌──────────────────────────────────────────────┐
+│ Physical / cloud infrastructure              │
+└──────────────────────┬───────────────────────┘
+                       │
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│ VM node 1    │ │ VM node 2    │ │ VM node 3    │
+│ Containers   │ │ Containers   │ │ Containers   │
+└──────────────┘ └──────────────┘ └──────────────┘
+```
+
+VM cung cấp boundary ở cấp node, image chuẩn hóa application ở cấp process, còn orchestrator có thể scheduling container qua nhiều node. Cách xếp layer này hỗ trợ:
+
+- cô lập team, tenant hoặc environment ở VM boundary;
+- thay/scale application nhanh bằng container;
+- thay node bằng image/template quản lý tập trung;
+- giảm blast radius so với đặt mọi container lên một host vật lý duy nhất.
+
+Đổi lại, bạn phải quan sát và cập nhật nhiều layer hơn: cloud/hypervisor, guest OS, kernel, runtime, image và application.
+
+## Chọn mô hình theo yêu cầu
+
+### Ưu tiên container khi
+
+- application phù hợp process model và có startup rõ ràng;
+- muốn build artifact một lần rồi chạy qua dev, CI và deployment;
+- cần khởi động nhanh, scale theo instance hoặc chạy nhiều isolated job;
+- team có thể tách configuration, secret và persistent data khỏi image;
+- host/kernel compatibility được kiểm soát.
+
+### Ưu tiên VM hoặc boundary mạnh hơn khi
+
+- cần guest OS hoặc kernel khác;
+- chạy tenant/workload không tin cậy với yêu cầu isolation cao;
+- application legacy giả định một server đầy đủ, init system hoặc kernel customization;
+- compliance và operational model được chuẩn hóa quanh VM;
+- blast radius yêu cầu tách host kernel.
+
+### Dùng kết hợp khi
+
+- muốn VM làm failure/security domain và container làm deployment unit;
+- chạy orchestrator trên cloud VMs;
+- cần tách production, staging hoặc tenant ở node boundary nhưng vẫn dùng chung pipeline image.
+
+Không chọn chỉ theo tiêu chí “công nghệ mới hơn”. Hãy bắt đầu từ threat model, OS compatibility, startup/scale requirement, state model và năng lực vận hành.
+
+## Ví dụ suy luận
+
+### API stateless
+
+Một HTTP API đọc configuration từ environment, lưu dữ liệu trong external database và có nhiều replica là ứng viên tốt cho container. Image đóng gói runtime; container có thể được thay thế; database lifecycle được quản lý riêng.
+
+### Desktop application cần GUI và tích hợp OS sâu
+
+Container có thể hỗ trợ build/test, nhưng chưa chắc là packaging/runtime phù hợp cho end user. VM hoặc native installer có thể đơn giản hơn tùy yêu cầu GUI, device và host integration.
+
+### Build code không tin cậy từ nhiều khách hàng
+
+Container giúp tạo environment tạm thời nhưng shared-kernel risk có thể không đáp ứng threat model. Cần xem xét microVM, VM riêng, sandbox chuyên dụng hoặc nhiều lớp control thay vì chỉ thêm `--privileged` để build chạy được.
+
+## Tự kiểm tra
+
+Hãy thử giải thích mà không nhìn lại trang:
+
+1. Vì sao Linux container thường khởi động nhanh hơn VM?
+2. Namespace và cgroups trả lời hai câu hỏi khác nhau nào?
+3. Vì sao Linux container trên macOS thường cần một Linux VM?
+4. Khi nào chia sẻ kernel trở thành yếu tố quyết định bảo mật?
+5. Vì sao VM và container thường xuất hiện cùng nhau trong production?
+
+Tiếp theo, [Hệ sinh thái Docker](/docs/bat-dau/he-sinh-thai-docker/) sẽ đặt Engine, CLI, Desktop, Build, Compose và registry vào đúng layer của workflow này.

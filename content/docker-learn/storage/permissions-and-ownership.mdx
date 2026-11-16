@@ -1,0 +1,203 @@
+---
+title: "Permission và ownership"
+description: "Chẩn đoán quyền storage bằng numeric UID/GID, Unix mode, read-only mount, SELinux label, rootless mode và user namespace mapping."
+---
+
+Docker mount không tự dịch username giữa host và container. Trên Linux, kernel quyết định filesystem access từ numeric UID/GID, mode bits, ACL, mount flags, security module và user namespace mapping.
+
+```text
+process UID/GID trong container
+          │
+          ├── user namespace mapping
+          ▼
+UID/GID được kernel dùng trên host filesystem
+          │
+          ├── mode / ACL / mount read-only
+          └── SELinux hoặc LSM policy
+```
+
+Vì vậy `Permission denied` không nên được “sửa” ngay bằng `chmod 777` hoặc chạy container bằng root.
+
+## Evidence cần thu thập
+
+Trong container:
+
+```bash
+docker exec CONTAINER id
+docker exec CONTAINER sh -c 'stat -c "%u:%g %a %n" /data; test -w /data; echo writable=$?'
+```
+
+Từ Docker config:
+
+```bash
+docker inspect CONTAINER --format 'user={{json .Config.User}}'
+docker inspect CONTAINER \
+  --format '{{range .Mounts}}{{println .Type .Source .Destination .RW}}{{end}}'
+```
+
+Trên host với bind mount:
+
+```bash
+stat -c '%u:%g %a %n' /host/source
+namei -l /host/source
+```
+
+`namei -l` hữu ích vì mọi parent directory đều cần execute/traverse permission.
+
+## Numeric UID/GID quan trọng hơn username
+
+`app` trong image A và `app` trên host có thể mang UID khác nhau. Ngược lại, UID `1000` có thể có username khác nhưng kernel vẫn coi là cùng numeric owner nếu không có user namespace mapping.
+
+Kiểm tra image runtime identity:
+
+```bash
+docker run --rm IMAGE id
+```
+
+Có thể override để thử nghiệm:
+
+```bash
+docker run --rm --user 1000:1000 IMAGE id
+```
+
+Override không tự bảo đảm application hoạt động: home directory, passwd entry, port, cache directory và capability có thể phụ thuộc user mặc định của image.
+
+## Lab: bind mount với UID/GID hiện tại
+
+Tạo host directory do user hiện tại sở hữu:
+
+```bash
+mkdir -p /tmp/permission-lab
+stat -c '%u:%g %a %n' /tmp/permission-lab
+```
+
+Chạy container bằng cùng numeric UID/GID:
+
+```bash
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  --mount type=bind,src=/tmp/permission-lab,dst=/data \
+  alpine:3.22 sh -c '
+    id
+    printf ok > /data/result
+    stat -c "%u:%g %a %n" /data/result
+  '
+```
+
+Host đọc lại file:
+
+```bash
+cat /tmp/permission-lab/result
+stat -c '%u:%g %a %n' /tmp/permission-lab/result
+```
+
+Cách này phù hợp cho development bind mount. Trong production, pin UID/GID trong image/deployment và provision ownership có chủ đích thay vì giả định mọi host user giống nhau.
+
+## Named volume mới và initialization
+
+Named volume mới thường bắt đầu với ownership phụ thuộc target/image và initialization logic. Nhiều official image chạy entrypoint bằng root trong thời gian ngắn để `chown`, sau đó hạ quyền; behavior này là image-specific.
+
+Một pattern an toàn là init step riêng, dùng đúng UID/GID của application:
+
+```bash
+docker volume create app-owned-data
+docker run --rm --user 0:0 \
+  --mount type=volume,src=app-owned-data,dst=/data \
+  alpine:3.22 chown 1000:1000 /data
+docker run --rm --user 1000:1000 \
+  --mount type=volume,src=app-owned-data,dst=/data \
+  alpine:3.22 sh -c 'printf ok > /data/result'
+```
+
+Không chạy `chown -R` mù trên volume lớn mỗi startup: nó tốn thời gian, thay đổi metadata hàng loạt và có thể gây copy/IO đáng kể. Chỉ migrate ownership khi cần, có backup và đo duration.
+
+## Read-only filesystem và read-only mount khác nhau
+
+- `--read-only` làm root filesystem của container read-only;
+- `--mount ... ,readonly` chỉ làm mount cụ thể read-only;
+- tmpfs hoặc volume read-write có thể được thêm cho path application cần ghi.
+
+```bash
+docker run --rm --read-only \
+  --mount type=tmpfs,dst=/tmp,tmpfs-size=16777216 \
+  alpine:3.22 sh -c 'printf ok > /tmp/value; ! touch /root/value'
+```
+
+Nếu error là `Read-only file system`, sửa mode/owner sẽ không giúp. Kiểm tra `.RW` và mount flags trước.
+
+## Rootless mode và `userns-remap`
+
+Hai cơ chế đều dùng user namespaces nhưng khác boundary:
+
+- **Rootless mode**: daemon và containers chạy không có root privilege trên host.
+- **`userns-remap`**: daemon vẫn là root; container UID 0 được map sang high UID không đặc quyền trên host.
+
+Khi bind mount, UID/GID nhìn thấy bên trong có thể không trùng host ID trực tiếp. Docker documentation khuyến nghị pre-arrange ownership cho host path cần ghi.
+
+Kiểm tra security options:
+
+```bash
+docker info --format '{{json .SecurityOptions}}'
+```
+
+Trên host Linux, kiểm tra subordinate ranges nếu dùng user namespace:
+
+```bash
+grep "^$(whoami):" /etc/subuid /etc/subgid
+```
+
+Không disable user namespace hoặc thêm `--privileged` chỉ để né permission error. Hãy xác định mapping và provision path đúng.
+
+## SELinux
+
+Trên host enforcing SELinux, Unix mode đúng vẫn có thể bị deny vì label. Kiểm tra:
+
+```bash
+getenforce
+ls -Zd /host/source
+```
+
+Với bind mount short syntax:
+
+```bash
+docker run --rm -v /host/shared:/data:z IMAGE
+docker run --rm -v /host/private:/data:Z IMAGE
+```
+
+- `z`: relabel để nhiều container chia sẻ;
+- `Z`: private label cho một container.
+
+<Callout type="warn" title="Relabel thay đổi host path">
+  `z` và `Z` tác động lên label thật của file/directory trên host. Không dùng `Z` cho system directory như `/home` hoặc `/usr`; có thể làm host service mất quyền truy cập.
+</Callout>
+
+Nếu nghi SELinux, xem audit log và policy thay vì tắt enforcement toàn cục.
+
+## Cách sửa theo nguyên nhân
+
+| Nguyên nhân | Cách xử lý ưu tiên |
+|---|---|
+| UID/GID lệch | Pin runtime UID/GID; provision owner/group |
+| Parent directory không traverse được | Sửa execute bit/ACL tối thiểu trên parent |
+| Mount read-only | Đổi deployment intent hoặc ghi sang path khác |
+| Root filesystem read-only | Thêm mount writeable cho path cần thiết |
+| SELinux label sai | Dùng label/policy đúng phạm vi |
+| User namespace mapping | Provision host path cho mapped IDs |
+| NFS root squashing | Thiết kế export và application UID đúng, không cố chạy root |
+| Volume driver policy | Kiểm tra backend credential và mount options |
+
+Không dùng `chmod 777` như default fix: nó mở quyền cho mọi local principal và thường che nguyên nhân thật.
+
+## Cleanup bài thực hành
+
+```bash
+rm -rf /tmp/permission-lab
+docker volume rm app-owned-data
+```
+
+## Nguồn chính thức
+
+- [Docker bind mounts](https://docs.docker.com/engine/storage/bind-mounts/)
+- [Rootless mode](https://docs.docker.com/engine/security/rootless/)
+- [User namespace remapping](https://docs.docker.com/engine/security/userns-remap/)
+- [Docker run user](https://docs.docker.com/reference/cli/docker/container/run/#user)

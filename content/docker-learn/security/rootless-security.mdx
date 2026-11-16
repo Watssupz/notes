@@ -1,0 +1,176 @@
+---
+title: "Rootless security"
+description: "Chạy Docker daemon và container trong user namespace của user thường để giảm authority trên host, đồng thời hiểu giới hạn về network, storage và cgroup."
+---
+
+Rootless mode chạy cả `dockerd` lẫn container mà không cần daemon có quyền root. Daemon và container nằm trong user namespace của một user thường, giúp giảm tác động nếu daemon hoặc runtime bị khai thác.
+
+```text
+Rootful:  root dockerd ──> container process
+Rootless: user dockerd ──> user namespace ──> container process
+```
+
+Rootless vẫn cần kernel, subordinate UID/GID mapping và một số helper. Nó không biến workload không tin cậy thành an toàn tuyệt đối, không bảo vệ dữ liệu mà user host vốn đọc được và không thay patching, seccomp hay least privilege trong container.
+
+## So sánh các mô hình
+
+| Mô hình | Daemon trên host | UID 0 trong container | Phù hợp |
+|---|---|---|---|
+| Rootful mặc định | `root` | Có quyền trong namespace, không phải host root đầy đủ | Server truyền thống cần feature rộng |
+| Rootful + `userns-remap` | `root` | Map sang subordinate UID host | Giảm rủi ro container root, giữ daemon rootful |
+| Rootless | User thường | Map trong user namespace của user | Developer, CI hoặc workload tương thích cần giảm daemon authority |
+| Chỉ `--user 10001` | Tùy daemon | Process app non-root | Baseline cho app, nhưng không giảm quyền daemon |
+
+Các control bổ sung nhau. Trong rootless mode vẫn nên dùng `USER`, drop capability, read-only root, resource limit và secret scope tối thiểu.
+
+## Prerequisite trên Linux
+
+Rootless Engine cần `newuidmap`, `newgidmap` và ít nhất 65.536 subordinate UID/GID cho user:
+
+```bash
+command -v newuidmap newgidmap
+USER_NAME="$(id -un)"
+grep "^${USER_NAME}:" /etc/subuid
+grep "^${USER_NAME}:" /etc/subgid
+```
+
+Output dạng:
+
+```text
+devuser:231072:65536
+```
+
+Range không được overlap với user khác. Dùng package/account tooling của distro để quản lý; không tự chọn range trên production nếu chưa kiểm kê `/etc/subuid` và `/etc/subgid`.
+
+Kiểm tra kernel cho phép unprivileged user namespace theo distro policy. Một số hệ thống hardening tắt tính năng này hoặc giới hạn qua sysctl/LSM.
+
+## Cài đặt bằng package chính thức
+
+Nếu Docker Engine package cung cấp rootless extras, chạy bằng **user thường**, không dùng `sudo`:
+
+```bash
+dockerd-rootless-setuptool.sh install
+```
+
+Script thường tạo systemd user service và Docker context `rootless`. Xác minh:
+
+```bash
+docker context ls
+docker context use rootless
+docker info
+```
+
+Trong `Security Options` cần thấy `rootless`. Socket thường ở:
+
+```bash
+printf '%s\n' "${DOCKER_HOST:-unix:///run/user/$(id -u)/docker.sock}"
+systemctl --user status docker
+```
+
+Để user service chạy sau reboot khi user không đăng nhập, admin có thể bật linger:
+
+```bash
+sudo loginctl enable-linger "$(id -un)"
+```
+
+Linger là quyết định vận hành: daemon của user sẽ chạy nền sau logout và tiêu thụ tài nguyên. Chỉ bật cho account service được quản lý.
+
+<Callout type="warn" title="Hai daemon có thể cùng tồn tại">
+  Nếu rootful daemon vẫn chạy, command có thể vô tình nối sai context. Luôn kiểm tra `docker context show`, `DOCKER_HOST` và phần Server trong `docker info` trước thao tác production.
+</Callout>
+
+## Kiểm tra mapping
+
+Chạy lab:
+
+```bash
+docker run --rm alpine:3.23 sh -c 'id; cat /proc/self/uid_map; cat /proc/self/gid_map'
+```
+
+Bên trong có thể thấy UID `0`, nhưng UID đó được map sang range không đặc quyền trên host. Rootless daemon không thể tùy ý thao tác file/device thuộc root host như rootful daemon.
+
+Rootless data và config thường nằm dưới home/runtime directory của user, không dùng `/var/lib/docker` và `/var/run/docker.sock` rootful. Xem effective paths:
+
+```bash
+docker info --format 'root={{.DockerRootDir}}'
+docker context inspect rootless
+```
+
+## Giới hạn cần thử nghiệm
+
+Behavior phụ thuộc kernel, distro, cgroup v2, RootlessKit và network driver. Kiểm tra đặc biệt:
+
+- bind privileged port thấp và policy `net.ipv4.ip_unprivileged_port_start`;
+- cgroup resource limits và delegation của systemd;
+- network throughput, source IP, MTU và inbound publish;
+- storage driver và filesystem backing home directory;
+- NFS/home filesystem không hỗ trợ ownership/xattr cần thiết;
+- host networking, device, overlay network hoặc plugin cần quyền root;
+- disk quota vì image/cache nằm trong home của user;
+- service startup, linger và log rotation.
+
+Không thêm setuid, broad sudo rule hoặc writable system path chỉ để làm rootless workload tương thích; cách đó có thể trả lại authority vừa cố loại bỏ.
+
+## Resource limits
+
+Với cgroup v2 và systemd delegation phù hợp, rootless có thể quản lý nhiều controller. Kiểm tra:
+
+```bash
+docker info | sed -n '/Cgroup/,+4p'
+docker run --rm --memory 64m --pids-limit 32 alpine:3.23 sh -c \
+  'cat /sys/fs/cgroup/memory.max; cat /sys/fs/cgroup/pids.max'
+```
+
+Nếu Docker cảnh báo limit không được hỗ trợ, sửa cgroup delegation hoặc đặt giới hạn ở systemd user slice. Không bỏ limit mà không đánh giá DoS risk.
+
+## Vận hành nhiều rootless daemon
+
+Mỗi user có socket, image store, network và lifecycle riêng. Điều này tạo isolation quản trị hữu ích nhưng cũng tăng:
+
+- duplicate image/cache và disk usage;
+- version drift giữa daemon;
+- backup/log/monitoring path khác nhau;
+- khó inventory nếu chỉ query rootful socket;
+- rủi ro account user bị chiếm sẽ điều khiển toàn bộ daemon của user đó.
+
+Dùng dedicated service account, không dùng tài khoản cá nhân cho workload dài hạn. Bảo vệ SSH/session/credential của account như control-plane identity.
+
+## Troubleshooting theo bằng chứng
+
+### CLI nối sai daemon
+
+```bash
+docker context show
+docker context ls
+printf 'DOCKER_HOST=%s\n' "${DOCKER_HOST:-unset}"
+docker info --format '{{json .SecurityOptions}}'
+```
+
+### Service user không chạy sau reboot
+
+```bash
+loginctl show-user "$(id -un)" -p Linger
+systemctl --user status docker
+journalctl --user -u docker --since today
+```
+
+### Bind mount lỗi permission
+
+Root trong container được map, không phải UID sở hữu file host. Kiểm tra path và mapping; ưu tiên volume hoặc cấp ownership cho đúng subordinate mapping thay vì `chmod 777`.
+
+### Cleanup/uninstall
+
+Trước khi uninstall, backup dữ liệu cần giữ và xóa workload:
+
+```bash
+dockerd-rootless-setuptool.sh uninstall
+```
+
+Tool không nhất thiết xóa image/data directory. Xem output chính xác rồi dọn theo path từ `docker info`; không `rm -rf` dựa trên path đoán.
+
+## Nguồn chính thức
+
+- [Docker Rootless mode](https://docs.docker.com/engine/security/rootless/)
+- [Rootless troubleshooting](https://docs.docker.com/engine/security/rootless/troubleshoot/)
+- [Rootless tips](https://docs.docker.com/engine/security/rootless/tips/)
+- [User namespace remapping](/docs/security/user-namespaces/)

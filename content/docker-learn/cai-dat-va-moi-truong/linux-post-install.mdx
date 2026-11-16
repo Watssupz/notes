@@ -1,0 +1,333 @@
+---
+title: "Thiết lập Linux sau cài đặt"
+description: "Chọn quyền truy cập Docker socket, cấu hình systemd startup và log rotation, kiểm tra disk, firewall và tạo baseline vận hành an toàn trên Linux."
+---
+
+Docker Engine đã start và chạy được `hello-world` mới chỉ là installation baseline. Trước khi dùng lâu dài, bạn phải quyết định ai được điều khiển daemon, service có tự chạy khi boot không, log được giới hạn thế nào và cách phát hiện disk/network/config problem.
+
+Trang này áp dụng cho Docker Engine native trên Linux. Docker Desktop quản lý các setting tương ứng qua Desktop application, không qua mọi file systemd được nêu ở đây.
+
+## Bắt đầu bằng inventory
+
+```bash
+docker context show
+sudo docker version
+sudo docker info
+sudo systemctl status docker --no-pager
+sudo systemctl status containerd --no-pager
+```
+
+Lưu lại ít nhất Engine version, package source, storage/image store, logging driver, cgroup version, security options và data location. Đây là baseline để so sánh sau khi thay đổi.
+
+## Chọn mô hình quyền truy cập
+
+Docker daemon rootful mặc định listen trên Unix socket, thường là `/var/run/docker.sock`. Socket do root sở hữu và cho phép group `docker` truy cập trên installation phổ biến.
+
+```bash
+ls -l /var/run/docker.sock
+getent group docker || true
+```
+
+Bạn có ba lựa chọn:
+
+1. **Giữ `sudo docker ...`:** phù hợp khi số admin ít và muốn elevation rõ ràng.
+2. **Thêm user vào nhóm `docker`:** tiện cho development/automation, nhưng user có thể yêu cầu daemon mount host filesystem, chạy privileged container và đạt quyền tương đương root.
+3. **Dùng rootless mode:** daemon chạy bằng user thường, giảm daemon attack surface nhưng có giới hạn cgroup/network/port.
+
+<Callout type="error" title="Nhóm docker không phải quyền hạn chế">
+  Thành viên nhóm `docker` phải được quản trị như user có quyền root trên host. Không thêm account không tin cậy và không dùng nhóm này làm multi-tenant sandbox.
+</Callout>
+
+### Thêm user vào nhóm `docker`
+
+Package thường đã tạo group. Nếu chưa có:
+
+```bash
+sudo groupadd docker
+```
+
+Thêm user hiện tại:
+
+```bash
+sudo usermod -aG docker "$USER"
+```
+
+`-aG` rất quan trọng: `-a` append group thay vì thay toàn bộ supplementary groups. Đăng xuất/đăng nhập lại để session nhận membership. Trên VM có thể cần restart session hoặc VM. `newgrp docker` có thể tạo subshell với group mới để test nhanh:
+
+```bash
+newgrp docker
+```
+
+Xác minh identity và socket access:
+
+```bash
+id
+docker version
+docker run --rm hello-world
+```
+
+Không dùng `sudo` ở ba command cuối. Nếu `id` chưa liệt kê `docker`, session chưa nhận group mới.
+
+### Sửa ownership của client config
+
+Nếu trước đó chạy Docker CLI bằng `sudo`, `~/.docker` có thể thuộc root:
+
+```bash
+ls -ld "$HOME/.docker" 2>/dev/null || true
+find "$HOME/.docker" -maxdepth 1 -printf '%u:%g %p\n' 2>/dev/null || true
+```
+
+Sửa ownership và group permission:
+
+```bash
+sudo chown "$USER":"$USER" "$HOME/.docker" -R
+sudo chmod g+rwx "$HOME/.docker" -R
+```
+
+Directory này chứa **client** config, context và có thể chứa credential metadata; không nhầm với `/etc/docker` của daemon. Nếu chọn xóa `~/.docker` để Docker tạo lại, backup context/config cần giữ trước.
+
+### Những cách không nên dùng
+
+Không giải quyết permission bằng:
+
+```text
+sudo chmod 666 /var/run/docker.sock
+sudo chmod -R 777 /var/lib/docker
+```
+
+Cách thứ nhất cấp Docker API cho mọi local user; cách thứ hai phá ownership/mode của internal state và có thể làm daemon hỏng hoặc lộ dữ liệu.
+
+## Cấu hình startup bằng systemd
+
+Trên Debian/Ubuntu, package thường enable Docker khi cài. Trên một số distribution khác, bạn phải bật rõ ràng.
+
+```bash
+sudo systemctl enable docker.service
+sudo systemctl enable containerd.service
+sudo systemctl start docker.service
+```
+
+Hoặc gộp enable và start Docker:
+
+```bash
+sudo systemctl enable --now docker.service
+```
+
+Xác minh desired state:
+
+```bash
+systemctl is-enabled docker.service
+systemctl is-active docker.service
+```
+
+Nếu policy yêu cầu daemon chỉ chạy khi cần:
+
+```bash
+sudo systemctl disable docker.service
+sudo systemctl disable containerd.service
+```
+
+`disable` không nhất thiết stop service đang chạy. Dùng `systemctl stop` riêng khi đã đánh giá impact tới containers.
+
+### Test sau reboot
+
+Trên host lab hoặc maintenance window:
+
+1. Ghi lại running containers và restart policy.
+2. Reboot host.
+3. Kiểm tra `systemctl is-active docker`.
+4. Kiểm tra container nào tự trở lại và vì sao.
+5. Gửi request thật tới application.
+
+Daemon tự start không đảm bảo mọi container/application healthy. Restart behavior phụ thuộc restart policy và state.
+
+## Ngăn container logs làm đầy disk
+
+Default logging driver trên nhiều Engine installation là `json-file`. Nếu không đặt rotation, log file có thể tăng đến khi đầy filesystem. Kiểm tra default thực tế:
+
+```bash
+docker info --format 'LoggingDriver={{.LoggingDriver}}'
+```
+
+Hai hướng phổ biến:
+
+- dùng `local` logging driver, được Docker thiết kế với rotation mặc định;
+- giữ `json-file` nhưng đặt `max-size` và `max-file`.
+
+Ví dụ `/etc/docker/daemon.json` cho `json-file`:
+
+```json
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+```
+
+Mọi value trong `log-opts` của JSON example phải là string. `10m` và `3` chỉ là lab baseline, không phải production sizing chung. Tính retention từ log rate, incident window, disk budget và remote aggregation.
+
+Trước restart, validate file:
+
+```bash
+sudo dockerd --validate --config-file=/etc/docker/daemon.json
+```
+
+Sau đó restart trong maintenance context:
+
+```bash
+sudo systemctl restart docker
+```
+
+Xác minh default:
+
+```bash
+docker info --format 'LoggingDriver={{.LoggingDriver}}'
+```
+
+Thay default logging configuration chỉ áp dụng cho **container được tạo mới**. Container hiện có giữ logging config đã được tạo với nó; cần recreate có kiểm soát để nhận default mới.
+
+Đọc [Cấu hình Docker daemon](/docs/cai-dat-va-moi-truong/daemon-configuration/) trước khi merge example vào file đã có. Hai JSON object tách rời không thể nối trực tiếp; phải merge key trong một object hợp lệ.
+
+## Theo dõi disk và inode
+
+Docker data có thể gồm image layers, writable layers, build cache, volumes, logs và containerd snapshots. Kiểm tra từ Docker:
+
+```bash
+docker system df
+docker system df -v
+```
+
+Kiểm tra filesystem:
+
+```bash
+df -h /var/lib/docker /var/lib/containerd 2>/dev/null || true
+df -i /var/lib/docker /var/lib/containerd 2>/dev/null || true
+```
+
+Docker Engine 29.0 trở lên dùng containerd image store mặc định cho fresh installation theo tài liệu hiện hành; image content/snapshot có thể nằm trong `/var/lib/containerd`, trong khi volumes/config khác vẫn ở `/var/lib/docker`. Đừng chỉ monitor một path dựa trên kinh nghiệm từ Engine cũ.
+
+Không chạy `docker system prune --all --volumes` như cron cleanup chung. Command có thể xóa cache, image và volume không còn được Docker object tham chiếu nhưng vẫn cần cho rollback hoặc dữ liệu. Đặt retention policy theo loại object và backup volume bền vững.
+
+## Kiểm tra time, DNS và registry path
+
+TLS, image signatures/tokens và log correlation phụ thuộc system time:
+
+```bash
+timedatectl status
+```
+
+Kiểm tra DNS từ host:
+
+```bash
+getent hosts registry-1.docker.io
+```
+
+Sau đó kiểm tra qua daemon bằng một pull rõ ràng:
+
+```bash
+docker pull hello-world
+```
+
+Host `curl` thành công không chứng minh daemon có đúng proxy/CA vì daemon chạy với environment riêng. Nếu pull lỗi trong corporate network, xem [Proxy và registry mirror](/docs/cai-dat-va-moi-truong/proxy-and-mirror/).
+
+## Review firewall và IP forwarding
+
+Docker networking có thể bật IP forwarding và tạo iptables/nftables integration. Sau installation, inventory:
+
+```bash
+sudo sysctl net.ipv4.ip_forward
+sudo iptables -S DOCKER-USER 2>/dev/null || true
+sudo nft list ruleset 2>/dev/null | head -n 80
+```
+
+Output chỉ để thu evidence; không xóa chain/rule khi chưa hiểu network driver và firewall manager. Với port public, test từ cả localhost và một host bên ngoài expected trust boundary. Bind host IP rõ ràng trong `--publish` thay vì mặc định mọi interface khi chỉ cần loopback.
+
+## Service logs và health baseline
+
+```bash
+sudo journalctl -u docker --since '30 minutes ago' --no-pager
+sudo journalctl -u containerd --since '30 minutes ago' --no-pager
+```
+
+Tìm restart loop, storage error, DNS/proxy/TLS error, iptables failure và warning về config deprecated. Một dòng chứa từ `error` trong message không luôn có log level error; đọc timestamp, level và context.
+
+Lưu report version/config không chứa secret:
+
+```bash
+docker version
+docker info
+systemctl cat docker
+```
+
+`docker info` và `systemctl cat` có thể lộ proxy endpoint, registry nội bộ, label hoặc path. Redact trước khi chia sẻ.
+
+## Baseline hardening tối thiểu
+
+- Giới hạn membership nhóm `docker` và audit định kỳ.
+- Không expose Docker API plaintext trên TCP `2375`.
+- Cập nhật OS kernel, Docker Engine, containerd và runtime theo maintenance process.
+- Bật log rotation hoặc remote logging trước workload nhiều log.
+- Monitor cả disk bytes và inodes.
+- Không mount Docker socket, host root hoặc device vào container nếu không có threat-model review.
+- Dùng resource limit/restart policy/healthcheck theo workload; installation không tự thêm chúng.
+- Backup volume/application data bằng cơ chế application-consistent và thử restore.
+
+## Troubleshooting
+
+### Group đã thêm nhưng vẫn permission denied
+
+```bash
+id
+ls -l /var/run/docker.sock
+getent group docker
+```
+
+Nếu `id` thiếu group, mở login session mới. Nếu socket group/mode khác, kiểm tra systemd unit và daemon `--group`; không chmod rộng. Nếu CLI đang dùng `DOCKER_HOST` hoặc remote context, lỗi có thể thuộc endpoint khác:
+
+```bash
+env | grep '^DOCKER_' || true
+docker context ls
+```
+
+### Service active nhưng command không kết nối
+
+```bash
+sudo systemctl status docker --no-pager -l
+sudo ss -lx | grep docker.sock || true
+docker context show
+docker version
+```
+
+Phân biệt daemon không listen, context sai và socket permission.
+
+### Daemon không lên sau khi sửa JSON
+
+```bash
+sudo dockerd --validate --config-file=/etc/docker/daemon.json
+sudo journalctl -u docker -n 100 --no-pager
+systemctl cat docker
+```
+
+Nếu option được đặt cả trong JSON và command-line flag của unit, daemon từ chối start. Rollback file backup, start lại, rồi sửa một setting mỗi lần.
+
+## Hoàn thành post-install
+
+Bạn hoàn tất khi:
+
+- access model đã được chọn và user không có quyền ngoài ý định;
+- Docker/containerd startup policy đúng;
+- log rotation/default đã xác minh trên container mới;
+- disk/inode, daemon journal và firewall được đưa vào monitoring/runbook;
+- proxy/registry path hoạt động;
+- reboot test hoặc maintenance test đã được lên kế hoạch.
+
+Tiếp theo, dùng [Cấu hình Docker daemon](/docs/cai-dat-va-moi-truong/daemon-configuration/) cho thay đổi daemon có rollback hoặc [Rootless mode](/docs/cai-dat-va-moi-truong/rootless-mode/) nếu không muốn cấp quyền rootful socket cho user.
+
+## Nguồn chính thức để đối chiếu
+
+- [Linux post-installation steps](https://docs.docker.com/engine/install/linux-postinstall/)
+- [Configure logging drivers](https://docs.docker.com/engine/logging/configure/)
+- [Docker daemon attack surface](https://docs.docker.com/engine/security/)
+- [Packet filtering and firewalls](https://docs.docker.com/engine/network/packet-filtering-firewalls/)

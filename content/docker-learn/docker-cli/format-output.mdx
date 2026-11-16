@@ -1,0 +1,261 @@
+---
+title: "Định dạng output Docker CLI"
+description: "Dùng --format, Go template, JSON và jq để tạo output dễ đọc hoặc machine-readable mà không phụ thuộc cột table mặc định."
+---
+
+Nhiều Docker command hiển thị table tối ưu cho terminal. Table này không phải stable machine interface: cột có thể thay đổi theo command, client version, terminal width hoặc `config.json` của user.
+
+Khi viết script, chọn một trong ba contract:
+
+1. `--format` để lấy đúng field cần thiết;
+2. JSON/JSON Lines để giữ cấu trúc;
+3. Engine API/SDK nếu cần schema, streaming và error handling chặt.
+
+## Mental model của `--format`
+
+Docker dùng Go template. Template được chạy một lần trên object hiện tại hoặc row do command cung cấp:
+
+```bash
+docker container ls --format '{{.ID}} {{.Names}} {{.Status}}'
+```
+
+Field khả dụng **phụ thuộc command**. `.Names` có thể tồn tại ở `docker container ls` nhưng dữ liệu `docker inspect` dùng path khác. Không copy field giữa command mà chưa kiểm tra reference.
+
+Cách khám phá row của command hỗ trợ format:
+
+```bash
+docker container ls --all --format '{{json .}}'
+docker image ls --format '{{json .}}'
+```
+
+Mỗi dòng là một JSON object đại diện row. Với `inspect`, JSON đầy đủ thường hữu ích hơn:
+
+```bash
+docker container inspect web
+```
+
+## Quote theo shell
+
+Trên POSIX shell, bọc template bằng single quote để shell không xử lý `$`, quote hoặc brace:
+
+```bash
+docker inspect --format '{{json .Config.Env}}' web
+```
+
+Khi template cần string literal, dùng double quote bên trong:
+
+```bash
+docker inspect --format '{{join .Config.Env ","}}' web
+```
+
+PowerShell có quoting rule khác; theo official formatting guide, single quote vẫn bọc template nhưng double quote bên trong có thể cần escape:
+
+```powershell
+docker inspect --format '{{join .Args \" , \"}}' web
+```
+
+Test template trong shell đích thay vì giả định command copy từ Bash chạy nguyên trạng trên PowerShell.
+
+## Text, table và JSON
+
+### Text không header
+
+Phù hợp pipeline line-oriented:
+
+```bash
+docker container ls --all \
+  --format '{{.ID}}\t{{.Names}}\t{{.State}}'
+```
+
+### Table có header
+
+Prefix template bằng `table`:
+
+```bash
+docker image ls \
+  --format 'table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}'
+```
+
+Table dành cho người đọc; không parse lại bằng `awk` theo vị trí whitespace nếu field có space.
+
+### JSON Lines
+
+```bash
+docker container ls --all --format '{{json .}}'
+```
+
+Mỗi line là JSON độc lập, thuận tiện stream. Gom thành array bằng `jq`:
+
+```bash
+docker container ls --all --format '{{json .}}' | jq -s '.'
+```
+
+Một số command mới hỗ trợ `--format json` trực tiếp. Kiểm tra `COMMAND --help`; không giả định mọi command có cùng directive.
+
+## Template function Docker hỗ trợ
+
+Official formatting guide mô tả các helper chính:
+
+| Function | Mục đích | Ví dụ |
+|---|---|---|
+| `json` | Encode value thành JSON | `{{json .Mounts}}` |
+| `join` | Ghép list string | `{{join .Args ","}}` |
+| `split` | Tách string | `{{split .Image ":"}}` |
+| `lower`, `upper`, `title` | Đổi case | `{{upper .Name}}` |
+| `pad` | Thêm khoảng trắng hai phía | `{{pad .Repository 2 4}}` |
+| `truncate` | Cắt string tới length | `{{truncate .Repository 20}}` |
+| `println` | In value và newline | dùng trong `range` |
+| `table` | Render table/header | `table {{.ID}}\t{{.Names}}` |
+
+Ví dụ list environment thành JSON thay vì text khó parse:
+
+```bash
+docker container inspect web \
+  --format '{{json .Config.Env}}' | jq '.'
+```
+
+## Điều kiện, loop, map và index
+
+### `range` qua nhiều network
+
+```bash
+docker container inspect web \
+  --format '{{range $name, $net := .NetworkSettings.Networks}}{{println $name $net.IPAddress}}{{end}}'
+```
+
+Map iteration không nên được dùng khi script cần thứ tự ổn định; chuyển sang JSON và sort key bằng `jq`.
+
+### `with` cho value có thể absent
+
+```bash
+docker container inspect web \
+  --format '{{with .State.Health}}{{.Status}}{{else}}no-healthcheck{{end}}'
+```
+
+Không phải container nào cũng có `.State.Health`. `with` tránh giả định healthcheck luôn tồn tại.
+
+### `index` cho key không dùng được bằng dot notation
+
+Port key bắt đầu bằng số và chứa `/`:
+
+```bash
+docker container inspect web \
+  --format '{{json (index .NetworkSettings.Ports "80/tcp")}}'
+```
+
+Value có thể là `null` nếu port chưa publish. Đừng index phần tử `0` trước khi kiểm tra list tồn tại.
+
+## Format cho các tác vụ thường gặp
+
+### Container status và exit code
+
+```bash
+docker container inspect web \
+  --format 'status={{.State.Status}} exit={{.State.ExitCode}} error={{json .State.Error}}'
+```
+
+### Image digest
+
+```bash
+docker image inspect alpine:latest \
+  --format '{{json .RepoDigests}}' | jq '.'
+```
+
+Local-only image hoặc workflow nhất định có thể không có `RepoDigests`; xử lý array rỗng/null.
+
+### Mount inventory
+
+```bash
+docker container inspect web \
+  --format '{{json .Mounts}}' | jq -r '.[] | [.Type, .Source, .Destination, (.RW|tostring)] | @tsv'
+```
+
+Output có host path và volume name; xem như operationally sensitive.
+
+### Port bindings
+
+```bash
+docker container port web
+
+docker container inspect web \
+  --format '{{json .NetworkSettings.Ports}}' | jq '.'
+```
+
+Command đầu tối ưu cho người đọc; command sau giữ mapping structure.
+
+## Khi nên dùng `jq`
+
+Go template phù hợp projection nhỏ. Dùng `jq` khi cần:
+
+- sort array/map;
+- lọc nested value;
+- xử lý null rõ ràng;
+- tạo JSON object mới;
+- kiểm tra cardinality/schema.
+
+Ví dụ liệt kê container theo name:
+
+```bash
+docker container ls --all --format '{{json .}}' |
+  jq -s 'sort_by(.Names) | map({id: .ID, name: .Names, state: .State})'
+```
+
+Không pipe table mặc định vào `jq`; input phải là JSON.
+
+## Default format trong `config.json`
+
+Bạn có thể cấu hình output tương tác:
+
+```json
+{
+  "psFormat": "table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}",
+  "imagesFormat": "table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}"
+}
+```
+
+Điều này hữu ích cho terminal cá nhân nhưng không phải contract cho automation. Script luôn truyền format tường minh.
+
+## Failure modes
+
+### Template field không tồn tại
+
+Triệu chứng có thể là `<no value>`, empty output hoặc template execution error tùy path/function. Xem source object:
+
+```bash
+docker container inspect web | jq '.[0] | keys'
+docker container ls --format '{{json .}}' | head -n 1 | jq 'keys'
+```
+
+Hai schema trên khác nhau.
+
+### Output bị ghép dòng
+
+Trong `range`, thêm `println` hoặc delimiter tường minh:
+
+```bash
+docker inspect web \
+  --format '{{range .Mounts}}{{println .Destination}}{{end}}'
+```
+
+### Shell ăn template
+
+Dùng single quote trên POSIX shell và không đặt template trong unquoted variable. Với template động, tránh `eval`; truyền nó như một argument đã quote.
+
+### JSON hợp lệ nhưng consumer sai shape
+
+`docker inspect` trả JSON array ngay cả khi inspect một object. `docker ... ls --format '{{json .}}'` trả JSON Lines, không phải array. Chuẩn hóa shape trước khi đưa vào consumer.
+
+## Best practices
+
+- Table cho người; JSON/explicit template cho máy.
+- Khám phá field từ command thực tế và pin minimum supported version.
+- Xử lý null, array rỗng và object không có optional state.
+- Không parse `Status` prose để suy ra state nếu có `.State` hoặc inspect field.
+- Không log toàn bộ inspect/config nếu chỉ cần một field; output có env, label, mount path và metadata nhạy cảm.
+- Test quoting trên Bash, PowerShell hoặc shell mà automation thực sự dùng.
+
+## Nguồn chính thức
+
+- [Format command and log output](https://docs.docker.com/go/formatting/)
+- [docker inspect](https://docs.docker.com/reference/cli/docker/inspect/)
+- [Docker CLI configuration file](https://docs.docker.com/reference/cli/docker/#configuration-files)

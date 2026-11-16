@@ -1,0 +1,20 @@
+{
+  "title": "Docker Compose",
+  "pages": [
+    "index",
+    "compose-file",
+    "services",
+    "networks",
+    "volumes",
+    "configs-and-secrets",
+    "environment-variables",
+    "interpolation",
+    "depends-on-and-healthcheck",
+    "profiles",
+    "extends-and-include",
+    "merge-and-override",
+    "develop-watch",
+    "production-patterns",
+    "compose-troubleshooting"
+  ]
+}

@@ -1,0 +1,292 @@
+---
+title: "Builders và drivers"
+description: "Chọn và vận hành BuildKit builder với docker, docker-container, kubernetes hoặc remote driver theo output, cache và isolation cần thiết."
+---
+
+Một **builder** là một instance BuildKit mà client gửi build request tới. Builder có thể gồm một hoặc nhiều node. **Driver** quyết định BuildKit chạy ở đâu, được quản lý ra sao và hỗ trợ output/cache/config nào.
+
+```text
+Buildx client
+    |
+    +--> default builder ------ docker driver ------ dockerd
+    |
+    +--> ci builder ----------- docker-container --- buildkit container
+    |
+    +--> cluster builder ------ kubernetes --------- BuildKit pods
+    |
+    +--> shared builder ------- remote ------------ buildkitd do platform team quản lý
+```
+
+Builder selection ảnh hưởng cache, platform, network, secret boundary và nơi output được lưu. Đây là quyết định kiến trúc, không chỉ là tên trong CLI.
+
+## Default builder
+
+Docker Engine tự tạo builder `default` dùng BuildKit library tích hợp trong daemon và `docker` driver. Nó gắn với Docker context hiện tại; đổi context có thể làm endpoint của default builder thay đổi.
+
+```bash
+docker context show
+docker buildx ls
+docker buildx inspect default
+```
+
+Default builder phù hợp local single-platform build vì không cần setup và thường auto-load image vào local store.
+
+## So sánh drivers
+
+| Driver | BuildKit chạy ở đâu? | Auto-load | Multi-platform/advanced output | Quản lý |
+|---|---|---:|---|---|
+| `docker` | Trong Docker daemon | Có | Hạn chế theo image store/config | Docker daemon |
+| `docker-container` | Dedicated container | Không, trừ config/`--load` | Đầy đủ cho phần lớn use case | Buildx tạo/xóa container |
+| `kubernetes` | Pod trong cluster | Không | Multi-node, scale theo K8s | Buildx + Kubernetes |
+| `remote` | `buildkitd` có sẵn | Không | Phụ thuộc daemon remote | Platform team/người vận hành |
+
+Docker docs hiện cũng có các driver/service khác như cloud trong sản phẩm tương ứng. Bảng trên là bốn driver Buildx nền tảng.
+
+### `docker` driver
+
+Ưu điểm:
+
+- zero setup;
+- tích hợp local image store;
+- behavior quen thuộc với `docker build`.
+
+Giới hạn:
+
+- không tùy chỉnh BuildKit daemon độc lập;
+- feature cache/export phụ thuộc Docker Engine và containerd image store;
+- cache/lifecycle gắn với daemon.
+
+Dùng cho local dev và build đơn giản. Khi cần multi-platform release, registry cache `mode=max`, custom BuildKit config hoặc isolation tốt hơn, cân nhắc `docker-container`.
+
+### `docker-container` driver
+
+Tạo BuildKit daemon trong container riêng:
+
+```bash
+docker buildx create \
+  --name ci-builder \
+  --driver docker-container \
+  --use --bootstrap
+```
+
+Build single-platform để chạy local:
+
+```bash
+docker buildx build --builder ci-builder --load -t app:dev .
+```
+
+Build multi-platform release:
+
+```bash
+docker buildx build \
+  --builder ci-builder \
+  --platform linux/amd64,linux/arm64 \
+  --push -t registry.example.com/team/app:1.4.0 .
+```
+
+Nếu không dùng `--load`, `--push` hoặc `--output`, kết quả có thể chỉ ở cache. Có thể cấu hình auto-load cho custom driver hỗ trợ Buildx mới:
+
+```bash
+docker buildx create \
+  --name dev-builder \
+  --driver docker-container \
+  --driver-opt default-load=true \
+  --use --bootstrap
+```
+
+Vẫn ghi output tường minh trong CI để tránh phụ thuộc default.
+
+### `kubernetes` driver
+
+Phù hợp khi tổ chức đã có Kubernetes và muốn BuildKit pod/nodes dùng cluster scheduling. Builder dùng Kubernetes context hiện tại hoặc endpoint cấu hình:
+
+```bash
+docker buildx create \
+  --name k8s-builder \
+  --driver kubernetes \
+  --use --bootstrap
+```
+
+Trước production cần thiết kế:
+
+- namespace và service account;
+- nodeSelector/architecture;
+- rootless hoặc privileged requirement;
+- persistent/ephemeral cache storage;
+- network policy và registry egress;
+- resource requests/limits;
+- pod disruption, replicas và cleanup;
+- secret nào được gửi từ client tới pod.
+
+Không dùng Kubernetes driver chỉ vì “có cluster”; remote shared builder đơn giản có thể dễ vận hành hơn.
+
+### `remote` driver
+
+Kết nối tới `buildkitd` do bên ngoài quản lý:
+
+```bash
+docker buildx create \
+  --name shared-builder \
+  --driver remote \
+  --use tcp://buildkit.example.com:1234
+```
+
+Production không mở BuildKit TCP plaintext/public. Dùng mTLS hoặc transport bảo mật được hỗ trợ, firewall, authentication/authorization và tenant isolation. Người vận hành remote daemon chịu trách nhiệm:
+
+- version/upgrade;
+- worker/snapshotter;
+- TLS và certificate rotation;
+- storage/GC;
+- observability;
+- entitlements;
+- capacity và failure recovery.
+
+Remote builder cải thiện cache reuse nhưng trở thành shared execution infrastructure có blast radius lớn.
+
+## Tạo, chọn và xóa builder
+
+```bash
+# Tạo
+docker buildx create --name lab --driver docker-container --use
+
+# Khởi động và kiểm tra
+docker buildx inspect lab --bootstrap
+
+# Chọn cho command sau
+docker buildx use lab
+
+# Dùng explicit, không đổi selection
+docker buildx build --builder lab --load -t app:test .
+
+# Dừng/xóa custom builder
+docker buildx stop lab
+docker buildx rm lab
+```
+
+Xóa builder có thể xóa cache/storage gắn với nó. Xác minh không có pipeline khác đang dùng và external cache đã export nếu cần.
+
+Builder selection precedence thực tế có thể đến từ `--builder`, `BUILDX_BUILDER`, selected Buildx builder và command/context. Khi debug, in rõ:
+
+```bash
+printf 'BUILDX_BUILDER=%s\n' "${BUILDX_BUILDER:-<unset>}"
+docker context show
+docker buildx ls
+```
+
+## Multi-node builder
+
+Thêm node cho platform/capacity khác:
+
+```bash
+docker buildx create --name native --use node-amd64
+docker buildx create --name native --append node-arm64
+docker buildx inspect native --bootstrap
+```
+
+Node names/platform có thể cấu hình bằng option create. Multi-node không tự giải quyết mọi vấn đề:
+
+- cache có thể nằm per-node/backend;
+- scheduler chọn node theo platform/capability;
+- source/registry access phải đồng nhất;
+- version/config khác nhau gây behavior khó lặp lại;
+- secret release được gửi tới node thực thi operation.
+
+Đặt monitoring và health check cho từng node, không chỉ builder aggregate.
+
+## BuildKit configuration
+
+Custom driver cho phép truyền config:
+
+```toml
+# buildkitd.toml
+[worker.oci]
+  max-parallelism = 4
+
+[registry."registry.example.com"]
+  mirrors = ["mirror.internal.example.com"]
+```
+
+```bash
+docker buildx create \
+  --name configured \
+  --driver docker-container \
+  --buildkitd-config ./buildkitd.toml \
+  --use --bootstrap
+```
+
+Config schema/version phải theo BuildKit đang chạy. Registry certificate, insecure registry, GC và worker config là security-sensitive; review và test trên builder disposable trước.
+
+## Resource và parallelism
+
+`docker-container` driver có thể nhận driver options tùy version, ví dụ resource constraints/network/image. Không đặt option theo snippet cũ mà chưa kiểm tra CLI:
+
+```bash
+docker buildx create --help
+docker buildx inspect --bootstrap
+```
+
+Giảm `max-parallelism` có thể tránh OOM hoặc rate limit nhưng làm build chậm. Tăng node/CPU chỉ có ích nếu dependency graph có nhánh song song hoặc operation bản thân dùng parallel compiler.
+
+## Cache lifecycle
+
+```bash
+docker buildx du --builder ci-builder
+docker buildx prune --builder ci-builder --filter 'until=168h'
+```
+
+Trước prune production:
+
+```bash
+docker buildx prune --builder ci-builder --filter 'until=168h' --verbose
+```
+
+Tùy CLI/version, interactive confirmation hoặc flag khác có thể cần. Cache pruning không nên chạy đồng thời thiếu kiểm soát với build quan trọng. Dùng BuildKit GC policy ở daemon cho shared builder thay cron `prune --all` tùy tiện.
+
+## Security model
+
+Builder chạy code từ Dockerfile và build context. Với shared builder:
+
+- tách trusted release và untrusted PR;
+- hạn chế entitlement `security.insecure`, `network.host`, device access;
+- không mount Docker socket vào build tùy tiện;
+- dùng short-lived scoped secret;
+- cô lập network/registry credentials theo tenant;
+- không giả định cache là confidential;
+- patch BuildKit, runtime và host;
+- lưu audit log: caller, source revision, builder node, output digest.
+
+<Callout type="warn" title="Cảnh báo">
+  Có quyền gửi build tới BuildKit thường tương đương quyền thực thi workload trong boundary của worker. Không expose unauthenticated remote BuildKit endpoint.
+</Callout>
+
+## Chọn topology
+
+| Use case | Lựa chọn khởi đầu |
+|---|---|
+| Developer build/run local | Default `docker` driver |
+| Local multi-platform hoặc feature BuildKit đầy đủ | `docker-container` |
+| CI nhỏ, runner ephemeral | `docker-container` + registry/GHA cache |
+| CI lớn cần shared cache | Remote builder được quản lý |
+| Native amd64 + arm64 | Multi-node remote/container contexts hoặc Kubernetes |
+| Tổ chức vận hành build trên K8s | `kubernetes` nếu team sở hữu operational complexity |
+
+Không dùng một shared builder duy nhất cho mọi trust level chỉ để tăng hit ratio.
+
+## Checklist vận hành
+
+- [ ] Pin và ghi nhận Docker, Buildx, BuildKit version.
+- [ ] Builder/driver/platform/output được khai báo rõ trong pipeline.
+- [ ] TLS/auth/network policy bảo vệ remote endpoint.
+- [ ] Cache GC, disk alert và quota đã cấu hình.
+- [ ] Node architecture và native/emulated status được biết rõ.
+- [ ] Trusted/untrusted workload được tách.
+- [ ] Registry mirror/proxy/certificate được test.
+- [ ] Có runbook recreate builder và warm cache.
+- [ ] Build output được xác minh ở local store hoặc registry đúng nơi.
+
+## Nguồn chính thức
+
+- [Builders](https://docs.docker.com/build/builders/)
+- [Build drivers](https://docs.docker.com/build/drivers/)
+- [`docker buildx create`](https://docs.docker.com/reference/cli/docker/buildx/create/)
+- [BuildKit configuration](https://docs.docker.com/build/buildkit/configure/)

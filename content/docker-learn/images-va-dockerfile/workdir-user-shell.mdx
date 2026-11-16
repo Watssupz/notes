@@ -1,0 +1,261 @@
+---
+title: "WORKDIR, USER và SHELL"
+description: "Kiểm soát working directory, runtime identity và shell mặc định trong Dockerfile; xử lý ownership, UID/GID, signal và compatibility an toàn."
+---
+
+`WORKDIR`, `USER` và `SHELL` thay đổi execution context của các instruction sau và default runtime config của image. Chúng không chỉ làm Dockerfile dễ đọc: một path tương đối sai có thể copy file nhầm chỗ, một `USER` sai làm volume không ghi được, và một `SHELL` sai có thể che failure trong pipe.
+
+## `WORKDIR`: base path trong stage
+
+```dockerfile
+WORKDIR /app
+COPY . .
+RUN ./build.sh
+CMD ["./server"]
+```
+
+`WORKDIR` đặt working directory cho `RUN`, `CMD`, `ENTRYPOINT`, `COPY` và `ADD` theo semantics của từng instruction. Nếu directory chưa tồn tại, builder tạo nó. Dùng absolute path để behavior không phụ thuộc `WORKDIR` thừa kế từ base.
+
+Không làm:
+
+```dockerfile
+RUN cd /app && make
+RUN ./run-tests
+```
+
+`cd` chỉ có hiệu lực trong shell process của instruction đầu; `RUN` sau bắt đầu ở `WORKDIR` hiện tại của stage, không giữ shell cwd trước. Viết:
+
+```dockerfile
+WORKDIR /app
+RUN make
+RUN ./run-tests
+```
+
+### Relative `WORKDIR` cộng dồn
+
+```dockerfile
+WORKDIR /opt
+WORKDIR app
+WORKDIR src
+```
+
+Effective path là `/opt/app/src`. Cú pháp hợp lệ nhưng khó review; ưu tiên absolute path mỗi khi đổi context lớn.
+
+Base image có thể đã đặt `WORKDIR`. Nếu image con dùng relative path mà không biết base config, update base có thể thay output. Build checks có thể cảnh báo `WorkdirRelativePath`; xem warning là lỗi thiết kế cần review.
+
+### Variable trong `WORKDIR`
+
+```dockerfile
+ENV APP_ROOT=/opt/app
+WORKDIR ${APP_ROOT}
+```
+
+Chỉ variable đã được khai báo theo scope trước đó mới có ý nghĩa mong muốn. Inspect final:
+
+```bash
+docker image inspect app:test --format '{{.Config.WorkingDir}}'
+```
+
+## `USER`: identity cho build và runtime
+
+```dockerfile
+USER <user>[:<group>]
+```
+
+`USER` đặt user/group cho `RUN` tiếp theo và default user khi container chạy. Runtime có thể override bằng `docker run --user`.
+
+Pattern Linux phổ biến:
+
+```dockerfile
+FROM alpine:3.23
+RUN addgroup -S -g 10001 app \
+    && adduser -S -D -H -u 10001 -G app app
+WORKDIR /app
+COPY --chown=10001:10001 app /app/app
+USER 10001:10001
+ENTRYPOINT ["/app/app"]
+```
+
+Numeric UID/GID explicit làm ownership dễ dự đoán hơn giữa rebuild. Tên user giúp người đọc nhưng phụ thuộc `/etc/passwd`; có thể dùng tên trong `USER` sau khi tạo account rõ ràng.
+
+### User, group và supplementary groups
+
+Khi chỉ định `USER app:app`, runtime dùng primary group đã chỉ định theo image config; behavior supplementary group có thể khác khi runtime override/add group. Nếu process cần group để truy cập socket/device/mount, cấu hình runtime `--group-add` hoặc orchestrator security context theo host resource; không bake host-specific GID tùy tiện vào public image.
+
+Kiểm tra:
+
+```bash
+docker run --rm app:test id
+```
+
+Nếu final image không có `id`, dùng test stage hoặc application self-check; thiếu coreutils không đồng nghĩa user config sai.
+
+### Non-root không tự động an toàn hoàn toàn
+
+`USER` non-root giảm quyền trong container nhưng không thay thế:
+
+- read-only root filesystem và writable mount có kiểm soát;
+- drop Linux capabilities;
+- seccomp/AppArmor/SELinux;
+- tránh Docker socket/host mount nhạy cảm;
+- user namespaces/rootless mode;
+- patch/scan dependency.
+
+Ngược lại, image chạy root có thể vẫn bị runtime remap, nhưng không nên dựa vào deployment luôn sửa image default. Đặt default an toàn trong image và override có chủ đích khi cần.
+
+## Chuẩn bị ownership trước khi đổi user
+
+Anti-pattern:
+
+```dockerfile
+COPY . /app
+RUN chown -R app:app /app
+USER app
+```
+
+`COPY` tạo content rồi `RUN chown` tạo thêm filesystem diff lớn. Dùng:
+
+```dockerfile
+COPY --chown=app:app . /app
+USER app
+```
+
+Với directory đã tạo bởi `WORKDIR`, đặt ownership rõ:
+
+```dockerfile
+RUN install -d -o app -g app /app /var/lib/app
+```
+
+Chỉ tạo writable path thực sự cần. Không `chown -R` toàn root filesystem hoặc volume lớn lúc startup.
+
+## Volume/bind mount có ownership riêng
+
+File ownership trong image không đảm bảo mount runtime ghi được. Bind mount giữ UID/GID từ host; named volume mới có thể nhận content/ownership ban đầu theo Engine behavior, nhưng volume tồn tại từ trước giữ state cũ.
+
+Chẩn đoán:
+
+```bash
+docker run --rm \
+  --mount type=bind,src="$PWD/data",dst=/var/lib/app \
+  app:test
+```
+
+Trên Linux host:
+
+```bash
+stat -c '%u:%g %a %n' data
+```
+
+Không khuyên `chmod 777`. Chọn UID/GID contract, provision host directory, dùng named volume hoặc init step có quyền giới hạn. Trên Docker Desktop, file sharing/VM layer có permission semantics khác native Linux; test đúng platform.
+
+## Root cho build, non-root cho runtime
+
+Cài package cần root, sau đó drop privilege:
+
+```dockerfile
+FROM alpine:3.23
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S -g 10001 app \
+    && adduser -S -D -H -u 10001 -G app app
+
+WORKDIR /app
+COPY --chown=10001:10001 server /app/server
+USER 10001:10001
+ENTRYPOINT ["/app/server"]
+```
+
+Nếu cần một root-only test sau `USER`, có thể `USER root` tạm rồi chuyển lại, nhưng nhiều switch làm security review khó. Sắp instruction để privileged setup hoàn tất trước.
+
+## `SHELL`: shell mặc định cho shell-form instruction
+
+Linux default thường tương đương:
+
+```dockerfile
+SHELL ["/bin/sh", "-c"]
+```
+
+Đổi sang Bash với pipefail nếu base có Bash:
+
+```dockerfile
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN curl --fail https://example.com/data | process-data
+```
+
+`SHELL` phải dùng JSON form và ảnh hưởng shell-form `RUN`, `CMD`, `ENTRYPOINT` phía sau. Nó **không** ảnh hưởng exec-form:
+
+```dockerfile
+SHELL ["/bin/bash", "-c"]
+RUN ["/bin/sh", "-c", "echo explicit shell"]
+```
+
+Đừng dùng `SHELL ["/bin/bash", "-c"]` nếu base không có `/bin/bash`. Việc đổi shell cũng có thể thay quoting, built-in, startup behavior và cache key; giữ scope gần instruction cần nó.
+
+### Windows container
+
+Windows image có thể dùng `cmd` hoặc PowerShell:
+
+```dockerfile
+# escape=`
+FROM mcr.microsoft.com/windows/servercore:ltsc2025
+SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop';"]
+RUN Write-Host 'building'
+```
+
+Base tag phải tương thích Windows host/build environment. PowerShell error semantics khác POSIX shell; đặt error preference phù hợp và test exit code. Ví dụ Windows không chạy trong Linux container mode.
+
+## `SHELL` không điều khiển exec-form runtime
+
+```dockerfile
+SHELL ["/bin/bash", "-c"]
+ENTRYPOINT ["/app/server"]
+```
+
+Entrypoint gọi trực tiếp `/app/server`; Bash không tham gia. Đây thường là điều mong muốn. Nếu dùng shell-form `ENTRYPOINT`, shell được chọn trở thành lớp PID 1 và có thể ảnh hưởng signal; ưu tiên exec form cho service.
+
+## Xác minh effective context
+
+Dockerfile test stage:
+
+```dockerfile
+FROM runtime AS verify
+USER root
+RUN test -x /app/server
+USER 10001:10001
+RUN test -r /app/server
+```
+
+Runtime:
+
+```bash
+docker image inspect app:test \
+  --format 'user={{.Config.User}} workdir={{.Config.WorkingDir}} shell={{json .Config.Shell}}'
+
+docker run --rm --entrypoint /app/server app:test --version
+```
+
+`Config.Shell` có thể rỗng khi dùng platform default. Không suy ra lỗi chỉ từ field rỗng; đối chiếu platform/base behavior.
+
+## Troubleshooting
+
+### `permission denied` khi start
+
+Kiểm tra executable bit, parent directory execute permission, ownership, mount che file image, SELinux label và noexec mount. `USER root` chỉ để chẩn đoán có kiểm soát, không phải fix cuối.
+
+### `WORKDIR` chứa file ở path lạ
+
+Inspect base `WorkingDir`, tìm relative `WORKDIR`, destination tương đối của `COPY`/`ADD` và command build context. Dùng absolute path.
+
+### `set -o pipefail: bad option`
+
+`/bin/sh` hiện tại không hỗ trợ. Chọn Bash có cài đặt, dùng exec form với shell phù hợp hoặc viết command không cần pipe.
+
+### Bind mount chạy local nhưng fail CI
+
+UID/GID, SELinux, filesystem sharing và path thuộc daemon host khác nhau. Ghi rõ contract và test trên Linux runner tương đương production.
+
+## Nguồn chính thức
+
+- [`WORKDIR` reference](https://docs.docker.com/reference/dockerfile/#workdir)
+- [`USER` reference](https://docs.docker.com/reference/dockerfile/#user)
+- [`SHELL` reference](https://docs.docker.com/reference/dockerfile/#shell)
+- [Dockerfile best practices](https://docs.docker.com/build/building/best-practices/)

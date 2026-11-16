@@ -1,0 +1,387 @@
+---
+title: "Windows containers"
+description: "Kiến trúc Windows containers, process và Hyper-V isolation, base image, host-image compatibility, Docker Desktop workflow và troubleshooting theo đúng OS boundary."
+---
+
+Windows containers đóng gói Windows user-mode system files, application và dependencies thành image rồi chạy bằng container primitives của Windows. Object model image/container/registry quen thuộc vẫn áp dụng, nhưng namespaces, capabilities, seccomp và OverlayFS của Linux **không phải implementation model để giải thích Windows container**.
+
+Điều cần xác định đầu tiên là bạn đang chạy **Linux container hay Windows container**, sau đó mới xét host version, base image và isolation mode.
+
+## Hai họ container trên Windows host
+
+Docker Desktop trên Windows có thể cung cấp workflow cho Linux containers và Windows containers, nhưng hai loại cần kernel/user-space family khác nhau.
+
+```text
+Windows machine
+├── Linux containers mode
+│   └── Linux environment/VM (thường WSL 2 backend)
+│       └── Linux kernel + Linux containers
+│
+└── Windows containers mode
+    └── Windows container host
+        ├── process-isolated Windows containers
+        └── Hyper-V-isolated Windows containers
+```
+
+Một Linux image như `alpine` không chạy như Windows process. Một Windows Server Core image không chạy trên Linux kernel. Cùng CPU architecture `amd64` không xóa ranh giới OS.
+
+Kiểm tra daemon hiện tại:
+
+```powershell
+docker context show
+docker info --format 'OSType={{.OSType}} Architecture={{.Architecture}}'
+```
+
+Expected `OSType` là `windows` cho Windows container daemon và `linux` cho Linux container daemon. Nếu `docker pull` báo không có matching manifest, kiểm tra mode/OS/architecture trước khi đổi tag ngẫu nhiên.
+
+## Windows container image chứa gì?
+
+Container share hoặc dùng kernel tương thích theo isolation mode, nhưng application vẫn cần user-mode APIs, libraries và system files. Microsoft phân phối các base image với surface khác nhau.
+
+| Base image family | Đặc điểm định hướng | Use case |
+|---|---|---|
+| Nano Server | Nhỏ, API surface tối thiểu hơn | Application hiện đại đã xác minh compatibility, ví dụ .NET phù hợp |
+| Server Core | Windows Server API surface rộng hơn Nano | Nhiều server application, .NET Framework/legacy compatibility theo support |
+| Windows / Windows Server | API surface lớn hơn theo image offering | Workload cần dependency/API không có ở Server Core; đánh đổi image size/attack surface |
+
+Tên/tag chính xác và support lifecycle thay đổi theo Windows release. Lấy image từ Microsoft Container Registry (MCR) và đọc base-image documentation hiện hành.
+
+Ví dụ reference:
+
+```text
+mcr.microsoft.com/windows/servercore:ltsc2022
+mcr.microsoft.com/windows/nanoserver:ltsc2022
+```
+
+Không dùng tag trên nếu host/support matrix của bạn yêu cầu release khác. Base image tag là một compatibility decision, không chỉ lựa chọn kích thước.
+
+## Hai isolation mode
+
+Windows containers cung cấp `process` và `hyperv` isolation.
+
+### Process isolation
+
+Nhiều container chạy trên cùng host và share Windows kernel. Windows tách các view/resources như:
+
+- filesystem;
+- registry;
+- network ports/stack resources;
+- process và thread ID space;
+- Object Manager namespace;
+- resource controls và các container-specific views khác.
+
+```text
+Container A user mode ─┐
+Container B user mode ─┼── shared Windows host kernel
+Host processes ────────┘
+```
+
+Ưu điểm là startup và density. Đổi lại, host/container version compatibility chặt hơn và shared kernel là trust boundary.
+
+### Hyper-V isolation
+
+Mỗi container chạy trong một utility VM tối ưu hóa, có kernel riêng cho container boundary:
+
+```text
+Windows host
+├── Utility VM A: kernel + container A
+└── Utility VM B: kernel + container B
+```
+
+Hyper-V isolation cung cấp hardware-backed boundary mạnh hơn và compatibility rộng hơn giữa một số host/image versions. Trade-off gồm startup, memory/compute overhead, feature/integration behavior và yêu cầu virtualization.
+
+Cùng Windows image có thể được dùng với hai mode khi platform/support matrix cho phép; khác biệt chính là runtime isolation boundary.
+
+## Chọn isolation mode có chủ đích
+
+| Yêu cầu | Process isolation | Hyper-V isolation |
+|---|---|---|
+| Mật độ/startup ưu tiên | Thường thuận lợi hơn | Có VM overhead |
+| Host/image version mismatch | Compatibility chặt hơn | Có thể hỗ trợ rộng hơn theo Microsoft matrix |
+| Workload ít tin cậy | Shared-kernel risk cao hơn | Kernel boundary riêng mạnh hơn |
+| Virtualization availability | Không cần VM per container | Cần Hyper-V/virtualization support |
+| Quan sát process từ host | Host có thể thấy underlying process theo security context | Application process nằm trong utility VM |
+
+Default isolation phụ thuộc Windows edition, host type, Docker/Desktop version và configuration. Trong automation quan trọng, chỉ rõ mode và validate thay vì dựa vào default không được pin.
+
+## Chạy container theo từng mode
+
+Các command dưới đây cần Windows container daemon và host hỗ trợ image `ltsc2022`.
+
+Process isolation:
+
+```powershell
+docker run --rm --isolation=process `
+  mcr.microsoft.com/windows/servercore:ltsc2022 `
+  cmd /S /C ver
+```
+
+Hyper-V isolation:
+
+```powershell
+docker run --rm --isolation=hyperv `
+  mcr.microsoft.com/windows/servercore:ltsc2022 `
+  cmd /S /C ver
+```
+
+Dấu backtick là PowerShell line continuation. Trong Command Prompt, viết command một dòng hoặc dùng syntax phù hợp.
+
+Nếu process mode lỗi compatibility nhưng Hyper-V mode chạy, đó là evidence về kernel/version boundary; không có nghĩa mọi production workload nên chuyển Hyper-V mà không đánh giá capacity và operations.
+
+## Host-image version compatibility
+
+Windows container compatibility phụ thuộc:
+
+- host Windows release/build;
+- container base image release/build/tag;
+- isolation mode;
+- Windows Server versus client host;
+- servicing/update level theo compatibility rules hiện hành;
+- container runtime/Engine support.
+
+Process isolation thường yêu cầu host và base image tương thích chặt. Hyper-V isolation boot kernel phù hợp trong utility VM nên xử lý được nhiều mismatch scenario hơn, nhưng không phải mọi kết hợp đều được support.
+
+Quy trình chọn image:
+
+1. Ghi host edition, version và build:
+
+```powershell
+Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsBuildNumber
+```
+
+2. Xác định runtime/isolation mode có thể dùng.
+3. Tra [Windows container version compatibility](https://learn.microsoft.com/en-us/virtualization/windowscontainers/deploy-containers/version-compatibility) cho đúng host release.
+4. Chọn supported MCR base-image tag.
+5. Build/test trên cùng compatibility matrix với production.
+6. Pin release tag/digest theo supply-chain policy và có rebuild cadence cho servicing updates.
+
+Không dùng `latest` để né compatibility decision.
+
+## Windows runtime stack ở mức khái niệm
+
+Docker Engine trên Windows phối hợp với Windows container platform, gồm Host Compute Service (HCS) và runtime integration để tạo compute system, filesystem layers, network endpoint và process. Low-level implementation/tool names có thể thay đổi theo Engine/container runtime version.
+
+```text
+Docker CLI
+   │ Docker API
+   ▼
+Docker Engine / container runtime
+   │ Windows container APIs
+   ▼
+Host Compute Service
+   ├── process-isolated compute system
+   └── Hyper-V-isolated utility VM
+          │
+          ▼
+Windows application process
+```
+
+Không dùng Linux paths như `/proc/<pid>/ns`, `/sys/fs/cgroup` hoặc `/var/lib/docker/overlay2` để chẩn đoán Windows containers. Dùng Docker inspect/events, Windows Event Logs, HCS/network tooling và Microsoft runbook.
+
+## Filesystem và layers không phải OverlayFS
+
+Windows images vẫn có layered content và writable container state ở object-model level, nhưng implementation không phải Linux OverlayFS. Path, case sensitivity, ACL, reparse point, file sharing và executable semantics thuộc Windows.
+
+Ví dụ Dockerfile Windows:
+
+```dockerfile
+# escape=`
+FROM mcr.microsoft.com/windows/servercore:ltsc2022
+SHELL ["powershell", "-NoLogo", "-Command"]
+RUN Set-Content -Path C:\message.txt -Value 'hello from Windows'
+CMD ["powershell", "-NoLogo", "-Command", "Get-Content C:\\message.txt"]
+```
+
+Build khi daemon ở Windows container mode:
+
+```powershell
+docker build -t local/windows-message:ltsc2022 .
+docker run --rm local/windows-message:ltsc2022
+```
+
+Expected output chứa `hello from Windows`.
+
+Dọn image:
+
+```powershell
+docker image rm local/windows-message:ltsc2022
+```
+
+Windows base images có thể lớn; plan registry bandwidth, node cache, patch/rebuild và disk capacity thay vì so trực tiếp với Alpine.
+
+## Persistent storage và host integration
+
+Windows container có thể dùng volume/bind mount theo Engine/platform support. Host path dùng Windows syntax và permission/ACL phải phù hợp.
+
+Ví dụ bind mount PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force C:\container-data | Out-Null
+docker run --rm `
+  --mount type=bind,source=C:\container-data,target=C:\data `
+  mcr.microsoft.com/windows/servercore:ltsc2022 `
+  cmd /S /C "echo persisted>C:\data\value.txt"
+Get-Content C:\container-data\value.txt
+```
+
+Bind mount xuyên isolation boundary tới host content. Với Hyper-V isolation, sharing được platform dàn xếp nhưng vẫn là host-data exposure. Áp read-only khi có thể, dùng ACL/identity phù hợp và không mount host system directories rộng.
+
+Windows còn hỗ trợ named pipe/device integration trong các scenario nhất định. Những integration này làm tăng quyền/attack surface giống Docker socket hoặc device mount trên Linux; cần review riêng.
+
+## User và quyền trong Windows container
+
+Windows container dùng Windows accounts/tokens và ACL, không dùng Linux UID/GID/capabilities model. Các built-in identities thường gặp trong base images gồm `ContainerUser` và `ContainerAdministrator`, nhưng default user phụ thuộc image.
+
+Kiểm tra identity:
+
+```powershell
+docker run --rm mcr.microsoft.com/windows/servercore:ltsc2022 whoami
+```
+
+Đặt `USER` trong Dockerfile khi image/application support:
+
+```dockerfile
+USER ContainerUser
+```
+
+Chạy non-administrator giảm rủi ro, nhưng phải test file ACL, registry access, certificate stores, port binding, service APIs và startup scripts. Không chuyển sang `ContainerAdministrator` chỉ để bỏ qua ACL error mà chưa hiểu resource bị từ chối.
+
+## Process lifecycle và signal khác Linux
+
+Windows process/control event semantics khác Unix signals. Application phải handle shutdown mechanism mà container platform/runtime gửi cho loại workload tương ứng. Không giả định code chỉ bắt `SIGTERM` trên Linux sẽ graceful shutdown y hệt trong Windows container.
+
+Test thực tế:
+
+1. khởi động application container;
+2. gửi request đang xử lý;
+3. chạy `docker stop` với grace period phù hợp;
+4. đo application có ngừng nhận request và flush state không;
+5. xem exit code, logs và event;
+6. kiểm tra behavior ở cả process/Hyper-V isolation nếu support cả hai.
+
+Windows service-style application, console application và framework hosting model có shutdown behavior khác nhau. Theo documentation của runtime (.NET, IIS, service wrapper) và Windows container version đang dùng.
+
+## Networking
+
+Windows container networking dùng Host Networking Service (HNS) và network drivers/topologies của Windows container platform. Khái niệm port publishing vẫn quen thuộc:
+
+```powershell
+docker run --rm -p 127.0.0.1:8080:80 WINDOWS_WEB_IMAGE
+```
+
+Nhưng implementation/firewall/NAT behavior không nên suy trực tiếp từ Linux bridge/iptables. Khi service không truy cập được, kiểm tra:
+
+- process có listen đúng container interface/port không;
+- container endpoint và network attachment;
+- published host address/port;
+- Windows Firewall/HNS policy;
+- Docker Desktop/VM boundary nếu liên quan;
+- host/image version và isolation mode;
+- DNS behavior trong network scope.
+
+`localhost` vẫn là loopback của network context hiện tại, không tự trỏ tới container khác.
+
+## Lab: quan sát khác biệt process và Hyper-V isolation
+
+Microsoft minh họa rằng process-isolated application process có thể quan sát được từ host, còn Hyper-V-isolated process nằm trong utility VM.
+
+Tạo process-isolated container chạy lâu:
+
+```powershell
+$processContainer = docker run -d --isolation=process `
+  mcr.microsoft.com/windows/servercore:ltsc2022 `
+  ping localhost -t
+
+docker top $processContainer
+Get-Process ping -ErrorAction SilentlyContinue
+```
+
+Tạo Hyper-V-isolated container:
+
+```powershell
+$hypervContainer = docker run -d --isolation=hyperv `
+  mcr.microsoft.com/windows/servercore:ltsc2022 `
+  ping localhost -t
+docker top $hypervContainer
+Get-Process ping -ErrorAction SilentlyContinue
+```
+
+Điểm quan sát mong đợi:
+
+- `docker top` thấy process trong cả hai container;
+- host process list có thể thấy `ping` của process-isolated container;
+- `ping` trong Hyper-V container không xuất hiện như application process trực tiếp trên host vì nằm trong utility VM.
+
+Có thể có process `ping` khác trên host, nên đối chiếu PID/container metadata thay vì chỉ thấy tên. Dọn lab:
+
+```powershell
+docker rm -f $processContainer $hypervContainer
+```
+
+## Troubleshooting theo decision tree
+
+### `no matching manifest`
+
+1. `docker info` cho biết daemon `OSType` nào?
+2. Image index có Windows manifest không?
+3. Architecture đúng không?
+4. Tag MCR có tồn tại và được support không?
+
+Không ép `--platform` sang Windows nếu image không thực sự chứa Windows variant.
+
+### `The operating system of the container does not match...`
+
+1. Ghi host build và image tag/digest.
+2. Xác định `process` hay `hyperv` isolation.
+3. Tra Microsoft compatibility matrix.
+4. Thử supported matching base tag trong lab hoặc Hyper-V isolation nếu use case/support cho phép.
+5. Rebuild application trên supported base image; không patch metadata để che mismatch.
+
+### Container create lỗi ở Hyper-V mode
+
+Kiểm tra virtualization/Hyper-V features, nested virtualization nếu host là VM, available memory, Windows event logs và runtime version. Hyper-V isolation cần infrastructure hỗ trợ; flag đúng không bù được virtualization bị tắt.
+
+### Build/pull rất chậm hoặc hết disk
+
+Windows layers/base images lớn. Kiểm tra:
+
+```powershell
+docker system df -v
+docker image ls
+```
+
+Sau đó xem data-root capacity, registry/network, antivirus scanning policy và layer reuse. Không chạy prune trên host production trước khi hiểu resource references và backup.
+
+### Application chỉ chạy khi administrator
+
+Thu exact `Access is denied` resource, process identity và ACL. Dùng Process Monitor/Windows event/audit tooling phù hợp trong lab nếu cần. Cấp ACL hẹp hoặc sửa image path; không nâng toàn container lên administrator mặc định.
+
+## Production checklist
+
+- Tách node pools/hosts cho Windows và Linux workloads.
+- Pin host release, base image family/tag và isolation mode trong support matrix.
+- Rebuild image theo Windows servicing cadence; scan và test lại.
+- Chọn Hyper-V isolation khi threat model/version compatibility cần, kèm capacity benchmark.
+- Chạy non-administrator khi application cho phép.
+- Giới hạn bind mounts, named pipes và device exposure.
+- Test shutdown, health, logging, backup/restore và node reboot.
+- Thu Docker/HCS/HNS/Windows event logs trước restart.
+- Không áp Linux security controls/paths như seccomp/cgroups vào Windows runbook.
+
+## Tự kiểm tra
+
+1. Linux container trên Windows lấy Linux kernel từ đâu?
+2. Process và Hyper-V isolation khác kernel boundary thế nào?
+3. Vì sao base image tag phải khớp compatibility matrix?
+4. `ContainerUser` khác Linux non-root/capabilities model ra sao?
+5. Khi `no matching manifest`, vì sao phải kiểm tra daemon `OSType` trước?
+
+Bạn đã hoàn thành phần nền tảng. Tiếp theo, [Tổng quan cài đặt Docker](/docs/cai-dat-va-moi-truong/) sẽ dùng platform mental model này để chọn Docker Engine, Docker Desktop, WSL 2 và cấu hình môi trường đúng mục tiêu.
+
+## Nguồn đối chiếu
+
+- [About Windows containers — Microsoft Learn](https://learn.microsoft.com/en-us/virtualization/windowscontainers/about/)
+- [Isolation modes — Microsoft Learn](https://learn.microsoft.com/en-us/virtualization/windowscontainers/manage-containers/hyperv-container)
+- [Windows container version compatibility](https://learn.microsoft.com/en-us/virtualization/windowscontainers/deploy-containers/version-compatibility)
+- [Container base images — Microsoft Learn](https://learn.microsoft.com/en-us/virtualization/windowscontainers/manage-containers/container-base-images)
+- [Windows containers — Docker Docs](https://docs.docker.com/desktop/setup/install/windows-install/)

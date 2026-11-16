@@ -1,0 +1,300 @@
+---
+title: "Process isolation"
+description: "Mental model về process trong container, shared kernel, PID 1, signal, child reaping và quy trình đối chiếu container process với host process."
+---
+
+Một container đang chạy trước hết là **một hoặc nhiều process**. Docker gắn metadata và lifecycle vào nhóm process đó, dựng cho chúng filesystem/network view riêng và áp resource/security controls. Khi process chính kết thúc, container dừng; không có một “máy ảo nhỏ” tiếp tục chạy ngầm bên trong.
+
+Trang này tập trung vào process model. Namespaces, cgroups, capabilities và seccomp sẽ được tách thành các trang sau để tránh nhầm “nhìn khác” với “dùng ít hơn” hoặc “có ít quyền hơn”.
+
+## Process không thay đổi bản chất khi vào container
+
+Process trong Linux container vẫn có các thuộc tính quen thuộc:
+
+- executable code, virtual address space và open file descriptors;
+- PID và parent/child relationship;
+- UID, GID, supplementary groups và capabilities;
+- environment variables, current working directory và umask;
+- signal dispositions;
+- scheduler state và resource accounting;
+- system calls đi vào host kernel.
+
+Runtime không emulation mọi syscall trong mô hình `runc` thông thường. Process user space gọi host kernel giống process khác; namespace và security context làm kernel trả về view/kết quả phù hợp.
+
+```text
+Container user space                   Host
+┌──────────────────────┐
+│ App process          │
+│ libc / runtime       │
+└──────────┬───────────┘
+           │ syscall
+           ▼
+┌──────────────────────────────────────────────┐
+│ Shared Linux kernel                          │
+│ namespace · cgroup · capability · seccomp    │
+│ LSM · filesystem · scheduler · networking    │
+└──────────────────────────────────────────────┘
+```
+
+Hệ quả là kernel version và kernel vulnerability thuộc về host boundary. Image có thể chứa `glibc`, `musl` hoặc user-space tool khác, nhưng Linux image thông thường không chứa một guest Linux kernel được boot riêng.
+
+## Container lifecycle bám vào process chính
+
+Image/runtime configuration xác định command chính từ `ENTRYPOINT`, `CMD` và argument override. Docker tạo container rồi runtime khởi động command đó. Khi command chính còn sống, container thường ở state `running`; khi command exit, container chuyển sang `exited`.
+
+Thử với một process ngắn:
+
+```bash
+docker run --name process-demo alpine:3.20 sh -c \
+  'echo "container pid=$$"; sleep 2; exit 7'
+```
+
+Sau khoảng hai giây, kiểm tra state:
+
+```bash
+docker container inspect process-demo \
+  --format 'status={{.State.Status}} exit={{.State.ExitCode}} pid={{.State.Pid}}'
+```
+
+Expected state là `status=exited`, `exit=7`; PID host không còn chạy và thường được biểu diễn là `0` trong state sau khi exit. Output cụ thể có thể khác theo Engine version.
+
+Dọn lab:
+
+```bash
+docker container rm process-demo
+```
+
+Điều vừa chứng minh là container không cần được “shutdown như một OS” nếu application process đã kết thúc đúng cách. Restart policy có thể yêu cầu daemon tạo lần chạy mới của process, nhưng không làm process cũ sống lại.
+
+## Một process có hai PID nhìn thấy được
+
+PID namespace cho phép cùng process có PID khác nhau theo góc nhìn. Process chính thường thấy mình là PID `1` bên trong container, trong khi host gán một PID khác.
+
+### Thực hành đối chiếu PID
+
+Khởi động container:
+
+```bash
+docker run --name pid-demo -d alpine:3.20 sleep 300
+```
+
+Lấy PID theo metadata Engine:
+
+```bash
+HOST_PID=$(docker inspect --format '{{.State.Pid}}' pid-demo)
+printf 'Host PID: %s\n' "$HOST_PID"
+```
+
+Quan sát từ hai phía:
+
+```bash
+docker exec pid-demo ps -o pid,ppid,comm
+ps -o pid,ppid,comm -p "$HOST_PID"
+```
+
+Output minh họa:
+
+```text
+Trong container: PID 1  sleep
+Trên host:       PID 42718  sleep
+```
+
+Con số `42718` chỉ là ví dụ. Đây là cùng một task trong kernel, không phải hai bản sao process. PID namespace thay đổi PID được process trong namespace nhìn thấy.
+
+Bạn có thể so inode PID namespace:
+
+```bash
+readlink "/proc/$HOST_PID/ns/pid"
+readlink /proc/self/ns/pid
+```
+
+Nếu hai output khác nhau, container process và shell host đang ở PID namespace khác. Command đọc `/proc/$HOST_PID` thường cần chạy trực tiếp trên Linux Docker host và đủ quyền; Docker Desktop host macOS/Windows không cung cấp cùng view.
+
+Dọn lab:
+
+```bash
+docker rm -f pid-demo
+```
+
+## PID 1 là trường hợp đặc biệt
+
+PID 1 trong một PID namespace có trách nhiệm quan trọng với lifecycle process:
+
+1. **Nhận signal đúng cách.** Startup wrapper hoặc shell có thể giữ vai trò PID 1 và không chuyển signal như application mong đợi.
+2. **Reap orphaned children.** Child đã exit cần parent gọi `wait`; nếu bị orphan, PID 1 trong namespace nhận trách nhiệm reaping.
+3. **Quyết định container exit.** Khi PID 1 của PID namespace kết thúc, kernel chấm dứt các process còn lại trong namespace đó.
+
+Đây là lý do command form và process tree quan trọng. So sánh:
+
+```dockerfile
+# Exec form: application trở thành process trực tiếp
+ENTRYPOINT ["/app/server"]
+
+# Shell form: /bin/sh có thể trở thành PID 1
+ENTRYPOINT /app/server
+```
+
+Exec form thường giúp signal đi trực tiếp tới application. Shell form có use case riêng như interpolation hoặc shell operators, nhưng wrapper phải dùng `exec` và forward signal/reap child đúng cách.
+
+Một wrapper tối thiểu nên kết thúc bằng:
+
+```sh
+#!/bin/sh
+set -eu
+# Chuẩn bị configuration...
+exec /app/server "$@"
+```
+
+`exec` thay shell bằng application thay vì tạo thêm một child process.
+
+## Signal và graceful shutdown
+
+`docker stop` không tương đương `docker kill` mặc định. Engine gửi stop signal được cấu hình, mặc định thường là `SIGTERM` trên Linux, đợi timeout rồi mới gửi `SIGKILL` nếu process chưa dừng. Chi tiết signal/default timeout có thể thay đổi theo platform và container configuration, vì vậy kiểm tra `StopSignal`, CLI help và orchestration layer đang dùng.
+
+Luồng shutdown mong muốn:
+
+```text
+docker stop
+    │
+    ├── gửi stop signal tới process chính
+    ▼
+Application ngừng nhận request mới
+    │ hoàn thành work đang xử lý, flush cần thiết
+    ▼
+Process exit trong grace period
+    │
+    └── Container state = exited
+```
+
+Nếu wrapper nuốt signal hoặc application không handle signal, Engine phải dùng `SIGKILL`. `SIGKILL` không thể được catch; application mất cơ hội cleanup. Trong production, grace period phải đủ cho workload và phải được kiểm thử bằng request đang chạy, không chỉ bằng container idle.
+
+Quan sát cấu hình và event:
+
+```bash
+docker inspect --format 'path={{.Path}} args={{json .Args}} stop={{.Config.StopSignal}}' CONTAINER
+docker events --filter type=container --filter container=CONTAINER
+```
+
+Thay `CONTAINER` bằng ID/name thật. `docker events` stream cho đến khi bạn dừng bằng `Ctrl+C`.
+
+## Một service không bắt buộc chỉ có một OS process
+
+Khuyến nghị “một process mỗi container” thường bị hiểu quá cứng. Web server có thể tạo worker process; application có helper child; runtime có garbage collector threads. Điểm thiết kế đúng hơn là **một concern/lifecycle chính mỗi container**.
+
+Nếu container chạy nhiều service không liên quan, bạn phải tự giải quyết:
+
+- service nào quyết định exit code;
+- signal được gửi tới tất cả process thế nào;
+- child nào được restart;
+- logs được đưa ra `stdout`/`stderr` ra sao;
+- healthcheck tổng hợp nghĩa gì;
+- resource và security policy có cần khác nhau không.
+
+Khi process chính không reap child tốt, Docker hỗ trợ `--init` để chèn một init nhỏ làm PID 1:
+
+```bash
+docker run --rm --init IMAGE
+```
+
+Không thêm full init system chỉ để che một entrypoint sai. Trước tiên hãy sửa wrapper bằng `exec`, quản lý signal và xác định lifecycle rõ ràng.
+
+## Isolation có thể được chia sẻ có chủ đích
+
+Container không luôn có mọi namespace riêng. Docker cho phép share một số namespace, ví dụ:
+
+```bash
+docker run --rm --pid host alpine:3.20 ps -ef
+```
+
+Command này cho process trong container dùng host PID namespace và có thể thấy process host trong phạm vi `/proc`/permission cho phép. Đây là thay đổi trực tiếp threat model, không chỉ là option tiện debug.
+
+Tương tự, `--network host`, `--ipc host` hoặc join namespace của container khác làm view được chia sẻ. Khi troubleshooting, đừng chỉ hỏi “container có namespace không”; hãy inspect **namespace mode nào đang được dùng**:
+
+```bash
+docker inspect --format \
+  'pid={{.HostConfig.PidMode}} network={{.HostConfig.NetworkMode}} ipc={{.HostConfig.IpcMode}}' \
+  CONTAINER
+```
+
+Field rỗng có thể biểu diễn default tùy API/version; đối chiếu `docker inspect` đầy đủ và daemon documentation.
+
+## Isolation khác authorization và resource limit
+
+Ba failure scenario sau cho thấy cần tách các layer:
+
+| Triệu chứng | Layer cần kiểm tra trước |
+|---|---|
+| Container chỉ thấy process của chính nó | PID namespace/isolation |
+| Process thấy file nhưng `Operation not permitted` | UID/GID, capabilities, seccomp, LSM, mount flags |
+| Process dùng hết memory rồi bị kill | Cgroup limit, OOM events và application memory |
+
+Một PID namespace riêng không ngăn process dùng hết CPU. `--memory` không che host process. Drop capability không thay đổi PID mapping. Chẩn đoán đúng layer giúp tránh dùng `--privileged` như một cách “thử cho chạy”.
+
+## Ranh giới shared kernel
+
+Container process có thể bị cô lập khỏi process khác nhưng vẫn gửi syscall tới cùng kernel. Security phải kết hợp:
+
+- chạy non-root khi application cho phép;
+- dùng user namespace/rootless mode khi phù hợp;
+- drop capability không cần;
+- giữ default seccomp hoặc profile chặt hơn đã test;
+- bật và duy trì AppArmor/SELinux policy;
+- hạn chế mount, device, Docker socket và namespace sharing;
+- đặt cgroup limits chống resource exhaustion;
+- cập nhật kernel, Engine, containerd và OCI runtime;
+- dùng VM/sandbox runtime cho workload không tin cậy khi threat model yêu cầu.
+
+<Callout type="warn" title="Cảnh báo">
+  Mount `/var/run/docker.sock`, bind mount host root, cấp device nhạy cảm hoặc chạy `--privileged` có thể trao quyền ảnh hưởng host lớn hơn rất nhiều so với container mặc định. “Process có PID 1 riêng” không bù lại các quyền này.
+</Callout>
+
+## Quy trình điều tra process lifecycle
+
+Khi container exit sớm hoặc không stop graceful, thu thập evidence theo thứ tự:
+
+1. Xem state và exit metadata:
+
+```bash
+docker inspect --format '{{json .State}}' CONTAINER
+```
+
+2. Xem command thực tế:
+
+```bash
+docker inspect --format 'path={{.Path}} args={{json .Args}}' CONTAINER
+```
+
+3. Đọc log, ghi rõ logging driver có hỗ trợ `docker logs` hay không:
+
+```bash
+docker logs --timestamps CONTAINER
+```
+
+4. Nếu còn running, xem process tree:
+
+```bash
+docker top CONTAINER -eo pid,ppid,user,stat,comm,args
+```
+
+5. Reproduce stop trong môi trường test và đo thời gian/signal behavior.
+6. Chỉ thay restart policy sau khi hiểu exit cause; restart loop có thể che lỗi và tạo load liên tục.
+
+`exitCode=137` thường gợi ý process kết thúc do `SIGKILL`, nhưng không tự chứng minh OOM. Kiểm tra `.State.OOMKilled`, daemon/kernel events và cgroup memory events trước khi kết luận.
+
+## Tự kiểm tra
+
+1. Vì sao PID 1 trong container và PID host có thể chỉ cùng một process?
+2. Điều gì xảy ra với container khi process chính exit?
+3. Vì sao shell-form entrypoint có thể làm graceful shutdown lỗi?
+4. “Một process mỗi container” nên được hiểu thế nào?
+5. Vì sao PID namespace riêng không phải security boundary đầy đủ?
+
+Tiếp theo, [Linux namespaces](/docs/nen-tang-container/linux-namespaces/) phân tích từng isolated view mà runtime có thể tạo quanh process này.
+
+## Nguồn đối chiếu
+
+- [PID namespaces — Linux manual](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html)
+- [Linux namespaces overview](https://man7.org/linux/man-pages/man7/namespaces.7.html)
+- [Run multiple processes in a container — Docker Docs](https://docs.docker.com/engine/containers/multi-service_container/)
+- [`docker container stop` reference](https://docs.docker.com/reference/cli/docker/container/stop/)
+- [OCI Runtime Specification](https://github.com/opencontainers/runtime-spec)

@@ -1,0 +1,209 @@
+---
+title: "Process trong container"
+description: "Quan sát process tree của container bằng docker top, inspect, exec và stats; hiểu PID namespace, PID 1, zombie process, thread count và giới hạn của việc debug từ host."
+---
+
+Container chạy được vì có ít nhất một process chính. Khi process chính kết thúc, container chuyển sang `exited`, dù bên trong từng có nhiều child process. Vì vậy, quan sát process tree là bước nền tảng khi chẩn đoán container “vừa chạy đã tắt”, stop không graceful, CPU cao, PID tăng bất thường hoặc zombie process.
+
+Docker cung cấp hai góc nhìn bổ sung:
+
+- `docker container inspect` cho biết PID chính trên host, lifecycle state và cấu hình command;
+- `docker container top` gọi cơ chế tương tự `ps` để hiển thị process đang chạy trong container.
+
+Không lẫn `docker top` với `docker stats`: `top` trả danh sách process, còn `stats` trả số liệu resource tổng hợp của container.
+
+## PID namespace và PID 1
+
+Trong PID namespace riêng, process chính thường thấy mình là PID 1 bên trong container. Trên host, cùng process đó có một PID khác. Docker expose host PID qua `.State.Pid`:
+
+```bash
+docker container inspect CONTAINER \
+  --format 'state={{.State.Status}} host-pid={{.State.Pid}} path={{.Path}} args={{json .Args}}'
+```
+
+PID 1 có hai hệ quả vận hành quan trọng:
+
+1. Docker gửi stop signal đến process chính này.
+2. Trên Linux, PID 1 cần xử lý signal và reap child process đúng cách; nếu không, child kết thúc có thể thành zombie.
+
+Nếu Dockerfile dùng shell form hoặc wrapper không `exec`, PID 1 có thể là `/bin/sh` thay vì application. Khi đó signal có thể không đến server như bạn nghĩ. Phần [Stop, kill và restart](/docs/container-lifecycle/stop-kill-restart/) giải thích chi tiết signal flow.
+
+## Dùng `docker container top`
+
+Cú pháp:
+
+```text
+docker container top CONTAINER [ps OPTIONS]
+```
+
+Ví dụ cơ bản:
+
+```bash
+docker container top api
+```
+
+Trên Linux, có thể truyền option kiểu `ps` để chọn cột dễ đọc:
+
+```bash
+docker container top api -eo pid,ppid,user,stat,etime,args
+```
+
+Ý nghĩa các cột thường dùng:
+
+| Cột | Cần nhìn gì |
+|---|---|
+| `PID` | PID trên host mà Docker/daemon thấy |
+| `PPID` | Quan hệ parent-child, giúp phát hiện wrapper hoặc process mồ côi |
+| `USER` | User effective của process, không nhất thiết là user name có trong image |
+| `STAT` | State process; `Z` thường là zombie trên Linux |
+| `ETIME` | Process đã chạy bao lâu |
+| `ARGS` | Command thực tế, bao gồm wrapper và argument |
+
+`ps OPTIONS` phụ thuộc platform và implementation phía daemon. Nếu command chạy trên Docker Desktop, remote daemon hoặc Windows container, output/cột có thể khác. Trong script portable, ưu tiên `inspect` cho field có cấu trúc và dùng `top` cho chẩn đoán tương tác.
+
+## Lab: nhìn process tree và wrapper
+
+Tạo container có wrapper shell sinh một child chạy lâu:
+
+```bash
+docker container run --detach \
+  --name lifecycle-process-demo \
+  --label com.example.lab=processes-and-top \
+  alpine:3.22 \
+  sh -c 'echo "wrapper=$$"; sleep 300 & wait'
+```
+
+Xem PID chính và command đã lưu:
+
+```bash
+docker container inspect lifecycle-process-demo \
+  --format 'host-pid={{.State.Pid}} path={{.Path}} args={{json .Args}}'
+```
+
+Xem process tree:
+
+```bash
+docker container top lifecycle-process-demo -eo pid,ppid,user,stat,args
+```
+
+Bạn sẽ thấy shell wrapper và child `sleep`. Nếu image production vô tình có mô hình này, `docker stop` gửi signal đến shell; shell có forward/thoát đúng hay không phụ thuộc script.
+
+Kiểm tra từ bên trong namespace:
+
+```bash
+docker container exec lifecycle-process-demo sh -c 'echo "inside-pid=$$"; ps -o pid,ppid,user,stat,args'
+```
+
+PID nhìn từ trong container có thể khác PID trên host. Đó là behavior đúng của PID namespace.
+
+Cleanup:
+
+```bash
+docker container rm --force lifecycle-process-demo
+```
+
+## `exec` tạo process phụ, không thay thế PID 1
+
+Khi chạy:
+
+```bash
+docker container exec api sh
+```
+
+Docker tạo một process mới trong namespaces/cgroups của container đang chạy. Process này có thể đọc filesystem, network namespace và environment lúc create, nhưng nó không trở thành process chính của container. Nếu PID 1 exit, container dừng và các exec process không giữ container sống theo cách đáng tin cậy.
+
+Do đó, dùng `exec` để debug, không dùng để “khởi động service bị thiếu” trong production. Nếu cần process bắt buộc, hãy sửa image hoặc entrypoint rồi recreate container.
+
+## Zombie process và khi nào cần `--init`
+
+Zombie là child đã exit nhưng parent chưa `wait()` để thu dọn exit status. Một vài zombie ngắn hạn có thể bình thường; số lượng tăng liên tục là dấu hiệu PID 1 hoặc process manager trong container không reap child đúng.
+
+Tìm dấu hiệu trên Linux:
+
+```bash
+docker container top api -eo pid,ppid,user,stat,args
+```
+
+Process có `STAT` chứa `Z` là zombie. Nếu application sinh child process và không reap được, cân nhắc:
+
+- sửa application để xử lý child lifecycle;
+- dùng exec form để application thật là PID 1 nếu nó đã làm đúng;
+- thêm `--init` để Docker chạy một init nhỏ có nhiệm vụ forward signal và reap zombie.
+
+```bash
+docker container run --init app:1.0
+```
+
+`--init` không sửa business logic, không restart child process và không thay thế graceful shutdown handler.
+
+## Quan sát thread/PID pressure bằng `docker stats`
+
+`docker container stats` có cột `PIDS`, biểu diễn số process hoặc kernel thread mà container tạo. Con số này có thể cao hơn số dòng bạn thấy trong `ps` vì thread cũng được tính.
+
+```bash
+docker container stats --no-stream api
+```
+
+Nếu `PIDS` tăng nhanh trong khi `top` chỉ thấy vài process, nghi ngờ thread leak, connection pool tạo thread không giới hạn hoặc runtime sinh worker quá nhiều. Kết hợp với giới hạn `--pids-limit` nếu cần bảo vệ host:
+
+```bash
+docker container run --pids-limit 256 app:1.0
+```
+
+Giới hạn PID là guardrail, không phải fix cho leak. Khi chạm limit, application có thể không fork/thread mới được và lỗi theo cách khó đoán nếu không có metric/alert.
+
+## Khi nào dùng host PID namespace
+
+`--pid=host` cho process trong container thấy process namespace của host. Đây là pattern hữu ích cho debug toolbox như `strace`, `gdb` hoặc node exporter đặc biệt, nhưng làm mờ ranh giới isolation:
+
+```bash
+docker container run --rm -it --pid=host alpine:3.22 sh
+```
+
+Không dùng `--pid=host` cho application thông thường. Container có thể quan sát nhiều process hơn cần thiết, PID không còn cô lập như mặc định và rủi ro security/debug nhầm scope tăng lên.
+
+## Troubleshooting theo triệu chứng
+
+### Container stop không graceful
+
+Kiểm tra PID 1 và child:
+
+```bash
+docker container top CONTAINER -eo pid,ppid,user,stat,args
+docker container inspect CONTAINER \
+  --format 'path={{.Path}} args={{json .Args}} stop-signal={{.Config.StopSignal}}'
+```
+
+Nếu PID 1 là shell wrapper, sửa Dockerfile/script để dùng exec form hoặc `exec /app/server "$@"`.
+
+### `docker top` không trả process
+
+Container có thể không chạy, đang paused hoặc daemon/platform không hỗ trợ output mong muốn:
+
+```bash
+docker container inspect CONTAINER \
+  --format 'status={{.State.Status}} paused={{.State.Paused}} error={{json .State.Error}}'
+```
+
+Nếu state là `exited`, dùng logs/inspect/exit code thay vì cố exec hoặc top.
+
+### PIDS tăng bất thường
+
+Thu snapshot lặp lại để xác định xu hướng:
+
+```bash
+for i in 1 2 3; do
+  docker container stats --no-stream api
+  docker container top api -eo pid,ppid,user,stat,args | head -50
+  sleep 10
+done
+```
+
+Sau đó liên hệ metric application: request concurrency, thread pool, worker process và dependency timeout. Đừng chỉ restart nếu chưa capture evidence.
+
+## Nguồn chính thức
+
+- [docker container top](https://docs.docker.com/reference/cli/docker/container/top/)
+- [docker container stats](https://docs.docker.com/reference/cli/docker/container/stats/)
+- [docker container exec](https://docs.docker.com/reference/cli/docker/container/exec/)
+- [docker container run và PID settings](https://docs.docker.com/reference/cli/docker/container/run/)

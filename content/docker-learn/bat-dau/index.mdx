@@ -1,0 +1,117 @@
+---
+title: "Lộ trình học Docker"
+description: "Cách sử dụng bộ tài liệu Docker theo lộ trình từ mental model, thực hành container đầu tiên đến build, networking, storage, security và vận hành production."
+---
+
+Docker dễ bắt đầu bằng một lệnh, nhưng dùng Docker đúng đòi hỏi nhiều hơn việc ghi nhớ command. Bạn cần phân biệt image với container, hiểu dữ liệu nào sẽ mất khi container bị xóa, biết traffic đi qua đâu và nhận ra ranh giới bảo mật giữa container với host.
+
+Phần **Bắt đầu** xây mental model đó trước khi đi vào cài đặt và cấu hình chi tiết. Sau khi hoàn thành phần này, bạn có thể giải thích một lệnh `docker run` đã tạo ra những gì, tự chạy và dọn dẹp một web container, đồng thời biết mình đã đủ nền tảng để đi tiếp hay chưa.
+
+## Bạn sẽ học được gì?
+
+Phần này dẫn bạn qua bốn kết quả chính:
+
+1. **Hiểu Docker giải quyết vấn đề nào:** đóng gói application cùng runtime dependencies thành image và chạy image dưới dạng container.
+2. **Phân biệt các khái niệm dễ nhầm:** container với virtual machine, image với container, registry với repository, `Dockerfile` với Compose file.
+3. **Quan sát một lifecycle hoàn chỉnh:** pull image, create và start container, publish port, đọc trạng thái, stop rồi remove resource.
+4. **Biết học tiếp ở đâu:** xác định mốc tiếp theo trong curriculum thay vì đọc mọi trang theo cùng một độ sâu.
+
+<Callout type="info" title="Lưu ý">
+  Bạn chưa cần biết Docker trước khi đọc phần này. Kinh nghiệm dùng terminal, hiểu file và directory, port TCP cùng mô hình client-server sẽ giúp thực hành thuận lợi hơn. Trang [Kiểm tra kiến thức nền](/docs/bat-dau/kiem-tra-kien-thuc-nen/) giúp bạn xác định phần cần ôn.
+</Callout>
+
+## Trật tự đọc đề xuất
+
+Các trang được sắp theo thứ tự từ khái niệm đến thao tác:
+
+| Bước | Trang | Câu hỏi trang trả lời |
+|---|---|---|
+| 1 | [Docker là gì?](/docs/bat-dau/docker-la-gi/) | Docker đóng gói và chạy application như thế nào? |
+| 2 | [Container và virtual machine](/docs/bat-dau/container-va-virtual-machine/) | Hai mô hình cách ly khác nhau ở đâu và khi nào dùng mỗi mô hình? |
+| 3 | [Hệ sinh thái Docker](/docs/bat-dau/he-sinh-thai-docker/) | Engine, CLI, Desktop, Build, Compose và registry liên hệ với nhau ra sao? |
+| 4 | [Thuật ngữ Docker quan trọng](/docs/bat-dau/thuat-ngu-quan-trong/) | Những từ nào cần hiểu chính xác trước khi đọc command và cấu hình? |
+| 5 | [Ứng dụng container đầu tiên](/docs/bat-dau/ung-dung-container-dau-tien/) | Một container web đi từ image đến request trong browser như thế nào? |
+| 6 | [Kiểm tra kiến thức nền](/docs/bat-dau/kiem-tra-kien-thuc-nen/) | Bạn đã sẵn sàng thực hành và còn thiếu kiến thức nền nào? |
+
+Nếu hoàn toàn mới, hãy đọc theo thứ tự trên. Nếu đã từng chạy container, bạn có thể làm bài kiểm tra trước, sau đó quay lại những phần trả lời chưa chắc chắn.
+
+## Mental model xuyên suốt tài liệu
+
+Hầu hết workflow Docker có thể đọc theo chuỗi sau:
+
+```text
+┌────────────────────────────┐
+│ Source code + dependencies │
+└──────────────┬─────────────┘
+               │ docker build
+               ▼
+        ┌─────────────┐       docker push       ┌────────────┐
+        │    Image    │ ──────────────────────▶ │  Registry  │
+        │             │ ◀────────────────────── │            │
+        └──────┬──────┘       docker pull       └────────────┘
+               │ docker run
+               ▼
+        ┌─────────────┐
+        │  Container  │
+        └──────┬──────┘
+               ├─ Network: nhận và gửi traffic
+               ├─ Storage: giữ hoặc chia sẻ dữ liệu
+               └─ Logs / metrics / events
+```
+
+Điểm quan trọng nhất là **image không phải container**. Image là package bất biến dùng làm đầu vào. Container là một instance có cấu hình runtime, process, network và writable layer riêng. Một image có thể tạo ra nhiều container; xóa container không tự động xóa image.
+
+Khi application có nhiều thành phần, Compose mô tả tập container, network và volume trong một file YAML. Khi cần triển khai trên nhiều máy hoặc điều phối ở quy mô lớn, bạn cần học thêm orchestrator như Docker Swarm hoặc Kubernetes; Docker Engine đơn lẻ không tự giải quyết toàn bộ bài toán đó.
+
+## Cách học để không chỉ nhớ command
+
+Với mỗi ví dụ trong tài liệu, nên thực hiện đủ bốn bước:
+
+1. **Dự đoán:** trước khi chạy, nói rõ object nào sẽ được tạo hoặc thay đổi.
+2. **Thực thi:** chạy command trong môi trường thử nghiệm, không dùng production host.
+3. **Xác minh:** dùng `docker ps`, `docker inspect`, `docker logs`, browser hoặc một request để kiểm tra kết quả.
+4. **Dọn dẹp:** xóa container, network, volume hoặc image không còn cần; kiểm tra lại thay vì giả định command đã thành công.
+
+Ví dụ, đừng chỉ thấy trang web hiện ra rồi kết luận “Docker chạy được”. Hãy kiểm tra container nào đang phục vụ, host port ánh xạ tới container port nào, process còn chạy không và điều gì xảy ra sau khi stop container.
+
+<Callout type="warn" title="Quan trọng">
+  Command Docker có thể tác động đến host, mở port ra network, gắn host directory hoặc cấp quyền cao cho process. Không thêm `--privileged`, không mount Docker socket và không copy command xóa dữ liệu khi chưa hiểu từng option.
+</Callout>
+
+## Các mốc trong toàn bộ curriculum
+
+Sau phần **Bắt đầu**, curriculum được chia thành các mốc có đầu ra quan sát được:
+
+### Mốc 1: Nền tảng và môi trường
+
+Bạn hiểu process isolation, namespaces, cgroups và runtime, sau đó cài Docker phù hợp với Linux, Windows/WSL2 hoặc macOS. Kết quả cần đạt là cả Docker client và daemon đều hoạt động, không chỉ command `docker` tồn tại.
+
+Tiếp tục với [Nền tảng container](/docs/nen-tang-container/) và [Cài đặt và môi trường](/docs/cai-dat-va-moi-truong/).
+
+### Mốc 2: Làm chủ image và container
+
+Bạn sử dụng CLI có chủ đích, đọc inspect output, viết `Dockerfile`, hiểu layer/cache và quản lý lifecycle. Kết quả cần đạt là build được image có thể tái tạo, chạy được container và giải thích được trạng thái của chúng.
+
+Tiếp tục với [Docker CLI](/docs/docker-cli/), [Images và Dockerfile](/docs/images-va-dockerfile/) và [Container lifecycle](/docs/container-lifecycle/).
+
+### Mốc 3: Application có state và nhiều service
+
+Bạn kết nối container qua network, chọn volume hoặc bind mount phù hợp và mô tả application nhiều service bằng Compose. Kết quả cần đạt là dữ liệu sống qua lần thay container và các service tìm thấy nhau mà không hard-code địa chỉ IP động.
+
+Tiếp tục với [Storage](/docs/storage/), [Networking](/docs/networking/) và [Docker Compose](/docs/docker-compose/).
+
+### Mốc 4: Phân phối, bảo mật và vận hành
+
+Bạn push/pull image qua registry, kiểm soát trust boundary, đặt resource limit, thu thập logs/metrics và xây quy trình backup, upgrade, rollback. Kết quả cần đạt là một workload không chỉ “chạy được” mà còn có thể kiểm chứng, bảo vệ và phục hồi.
+
+Tiếp tục với [Registry và distribution](/docs/registry-va-distribution/), [Security](/docs/security/) và [Production operations](/docs/production-operations/).
+
+## Phạm vi của bộ tài liệu
+
+Tài liệu tập trung vào Docker Engine, Docker CLI, Docker Build/BuildKit, Docker Compose và workflow image/registry. Các phần Swarm, Kubernetes và công cụ thay thế được trình bày để bạn hiểu ranh giới, tích hợp và chiến lược chuyển đổi.
+
+Tài liệu không giả định một cấu hình duy nhất đúng cho mọi production system. Quyết định về rootless mode, storage driver, network topology, orchestrator hay registry phải dựa trên operating system, threat model, workload, yêu cầu availability và khả năng vận hành thực tế.
+
+## Bắt đầu ngay
+
+Nếu chưa có mental model về Docker, mở [Docker là gì?](/docs/bat-dau/docker-la-gi/). Nếu Docker đã được cài và daemon đang chạy, bạn có thể đi thẳng đến [Ứng dụng container đầu tiên](/docs/bat-dau/ung-dung-container-dau-tien/), nhưng nên quay lại các trang khái niệm khi một term hoặc bước trong lifecycle chưa rõ.

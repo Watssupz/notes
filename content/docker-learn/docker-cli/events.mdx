@@ -1,0 +1,272 @@
+---
+title: "Theo dõi Docker events"
+description: "Capture event lifecycle từ daemon theo time window, type, action và label; xuất JSON Lines và hiểu giới hạn để dùng đúng trong troubleshooting, audit và automation."
+---
+
+`docker events` (alias của `docker system events`) mở stream event từ Docker daemon. Event giúp nối timeline giữa hành động như create, start, kill, die, destroy, network connect, image pull và daemon reload.
+
+```bash
+docker events
+```
+
+Command tiếp tục chờ event mới đến khi nhấn `Ctrl-C`, hết `--until` hoặc connection bị ngắt.
+
+<Callout type="warn" title="Event stream không phải audit log bền vững">
+  Daemon chỉ trả tối đa 256 event lịch sử gần nhất theo official CLI reference. Restart, tải lớn hoặc khoảng thời gian dài có thể làm mất event cần điều tra. Muốn audit/retention, stream event sang hệ thống lưu trữ có monitoring và access control.
+</Callout>
+
+## Event chứa gì?
+
+Một event thường có:
+
+- timestamp;
+- object type (`container`, `image`, `volume`, `network`, `daemon`, `service`...);
+- action/status (`create`, `start`, `die`, `destroy`...);
+- actor ID;
+- attributes như name, image, label, exit code hoặc signal.
+
+Event type và action khác nhau theo object. Ví dụ container có `create`, `start`, `die`, `oom`, `health_status`, `destroy`; volume có `create`, `mount`, `unmount`, `destroy`.
+
+Không phải event nào cũng có cùng field. Consumer phải branch theo `Type`/`Action` và xử lý attribute optional.
+
+## Lab quan sát lifecycle
+
+Dùng hai terminal cùng context. Xác minh trước:
+
+```bash
+docker context show
+```
+
+Terminal 1, mở stream có time bound:
+
+```bash
+docker events \
+  --filter 'container=events-lab' \
+  --filter 'type=container' \
+  --until '10m'
+```
+
+Terminal 2, tạo và chạy container:
+
+```bash
+docker container create \
+  --name events-lab \
+  --label com.example.lab=events \
+  alpine:latest sh -c 'echo event-ok; exit 0'
+
+docker container start --attach events-lab
+docker container rm events-lab
+```
+
+Terminal 1 sẽ thấy một phần sequence như `create → start → die → destroy`; có thể có thêm action tùy CLI/runtime. Event `die` chứa exit information trong attributes trên Engine hỗ trợ.
+
+Nếu quên mở stream trước, truy vấn history gần:
+
+```bash
+docker events \
+  --since '10m' \
+  --until '0s' \
+  --filter 'container=events-lab'
+```
+
+`--until '0s'` tạo upper bound tại thời điểm command, để command trả về thay vì tiếp tục follow.
+
+## Time window
+
+`--since` và `--until` chấp nhận nhiều dạng:
+
+```bash
+docker events --since '30m' --until '0s'
+docker events --since '2026-06-01T10:00:00Z' --until '2026-06-01T10:15:00Z'
+docker events --since '1780308000' --until '1780308900'
+```
+
+Official reference hỗ trợ Unix timestamp, timestamp định dạng ngày và Go duration. Với relative duration, thời gian được tính theo clock của **client**. Timestamp không có timezone dùng local timezone client.
+
+Trong incident:
+
+- dùng UTC RFC3339 có `Z` để tránh mơ hồ;
+- ghi clock source và kiểm tra clock skew giữa client/daemon/log system;
+- đừng yêu cầu window quá rộng rồi giả định đủ dữ liệu vì history cap 256 event.
+
+## Filter theo type, action và actor
+
+Cú pháp:
+
+```bash
+docker events --filter 'KEY=VALUE'
+```
+
+Các key được official reference hỗ trợ gồm `type`, `event`, `container`, `image`, `volume`, `network`, `daemon`, `label`, `scope` và các Swarm object.
+
+Ví dụ chỉ container die/OOM:
+
+```bash
+docker events \
+  --filter 'type=container' \
+  --filter 'event=die' \
+  --filter 'event=oom'
+```
+
+Hai value cùng key `event` hoạt động kiểu OR; `type=container` kết hợp kiểu AND.
+
+Theo project label:
+
+```bash
+docker events \
+  --filter 'type=container' \
+  --filter 'label=com.example.project=checkout'
+```
+
+Theo hai container:
+
+```bash
+docker events \
+  --filter 'container=api-a' \
+  --filter 'container=api-b'
+```
+
+Name có thể được reuse. Khi cần timeline chính xác của một instance, capture immutable container ID từ inspect/list và filter theo ID.
+
+## Local scope và Swarm scope
+
+Event có scope `local` hoặc `swarm` tùy object. Local event chỉ thấy trên node nơi action xảy ra; Swarm-scoped event thấy trên manager theo behavior được document.
+
+```bash
+docker events --filter 'scope=local'
+docker events --filter 'scope=swarm'
+```
+
+Một event stream từ một node không phải toàn bộ distributed audit trail. Với Swarm, cần biết context trỏ manager nào và object/event scope nào được thu.
+
+## Output cho người và máy
+
+### Template text
+
+```bash
+docker events \
+  --filter 'type=container' \
+  --format 'time={{.Time}} type={{.Type}} action={{.Action}} id={{.ID}}'
+```
+
+Field support phụ thuộc event formatter/version. Khám phá bằng JSON trước.
+
+### JSON Lines
+
+```bash
+docker events --format '{{json .}}'
+```
+
+Hoặc trên CLI hỗ trợ directive:
+
+```bash
+docker events --format json
+```
+
+Mỗi event là một JSON object trên một dòng. Lưu có time bound:
+
+```bash
+umask 077
+docker events \
+  --since '0s' \
+  --until '15m' \
+  --format '{{json .}}' >docker-events.jsonl
+```
+
+File có thể chứa hostname, object name, label và image reference nhạy cảm. Áp retention, permission và redaction policy.
+
+Phân tích offline:
+
+```bash
+jq -c 'select(.Type == "container") | {time: .timeNano, action: .Action, actor: .Actor.ID}' \
+  docker-events.jsonl
+```
+
+Schema/case field có thể khác theo API version. Inspect sample từ environment thật trước khi viết jq cố định.
+
+## Dùng events trong incident response
+
+Workflow evidence-first:
+
+1. Xác minh context và UTC time.
+2. Capture `docker events --since ... --until ...` ngay khi có thể.
+3. Lấy `docker inspect`, logs và daemon logs trước recreate/delete.
+4. Correlate bằng immutable ID và timestamp, không chỉ bằng name.
+5. Đánh dấu gap do 256-event limit hoặc stream disconnect.
+6. Sau mitigation, xác minh event/state mới và lưu evidence theo policy.
+
+Ví dụ container restart loop:
+
+```bash
+container_id=$(docker container inspect web --format '{{.Id}}')
+
+docker events \
+  --since '15m' \
+  --until '0s' \
+  --filter "container=$container_id" \
+  --format '{{json .}}' >web-events.jsonl
+
+docker container inspect "$container_id" >web-inspect.json
+docker container logs --timestamps --tail 500 "$container_id" >web.log 2>&1
+```
+
+Không chạy `docker rm -f` trước capture nếu việc xóa làm mất state/log cần phân tích.
+
+## Dùng events cho automation: giới hạn cần thiết kế
+
+Event-driven worker phải xử lý:
+
+- reconnect khi daemon/network ngắt;
+- duplicate event sau resume;
+- missing event do retention cap hoặc downtime;
+- out-of-order processing giữa nhiều nguồn;
+- name reuse;
+- idempotency của action downstream;
+- backpressure và bounded queue;
+- authorization của Docker socket.
+
+Pattern an toàn là dùng event như **trigger**, rồi đọc current state bằng inspect/API và reconcile. Không coi một event đơn lẻ là toàn bộ truth.
+
+Pseudo-flow:
+
+```text
+Receive event → validate type/action → deduplicate by identity
+→ inspect current object → compare desired policy → act idempotently
+→ record result/checkpoint → reconnect from bounded time window
+```
+
+Nếu requirement là guaranteed durable delivery, Docker event stream một mình không cung cấp message broker semantics.
+
+## Troubleshooting
+
+### Không thấy event
+
+```bash
+docker context show
+docker version
+docker events --since '5m' --until '0s'
+```
+
+Kiểm tra đúng daemon, filter có quá chặt, event đã quá history cap, và action xảy ra trước/ngoài window không.
+
+### Command không kết thúc
+
+Không có `--until` nghĩa là tiếp tục stream. Thêm upper bound hoặc dùng OS-level timeout có xử lý signal:
+
+```bash
+docker events --since '5m' --until '0s'
+```
+
+### Time lệch log application
+
+Chuẩn hóa UTC, kiểm tra NTP/clock skew và phân biệt event time với log ingestion time. Relative duration dựa client clock.
+
+### JSON parser báo invalid array
+
+Event output là JSON Lines, không phải một JSON array. Dùng `jq -c` theo line hoặc `jq -s` để slurp thành array khi file đủ nhỏ.
+
+## Nguồn chính thức
+
+- [docker system events](https://docs.docker.com/reference/cli/docker/system/events/)
+- [Docker Engine API events endpoint](https://docs.docker.com/reference/api/engine/)
+- [Docker CLI formatting](https://docs.docker.com/go/formatting/)

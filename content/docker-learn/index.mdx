@@ -1,0 +1,130 @@
+---
+title: "Docker từ cơ bản đến chuyên sâu"
+description: "Lộ trình học Docker bằng tiếng Việt, giải thích từ khái niệm nền tảng đến build image, chạy container, bảo mật và vận hành production."
+---
+
+Docker giúp bạn đóng gói ứng dụng cùng runtime và dependency vào **image**, sau đó chạy image đó thành **container** trên laptop, CI hoặc server. Tài liệu này được viết theo hướng học từng bước: hiểu khái niệm trước, thực hành bằng lệnh cụ thể, rồi mới đi vào vận hành và tối ưu.
+
+Mục tiêu của bộ tài liệu không phải là liệt kê mọi option của Docker. Mục tiêu chính là giúp bạn trả lời được các câu hỏi thực tế:
+
+- Docker giải quyết vấn đề gì trong development, CI/CD và production?
+- Image khác container ở đâu?
+- Khi chạy `docker run`, Docker thật sự làm những bước nào?
+- Dữ liệu trong container được lưu ở đâu và mất khi nào?
+- Network, volume, user, capability và resource limit ảnh hưởng gì tới ứng dụng?
+- Khi container lỗi, nên kiểm tra theo thứ tự nào để không đoán mò?
+
+## Cách đọc tài liệu này
+
+Nếu bạn mới bắt đầu, hãy đọc theo thứ tự sidebar từ trên xuống. Các chương đầu giải thích khái niệm bằng ví dụ nhỏ; các chương sau mở rộng sang build, lifecycle, storage, network, security và production.
+
+Nếu bạn đã dùng Docker rồi, có thể đọc theo nhu cầu:
+
+| Bạn cần làm gì? | Nên đọc phần nào? |
+|---|---|
+| Hiểu Docker là gì và vì sao dùng Docker | Bắt đầu |
+| Hiểu container dựa trên cơ chế Linux nào | Nền tảng container |
+| Cài Docker Engine và kiểm tra môi trường | Cài đặt và môi trường |
+| Dùng CLI hiệu quả hơn | Docker CLI |
+| Viết Dockerfile và tối ưu image | Images và Dockerfile |
+| Quản lý container đang chạy | Container lifecycle |
+| Lưu dữ liệu bền vững | Storage |
+| Kết nối container và publish port | Networking |
+| Chạy nhiều service local | Docker Compose |
+| Đưa image lên registry | Registry và distribution |
+| Giảm rủi ro bảo mật | Security |
+| Debug lỗi container | Observability và troubleshooting |
+| Chuẩn bị chạy production | Production operations |
+
+## Quy ước giải thích trong tài liệu
+
+Tài liệu ưu tiên cách viết dễ hiểu và gần với công việc hằng ngày:
+
+- Dùng câu ngắn, hạn chế nói trừu tượng.
+- Thuật ngữ tiếng Anh được giữ nguyên khi đó là tên kỹ thuật, ví dụ `image`, `container`, `registry`, `volume`, `namespace`.
+- Mỗi thuật ngữ quan trọng sẽ được giải thích bằng vai trò thực tế, không chỉ dịch từng chữ.
+- Lệnh mẫu có thể chạy được trong môi trường phù hợp, kèm cảnh báo nếu lệnh có thể xóa dữ liệu hoặc thay đổi host.
+- Nội dung nâng cao luôn cố gắng trả lời câu hỏi: “Điều này ảnh hưởng gì tới ứng dụng của tôi?”
+
+Ví dụ, thay vì chỉ nói “container là môi trường cách ly”, tài liệu sẽ giải thích rõ hơn: container là một process được Docker chạy với filesystem, network, mount, user và resource configuration riêng. Cách giải thích này giúp bạn biết cần kiểm tra gì khi container không hoạt động như mong đợi.
+
+## Lộ trình học đề xuất
+
+### Giai đoạn 1: Nắm mental model
+
+Đọc các phần sau trước:
+
+1. [Docker là gì?](/docs/bat-dau/docker-la-gi/)
+2. [Container và virtual machine](/docs/bat-dau/container-va-virtual-machine/)
+3. [Thuật ngữ quan trọng](/docs/bat-dau/thuat-ngu-quan-trong/)
+4. [Ứng dụng container đầu tiên](/docs/bat-dau/ung-dung-container-dau-tien/)
+
+Sau giai đoạn này, bạn nên phân biệt được image, container, registry, volume, bind mount, port publishing và Docker daemon.
+
+### Giai đoạn 2: Dùng Docker trong công việc hằng ngày
+
+Tiếp theo, tập trung vào CLI, Dockerfile và vòng đời container:
+
+1. Docker CLI để biết cấu trúc lệnh, format output, inspect và filter.
+2. Images và Dockerfile để build image dễ cache, nhỏ hơn và dễ kiểm tra hơn.
+3. Container lifecycle để hiểu `run`, `start`, `stop`, `logs`, `exec`, healthcheck và cleanup.
+
+Khi học phần này, hãy chạy lệnh thật trên môi trường test. Chỉ đọc lệnh mà không chạy sẽ khó hình dung Docker thay đổi image store, container state, network và volume như thế nào.
+
+### Giai đoạn 3: Hiểu dữ liệu, network và bảo mật
+
+Khi ứng dụng bắt đầu có database, file upload hoặc nhiều service, hãy đọc tiếp:
+
+- Storage: khi nào dùng volume, bind mount hoặc tmpfs.
+- Networking: vì sao `localhost` trong container không phải luôn là host.
+- Security: vì sao không nên chạy container mặc định với quyền quá rộng.
+- Resource: cách giới hạn CPU, memory, process count và I/O.
+
+Đây là nhóm kiến thức giúp tránh lỗi phổ biến khi chuyển từ demo sang môi trường dùng thật.
+
+### Giai đoạn 4: Vận hành và mở rộng
+
+Cuối cùng, đọc các chủ đề production, CI/CD, Compose, Swarm, Kubernetes và troubleshooting. Các phần này dùng khi bạn cần:
+
+- build image trong pipeline;
+- promote image qua nhiều môi trường;
+- rollback phiên bản lỗi;
+- thu thập logs, metrics và debug bundle;
+- thiết kế backup, restore và disaster recovery;
+- chuyển workload Docker sang Kubernetes hoặc platform khác.
+
+## Những nguyên tắc cần nhớ sớm
+
+<Callout type="info" title="Tóm tắt ngắn">
+  Docker giúp đóng gói và chạy ứng dụng nhất quán hơn, nhưng không tự giải quyết hết backup, bảo mật, high availability, monitoring hoặc rollback. Các phần đó vẫn cần thiết kế riêng.
+</Callout>
+
+| Nguyên tắc | Giải thích dễ hiểu |
+|---|---|
+| Image nên bất biến | Build image một lần, test image đó, rồi deploy đúng image đã test. |
+| Container có thể bị xóa | Không lưu dữ liệu quan trọng trong writable layer của container. |
+| Config đi bên ngoài image | Dùng env, file config, secret hoặc platform config thay vì hard-code vào image. |
+| `localhost` phụ thuộc network namespace | Bên trong container, `localhost` thường là chính container đó. |
+| Root trong container vẫn là rủi ro | Giảm quyền bằng `USER`, capability, read-only filesystem và policy phù hợp. |
+| Tag không bất biến | `nginx:latest` hôm nay và ngày mai có thể trỏ tới content khác nhau. |
+
+## Cách tự kiểm tra sau mỗi chương
+
+Sau khi đọc một chương, hãy tự trả lời 3 câu:
+
+1. Chủ đề này giải quyết lỗi hoặc nhu cầu thực tế nào?
+2. Có lệnh nào mình có thể chạy để kiểm chứng không?
+3. Nếu cấu hình sai, hậu quả dễ gặp nhất là gì?
+
+Nếu trả lời được ba câu này bằng lời của mình, bạn đã hiểu đủ để chuyển sang chương tiếp theo. Nếu chưa, hãy quay lại phần ví dụ, bảng so sánh hoặc lab của chương đó.
+
+## Trạng thái nội dung
+
+Một số nhóm tài liệu đã có nội dung chi tiết; một số nhóm khác vẫn là khung để bổ sung dần. Khi đọc thấy trang chỉ có mô tả ngắn mà chưa có phần giải thích, hãy xem đó là trang đang chờ viết, không phải nội dung hoàn chỉnh.
+
+Thứ tự ưu tiên hoàn thiện nên là:
+
+1. Docker Compose, Storage và Networking vì đây là nhu cầu dùng hằng ngày.
+2. Security và Observability vì ảnh hưởng trực tiếp tới môi trường thật.
+3. Registry, CI/CD và Production operations để hoàn thiện đường đi từ build đến deploy.
+4. Kubernetes, Swarm, Docker internals và hệ sinh thái thay thế cho phần nâng cao.

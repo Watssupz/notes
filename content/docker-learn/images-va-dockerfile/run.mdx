@@ -1,0 +1,264 @@
+---
+title: "RUN"
+description: "Dùng RUN để tạo filesystem layer có thể tái lập, xử lý shell failure, package manager, cache, secret, network và cleanup đúng trong BuildKit."
+---
+
+`RUN` thực thi command trong build stage và lưu filesystem changes của operation làm input cho bước tiếp theo. Nó không đặt command mặc định khi container chạy; nhiệm vụ đó thuộc `CMD` và `ENTRYPOINT`.
+
+```dockerfile
+# Shell form
+RUN <command>
+
+# Exec form
+RUN ["executable", "arg1", "arg2"]
+```
+
+Một `RUN` thành công cần ba thuộc tính: command trả exit status đúng, output filesystem đủ để stage sau dùng và build có thể tái lập từ input được khai báo.
+
+## Shell form và exec form
+
+Shell form trên Linux mặc định chạy qua `/bin/sh -c`:
+
+```dockerfile
+RUN apk add --no-cache curl \
+    && curl --version
+```
+
+Shell xử lý variable expansion, glob, redirect, `&&` và pipe. Base image quyết định `/bin/sh` là implementation nào; không giả định Bash syntax có sẵn.
+
+Exec form gọi executable trực tiếp:
+
+```dockerfile
+RUN ["/bin/sh", "-c", "printf '%s\n' \"$HOME\""]
+```
+
+Exec form vẫn cần gọi shell rõ ràng nếu muốn expansion/pipe. JSON array bắt buộc nháy đôi và escape đúng.
+
+## Failure phải dừng đúng chỗ
+
+Dùng `&&` khi bước sau chỉ hợp lệ nếu bước trước thành công:
+
+```dockerfile
+RUN command-one \
+    && command-two \
+    && command-three
+```
+
+Dùng `;` sẽ chạy command sau dù command trước lỗi, và exit status cuối có thể che failure. Với pipe:
+
+```dockerfile
+RUN wget -O - https://example.invalid/artifact | sha256sum
+```
+
+Nhiều `/bin/sh` chỉ trả status của command cuối; `wget` fail nhưng consumer vẫn có thể trả `0`. Nếu shell hỗ trợ `pipefail`:
+
+```dockerfile
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN wget -O - https://example.invalid/artifact | sha256sum
+```
+
+Không cài Bash chỉ để dùng một pipe nếu có cách tốt hơn như `ADD --checksum`, package manager verification hoặc tải file rồi verify trong các command nối bằng `&&`.
+
+Heredoc phù hợp script nhiều dòng:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+RUN <<'EOF'
+set -eu
+mkdir -p /opt/app
+printf '%s\n' 'ready' > /opt/app/status
+EOF
+```
+
+## Cài package trong một layer nhất quán
+
+Debian/Ubuntu:
+
+```dockerfile
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates \
+       curl \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+Lý do:
+
+- update và install cùng cache boundary, tránh reuse package index cũ;
+- `--no-install-recommends` giảm dependency không cần;
+- xóa list trong cùng instruction để dữ liệu không còn trong exported layer.
+
+Alpine:
+
+```dockerfile
+RUN apk add --no-cache ca-certificates curl
+```
+
+Không dùng `upgrade` toàn distribution một cách mù quáng trong application image. Chọn base đã vá và rebuild định kỳ thường dễ audit hơn; nếu policy yêu cầu package upgrade, test compatibility và ghi rõ update strategy.
+
+Package version pin tăng reproducibility nhưng phải đi kèm quy trình bump. Repository upstream có thể xóa version cũ; lock bằng version không bảo đảm artifact luôn còn hoặc đáng tin.
+
+## Xóa ở `RUN` sau không làm layer trước nhỏ lại
+
+Anti-pattern:
+
+```dockerfile
+RUN curl -o /tmp/tool.tar.gz https://example.com/tool.tar.gz
+RUN tar -xzf /tmp/tool.tar.gz -C /usr/local/bin
+RUN rm /tmp/tool.tar.gz
+```
+
+Archive vẫn tồn tại trong blob của layer đầu. Gộp download, verification, extract và cleanup:
+
+```dockerfile
+ARG TOOL_SHA256
+RUN curl --fail --location --output /tmp/tool.tar.gz https://example.com/tool.tar.gz \
+    && echo "$TOOL_SHA256  /tmp/tool.tar.gz" | sha256sum --check - \
+    && tar -xzf /tmp/tool.tar.gz -C /usr/local/bin \
+    && rm -f /tmp/tool.tar.gz
+```
+
+`TOOL_SHA256` không phải secret và phải lấy từ trusted release metadata. Cách tốt hơn nữa có thể dùng multi-stage để download/extract trong builder rồi chỉ `COPY` artifact đã cần vào final stage.
+
+## `RUN --mount`: input tạm thời không bake vào layer
+
+BuildKit mount tồn tại trong thời gian một `RUN`.
+
+### Cache mount
+
+```dockerfile
+# syntax=docker/dockerfile:1
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --requirement requirements.txt
+```
+
+Cache mount tăng tốc nhưng có thể bị GC hoặc chia sẻ. Build phải đúng với cache rỗng.
+
+### Bind mount từ context
+
+```dockerfile
+RUN --mount=type=bind,source=requirements.txt,target=/tmp/requirements.txt,ro \
+    pip install --requirement /tmp/requirements.txt
+```
+
+File mount không được giữ trong final layer. Dùng khi operation cần đọc input nhưng image không cần giữ file. Source vẫn phải nằm trong context/named context và tham gia cache rule.
+
+### Secret mount
+
+```dockerfile
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc,required=true \
+    npm ci
+```
+
+Build command:
+
+```bash
+docker build --secret id=npmrc,src="$HOME/.npmrc" .
+```
+
+Secret không được ghi vào layer nếu command không copy/log nó. Builder không thể ngăn process độc hại tự gửi secret ra network hoặc ghi vào output; chỉ dùng Dockerfile/dependency đáng tin và giới hạn network.
+
+### SSH mount
+
+```dockerfile
+RUN --mount=type=ssh,required=true \
+    git clone git@github.com:example/private-repo.git /src/private
+```
+
+Forward agent/socket thay vì `COPY` private key. Pin host key và commit; không dùng `ssh-keyscan` qua network không tin cậy như một trust bootstrap không được review.
+
+Đọc chi tiết tại [Cache mounts](/docs/buildkit/cache-mounts/) và [Secret/SSH mounts](/docs/buildkit/secret-and-ssh-mounts/).
+
+## Kiểm soát network của từng step
+
+```dockerfile
+RUN --network=none ./run-offline-tests
+```
+
+`--network=none` chứng minh step không cần external network, hữu ích sau khi dependency đã được fetch/pin. `--network=host` cần entitlement và mở rộng trust boundary; không bật chỉ để xử lý DNS/proxy lỗi. Remote builder chạy ở host khác nên `localhost` trong build không nhất thiết là laptop gọi CLI.
+
+Build có network không bảo đảm reproducibility: remote URL, package index hoặc mutable branch có thể đổi. Pin artifact/checksum và lưu provenance.
+
+## User của `RUN`
+
+`USER` tác động các `RUN` sau nó:
+
+```dockerfile
+RUN addgroup -S -g 10001 app \
+    && adduser -S -D -H -u 10001 -G app app
+WORKDIR /app
+RUN chown 10001:10001 /app
+USER 10001:10001
+RUN id && touch writable-by-app
+```
+
+Cài package hoặc chỉnh system path thường cần root; thực hiện sớm rồi chuyển sang non-root. Không switch root/app nhiều lần nếu có thể chuẩn bị ownership bằng `COPY --chown`.
+
+## Cache và tính “mới nhất”
+
+```dockerfile
+RUN apt-get update && apt-get install -y curl
+```
+
+Command string không đổi có thể hit cache tuần sau; package repository thay đổi không tự invalidate. Chọn một trong các policy:
+
+- clean rebuild định kỳ với `--pull --no-cache` để lấy snapshot mới;
+- pin version/lockfile rồi cập nhật bằng PR;
+- cache-bust theo trusted dependency revision;
+- import external cache chỉ trong trust boundary phù hợp.
+
+Không dùng `RUN date` hoặc random value để phá cache. Input cache phải biểu diễn dependency thực.
+
+## Xác minh output của `RUN`
+
+Build log:
+
+```bash
+docker build --progress=plain --tag run-lab:test .
+```
+
+Kiểm tra file/package trong image bằng container tạm:
+
+```bash
+docker run --rm --entrypoint sh run-lab:test -c '
+  set -eu
+  test -f /opt/app/status
+  cat /opt/app/status
+'
+```
+
+Với image không có shell, dùng stage test trước final `scratch`/distroless hoặc copy artifact ra bằng build output. Không thêm shell vào production chỉ để CI test.
+
+Đọc history/size:
+
+```bash
+docker image history --no-trunc run-lab:test
+docker image inspect run-lab:test --format '{{.Size}}'
+```
+
+Không đưa token trực tiếp vào command line/log. `history` không phải security scanner nhưng có thể làm lộ argument đã bake.
+
+## Troubleshooting
+
+### Exit code `127`
+
+Shell không tìm thấy command. Kiểm tra package có được cài trong đúng stage, `PATH`, architecture và tên binary. Với exec form, command phải tồn tại đúng path; không có shell fallback.
+
+### `permission denied`
+
+Kiểm tra current `USER`, executable bit, ownership của parent directories và mount options. `COPY --chmod=755`/`--chown` thường rõ hơn `RUN chmod` sau copy.
+
+### Build treo ở package download
+
+Bật `--progress=plain`; kiểm tra proxy, DNS, CA, remote builder network và package repository. Không đổi sang `--network=host` trước khi xác định trust/entitlement impact.
+
+### Step cũ vẫn `CACHED`
+
+Package mới trên internet không phải input cache. Dùng `--no-cache-filter <stage>` hoặc update version/lockfile có chủ đích; đọc [Image layers và cache](/docs/images-va-dockerfile/layers-and-cache/).
+
+## Nguồn chính thức
+
+- [`RUN` reference](https://docs.docker.com/reference/dockerfile/#run)
+- [`RUN --mount`](https://docs.docker.com/reference/dockerfile/#run---mount)
+- [Dockerfile best practices](https://docs.docker.com/build/building/best-practices/)
+- [Build cache invalidation](https://docs.docker.com/build/cache/invalidation/)

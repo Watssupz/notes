@@ -1,10 +1,13 @@
 import {
   BookOpen,
   Coffee,
+  Container,
   Cpu,
   Database,
   InfinityIcon,
   KeyRound,
+  MessageCircleQuestion,
+  MessageSquareText,
   type LucideIcon,
 } from "lucide-react";
 
@@ -73,6 +76,13 @@ export const sections: Section[] = [
     title: "Interview Questions",
     meta: "Bộ câu hỏi",
     group: "web",
-    icon: Cpu,
+    icon: MessageSquareText,
+  },
+  {
+    id: "docker-learn",
+    title: "Docker",
+    meta: "Live • Core",
+    group: "infra",
+    icon: Container,
   },
 ];

@@ -1,0 +1,120 @@
+---
+title: "Host network"
+description: "Hiểu hệ quả khi container share host network namespace: không có IP riêng, publish port bị bỏ qua, port conflict và isolation giảm."
+---
+
+`--network host` cho process container dùng network stack của host thay vì namespace mạng riêng. Container không nhận endpoint IP riêng; socket mà application bind xuất hiện trực tiếp trong host port space.
+
+```text
+Bridge mode: container socket :80 -> NAT/publish -> host :8080
+Host mode:   container process bind trực tiếp host :80
+```
+
+<Callout type="warn" title="Boundary bị thu hẹp">
+  Host mode bỏ network isolation, không bỏ filesystem, PID hoặc các isolation khác. Tuy nhiên process có thể nhìn host interfaces, routes và dùng chung port space; hãy threat-model như một host process về mặt network.
+</Callout>
+
+## Behavior chính
+
+- `-p`, `--publish`, `-P` bị bỏ qua và Docker phát warning.
+- `127.0.0.1` trong container là host loopback.
+- Một port chỉ có thể được bind theo quy tắc socket thông thường trên host.
+- Không có container IP để peer gọi.
+- Firewall áp vào host traffic path, không phải bridge publish path.
+- Performance có thể tránh NAT/userland proxy overhead, nhưng cần benchmark workload thật.
+
+## Platform support
+
+Host driver hỗ trợ Docker Engine trên Linux. Docker Desktop 4.34 trở lên có host networking dạng opt-in cho Linux containers, nhưng implementation chạy qua Desktop VM và có giới hạn riêng, chủ yếu ở layer 4 TCP/UDP. Không suy luận Desktop behavior giống native Linux cho protocol dưới L4 hoặc interface access.
+
+Kiểm tra platform và feature trước khi viết config dùng chung cho team.
+
+## Lab trên Linux
+
+Đảm bảo host port `8080` chưa được dùng:
+
+```bash
+ss -lnt 'sport = :8080'
+```
+
+Chạy Nginx ở host mode. Image mặc định listen port `80`, vì vậy lab cần host port `80` trống:
+
+```bash
+docker run -d --name host-net-web \
+  --network host \
+  nginx:1.29-alpine
+```
+
+Xác minh:
+
+```bash
+curl http://127.0.0.1:80/
+sudo ss -lntp 'sport = :80'
+docker inspect host-net-web \
+  --format 'mode={{.HostConfig.NetworkMode}} networks={{json .NetworkSettings.Networks}}'
+```
+
+Thử publish cho thấy mapping không có tác dụng:
+
+```bash
+docker run --rm --network host -p 8080:80 alpine:3.23 true
+```
+
+Expected warning:
+
+```text
+Published ports are discarded when using host network mode
+```
+
+## Khi nào cân nhắc
+
+| Use case | Lý do | Trade-off |
+|---|---|---|
+| Network monitoring/troubleshooting agent | Cần quan sát host stack | Tăng visibility và blast radius |
+| Server dùng dải port động rất lớn | Tránh hàng nghìn mapping | Port collision, policy phức tạp |
+| Latency/throughput đã đo là bottleneck do NAT path | Data path ngắn hơn | Mất endpoint isolation |
+| Swarm service host mode | Bind trực tiếp từng node | Chỉ một task/port trên mỗi node |
+
+Không dùng host mode chỉ để application trong container gọi service host qua `localhost`. Trên Docker Desktop có `host.docker.internal`; trên Linux có thể dùng `--add-host host.docker.internal:host-gateway` hoặc thiết kế route rõ ràng. Chọn theo platform và threat boundary.
+
+## Port conflict và scheduling
+
+Nếu host đã có process listen `0.0.0.0:80`, container host-mode thường fail bind cùng address/port. Kiểm tra cả IPv4, IPv6 và UDP:
+
+```bash
+sudo ss -lntup
+```
+
+Trong Swarm, service host-mode publish hoặc application bind trực tiếp giới hạn số task dùng cùng port trên một node. Cần placement constraint hoặc global service phù hợp.
+
+## Security guidance
+
+- Giữ capabilities tối thiểu; host network không đòi `--privileged` cho application bình thường.
+- Không thêm `NET_ADMIN`/`NET_RAW` nếu không cần.
+- Review service listen trên `0.0.0.0`/`::`; nó có thể expose trên mọi host NIC.
+- Áp host firewall rõ ràng và test packet path.
+- Không kỳ vọng Docker bridge isolation hoặc `DOCKER-USER` bảo vệ host-mode traffic.
+- Dùng read-only observation trước khi chạy network tool thay đổi route/firewall.
+
+## Troubleshooting
+
+```bash
+docker inspect CONTAINER --format '{{.HostConfig.NetworkMode}}'
+docker exec CONTAINER ss -lntup
+sudo ss -lntup
+ip address
+ip route
+```
+
+Nếu host truy cập được nhưng remote client không được, kiểm tra bind address, host firewall, cloud security group và upstream route. `docker port CONTAINER` không hữu ích vì không có mapping.
+
+## Cleanup
+
+```bash
+docker rm -f host-net-web 2>/dev/null || true
+```
+
+## Nguồn chính thức
+
+- [Host network driver](https://docs.docker.com/engine/network/drivers/host/)
+- [Networking overview](https://docs.docker.com/engine/network/)

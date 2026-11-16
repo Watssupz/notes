@@ -1,0 +1,227 @@
+---
+title: "Container logs"
+description: "Đọc và follow stdout/stderr bằng docker logs, lọc theo time window và tail, hiểu ảnh hưởng của logging driver/TTY, bảo vệ dữ liệu nhạy cảm và xử lý lỗi không có log."
+---
+
+`docker container logs` đọc log mà logging driver của container cung cấp cho Docker. Với mô hình phổ biến, đây là dữ liệu process chính ghi vào `STDOUT` và `STDERR`:
+
+```bash
+docker container logs api
+```
+
+Command không tự quét mọi file trong filesystem container. Nếu application chỉ ghi `/var/log/app.log`, `docker logs` có thể trống dù file đó đang tăng.
+
+## Data path cần hình dung
+
+```text
+application PID 1
+  ├─ STDOUT ─┐
+  └─ STDERR ─┴─> logging driver ─> local/remote destination
+                                      └─> docker logs (nếu driver/read path hỗ trợ)
+```
+
+Logging behavior phụ thuộc driver và option effective. Kiểm tra trước khi chẩn đoán:
+
+```bash
+docker container inspect api \
+  --format 'driver={{.HostConfig.LogConfig.Type}} options={{json .HostConfig.LogConfig.Config}}'
+```
+
+Driver `none` vô hiệu hóa container logs. Với remote driver, khả năng đọc lại bằng `docker logs`, local cache và failure behavior phụ thuộc driver/configuration; xem [Logging drivers](/docs/observability-va-troubleshooting/logging-drivers/).
+
+## Đọc lượng log có giới hạn
+
+Không gọi toàn bộ lịch sử của container lâu ngày theo thói quen. Bắt đầu bằng tail có timestamp:
+
+```bash
+docker container logs \
+  --timestamps \
+  --tail 200 \
+  api
+```
+
+`--tail` tính theo dòng mà driver trả về, không theo byte hoặc event nghiệp vụ. Stack trace/multiline event có thể chiếm nhiều dòng.
+
+Follow log mới:
+
+```bash
+docker container logs --follow --tail 50 api
+```
+
+`--follow` đọc phần lịch sử được chọn trước, rồi tiếp tục stream log mới đến khi nhấn `Ctrl+C`, đạt `--until`, container/daemon connection kết thúc theo behavior tương ứng.
+
+## Lọc theo thời gian
+
+Relative window:
+
+```bash
+docker container logs --since 15m --until 0s api
+```
+
+UTC RFC3339 giúp correlate nhiều system mà không mơ hồ timezone:
+
+```bash
+docker container logs \
+  --since '2026-07-21T03:00:00Z' \
+  --until '2026-07-21T03:15:00Z' \
+  --timestamps \
+  api
+```
+
+CLI hỗ trợ RFC3339/RFC3339Nano, Unix timestamp và Go duration theo command reference. Timestamp không có `Z` hoặc offset được diễn giải theo local timezone của client. Trong incident, ghi rõ timezone và kiểm tra clock skew giữa client, daemon host, application và log backend.
+
+### Kết hợp follow với deadline
+
+```bash
+docker container logs \
+  --follow \
+  --since 5m \
+  --until 2m \
+  --timestamps \
+  api
+```
+
+Ví dụ này stream đến upper bound tương đối thay vì chạy vô hạn. Đây là pattern hữu ích cho script thu evidence có thời lượng giới hạn.
+
+## Timestamp và application timestamp
+
+`--timestamps` thêm timestamp RFC3339Nano do logging path cung cấp. Application cũng có thể ghi timestamp trong message, tạo hai clock:
+
+```text
+2026-07-21T03:04:05.123456789Z 2026-07-21T10:04:05+07:00 request completed
+^ Docker/logging timestamp              ^ application timestamp
+```
+
+Chúng có thể lệch do buffering, clock skew hoặc timezone. Dùng timestamp ngoài để lọc/correlate ingestion, nhưng giữ application timestamp/trace ID để hiểu business flow.
+
+## STDOUT, STDERR và TTY
+
+Không cấp TTY, Docker stream protocol có thể phân biệt stdout và stderr cho client phù hợp. Khi container chạy với `--tty`, pseudo-TTY thường gộp hai stream; parser downstream không nên dựa vào channel để suy severity.
+
+Application production nên ghi record có cấu trúc, ví dụ JSON Lines, với field như level, message, request/trace ID và timestamp. Không thêm ANSI color khi output không phải terminal; color code làm parser và search khó hơn.
+
+Redirect output trên shell client:
+
+```bash
+docker container logs --timestamps api >api.log 2>&1
+```
+
+File được tạo trên máy chạy Docker CLI, không ở daemon host nếu context là remote. `2>&1` cũng thu diagnostic của CLI; khi cần tách evidence/data, thiết kế stdout/stderr handling rõ trong script.
+
+## `--details` không tự hiển thị mọi metadata
+
+```bash
+docker container logs --details --tail 50 api
+```
+
+`--details` thêm attributes như label/environment **được cấu hình cho logging driver bằng log options**, không phải toàn bộ container inspect. Metadata có thể chứa tenant, hostname, image hoặc giá trị nhạy cảm; review trước khi export.
+
+## Lab: tail, time window và stderr
+
+Tạo workload ghi một dòng mỗi giây, trong đó dòng thứ 7 đi vào stderr:
+
+```bash
+docker container run --detach \
+  --name lifecycle-logs-demo \
+  --label com.example.lab=container-logs \
+  alpine:3.22 \
+  sh -c 'i=1; while [ "$i" -le 30 ]; do echo "count=$i"; if [ "$i" -eq 7 ]; then echo "demo-warning" >&2; fi; i=$((i + 1)); sleep 1; done'
+```
+
+Đọc năm dòng gần nhất:
+
+```bash
+docker container logs --tail 5 lifecycle-logs-demo
+```
+
+Thêm timestamp:
+
+```bash
+docker container logs --timestamps --tail 5 lifecycle-logs-demo
+```
+
+Theo dõi có upper bound:
+
+```bash
+docker container logs \
+  --follow \
+  --tail 3 \
+  --until 5s \
+  lifecycle-logs-demo
+```
+
+Sau khi process kết thúc, xác minh exit state và vẫn đọc được history nếu logging driver giữ log:
+
+```bash
+docker container wait lifecycle-logs-demo
+docker container inspect lifecycle-logs-demo \
+  --format 'status={{.State.Status}} exit={{.State.ExitCode}}'
+docker container logs lifecycle-logs-demo
+```
+
+Cleanup:
+
+```bash
+docker container rm --force lifecycle-logs-demo
+```
+
+## Logging production: các quyết định phải tường minh
+
+### Rotation và disk budget
+
+Local logs không giới hạn có thể lấp đầy Docker data root. Cấu hình rotation/retention trên daemon hoặc từng container theo driver, rồi tạo alert cho disk usage. Thay đổi default daemon thường chỉ áp dụng cho container tạo sau thay đổi; cần recreate để nhận config mới theo tài liệu driver.
+
+Inventory:
+
+```bash
+docker system df
+docker container inspect api --format '{{json .HostConfig.LogConfig}}'
+```
+
+Không chỉnh/xóa trực tiếp file dưới Docker data root khi daemon đang quản lý.
+
+### Backpressure và mất log
+
+Logging mode/driver quyết định application bị block khi destination chậm hay log được buffer/drop theo giới hạn. Không có lựa chọn đúng cho mọi workload:
+
+- audit/security event có thể ưu tiên durability nhưng phải ngăn logging outage kéo sập service;
+- high-volume debug log có thể chấp nhận sampling/drop có đo lường;
+- mọi mode cần metric cho queue, drop, delivery error và disk pressure nếu driver/backend cung cấp.
+
+### Secret và dữ liệu cá nhân
+
+Không log access token, password, cookie, full request body hoặc environment dump. Redact ở application trước khi record đi vào driver; xóa sau khi đã ship không thu hồi được mọi bản sao ở cache/backend/ticket.
+
+## Troubleshooting theo bằng chứng
+
+### `docker logs` trống
+
+Kiểm tra theo thứ tự:
+
+```bash
+docker container inspect api \
+  --format 'status={{.State.Status}} driver={{.HostConfig.LogConfig.Type}} path={{.LogPath}}'
+docker container inspect api \
+  --format 'path={{.Path}} args={{json .Args}} tty={{.Config.Tty}}'
+```
+
+Sau đó xác định application có ghi stdout/stderr không, driver có read path không, container đã chạy đủ lâu chưa và context có trỏ đúng daemon không. Đừng kết luận “application không có lỗi” chỉ vì command trống.
+
+### Thiếu log cũ
+
+Khả năng gồm rotation/retention, container đã bị xóa/recreate, driver/backend drop, time filter sai timezone hoặc đang xem instance khác dùng lại name. Correlate bằng immutable container ID và deployment timestamp.
+
+### Follow bị ngắt
+
+`docker logs --follow` không phải durable subscription. Client/daemon/network có thể disconnect. Automation cần reconnect có time cursor, deduplication và source of truth ở logging backend; tránh coi terminal stream là log pipeline production.
+
+### Dòng log bị trộn hoặc multiline khó parse
+
+Concurrent writer, TTY và stack trace multiline đều làm line-oriented parser khó correlate. Ghi JSON một event trên một dòng hoặc thêm stable request/trace ID. Không sửa bằng regex ngày càng phức tạp nếu application có thể phát structured log.
+
+## Nguồn chính thức
+
+- [docker container logs](https://docs.docker.com/reference/cli/docker/container/logs/)
+- [View container logs](https://docs.docker.com/engine/logging/)
+- [Configure logging drivers](https://docs.docker.com/engine/logging/configure/)
+- [Logging driver delivery mode](https://docs.docker.com/engine/logging/configure/#configure-the-delivery-mode-of-log-messages-from-container-to-log-driver)

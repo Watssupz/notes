@@ -1,0 +1,350 @@
+---
+title: "Container runtime"
+description: "Kiến trúc Docker Engine, containerd, shim, runc, snapshotter và alternative runtimes; trace lifecycle và troubleshooting theo đúng layer."
+---
+
+“Container runtime” có thể chỉ nhiều layer khác nhau. `runc` là low-level OCI runtime tạo process theo runtime bundle; containerd là daemon quản lý content, snapshots và task lifecycle; Docker Engine cung cấp API/object/network/build integration ở mức cao hơn.
+
+Dùng một từ “runtime” cho mọi layer làm troubleshooting mơ hồ. Trang này tách trách nhiệm và theo một container từ `docker run` đến process.
+
+## Bản đồ stack Docker trên Linux
+
+```text
+Docker CLI / SDK
+        │ Docker API
+        ▼
+dockerd
+  ├── Docker objects, auth, networking, volumes
+  ├── image/reference và API compatibility
+  └── yêu cầu container lifecycle
+        │
+        ▼
+containerd
+  ├── content/image metadata
+  ├── snapshotter
+  ├── task lifecycle
+  └── runtime/shim integration
+        │
+        ▼
+containerd shim
+  ├── giữ runtime/process I/O và lifecycle boundary
+  └── gọi OCI runtime
+        │
+        ▼
+runc (default OCI runtime)
+  ├── đọc OCI bundle/config
+  ├── namespaces, mounts, cgroups
+  ├── capabilities, seccomp, LSM context
+  └── tạo/khởi động process
+        │
+        ▼
+Application process dùng host kernel
+```
+
+Docker documentation hiện nêu Engine dùng containerd cho container lifecycle và containerd mặc định dùng `runc`. Component/version/default có thể thay đổi; lấy `docker info`, package inventory và daemon logs trên host thực tế làm evidence.
+
+## Trách nhiệm từng layer
+
+### Docker CLI
+
+CLI parse user-facing options và gọi Docker API. Nó có thể chạy trên máy khác daemon qua context/SSH/TLS. CLI không trực tiếp gọi `runc` để tạo container trong workflow Engine bình thường.
+
+```bash
+docker context show
+docker version
+```
+
+`docker version` tách Client và Server. Khi CLI mới nói chuyện với daemon cũ, API negotiation và feature support có thể ảnh hưởng behavior.
+
+### Docker daemon (`dockerd`)
+
+Daemon quản lý Docker object model:
+
+- image references, containers, networks, volumes;
+- port publishing/network driver integration;
+- API authorization boundary;
+- runtime configuration từ CLI/API;
+- logging/restart/health metadata;
+- giao tiếp với containerd và các subsystem.
+
+Quyền truy cập Docker API thường tương đương quyền mạnh trên host vì người dùng có thể yêu cầu privileged container, mount host path hoặc device. Docker socket là control-plane credential, không phải một file IPC vô hại.
+
+### containerd
+
+containerd là high-level container runtime daemon trong stack này. Trách nhiệm gồm:
+
+- quản lý content/image metadata;
+- unpack image qua snapshotter;
+- quản lý containers/tasks;
+- gọi runtime qua shim API;
+- expose API cho client cấp trên.
+
+Containerd cũng có thể được platform khác dùng trực tiếp qua integration riêng, không cần Docker object model. Nhưng Docker-managed container metadata không nên được sửa bằng `ctr`/tool containerd bên dưới; hai control planes có thể không đồng bộ.
+
+### Snapshotter
+
+Snapshotter chuẩn bị mountable root filesystem snapshots từ image layers và writable state. Ví dụ implementation có OverlayFS snapshotter, nhưng contract cho phép backend khác.
+
+Snapshot lifecycle khác content lifecycle: blob có thể còn trong content store trong khi một snapshot đã bị remove, hoặc nhiều snapshots tham chiếu cùng content. Không xóa disk directory thủ công.
+
+### Shim
+
+Shim là process/integration boundary giữa containerd và runtime task. Nó cho phép task I/O/lifecycle được quản lý mà không buộc low-level runtime binary chạy thường trực cho mỗi container, đồng thời giúp containerd daemon restart/upgrade không nhất thiết làm application process chết ngay.
+
+Implementation và process tree thay đổi theo runtime/shim version. Không viết monitoring rule chỉ dựa trên một tên process cứng; dùng supported APIs và process metadata.
+
+### `runc`
+
+`runc` là OCI runtime implementation phổ biến. Nó nhận bundle/config, thực hiện create/start/kill/delete theo OCI lifecycle và thiết lập Linux container primitives.
+
+`runc` không phải full image manager hoặc registry client. Nó không tự pull `nginx:alpine`, resolve tag, tạo Docker bridge hay quản lý named volume. Những việc đó thuộc layer cao hơn.
+
+## Trace một `docker run`
+
+Xét:
+
+```bash
+docker run --name runtime-demo -d \
+  --memory 128m \
+  --read-only \
+  --cap-drop ALL \
+  alpine:3.20 sleep 300
+```
+
+Luồng khái niệm:
+
+1. CLI resolve Docker context và gửi create request cho daemon.
+2. Daemon kiểm tra local image metadata; nếu thiếu, nó lấy manifest/blobs qua registry flow.
+3. Image manager/containerd verify content và chuẩn bị snapshot từ layers.
+4. Daemon tạo Docker configuration cho mount, network, cgroup, process và security.
+5. containerd tạo task qua shim/runtime phù hợp.
+6. OCI runtime dựng namespaces/mounts, join cgroup, set credentials/capabilities/seccomp và start `sleep`.
+7. Runtime process setup hoàn tất; shim/containerd theo dõi task; daemon báo container `running`.
+8. Khi `sleep` exit hoặc bị signal, task báo exit status; Docker cập nhật state/restart policy theo configuration.
+
+Inspect các layer được expose qua Docker:
+
+```bash
+docker inspect runtime-demo
+docker top runtime-demo -eo pid,ppid,user,stat,comm,args
+docker stats --no-stream runtime-demo
+docker events --filter container=runtime-demo
+```
+
+Dọn lab:
+
+```bash
+docker rm -f runtime-demo
+```
+
+`docker events` là stream; chạy ở terminal khác và dừng bằng `Ctrl+C`.
+
+## Image, container và task không phải cùng object
+
+Trong runtime stack có nhiều lifecycle:
+
+| Object | Ý nghĩa |
+|---|---|
+| Image content/metadata | Artifact và references để chuẩn bị filesystem/config |
+| Snapshot | Filesystem state đã unpack/ghép, có thể read-only hoặc writable |
+| Container metadata | Runtime configuration/identity trước hoặc ngoài process đang chạy |
+| Task | Process runtime đang chạy cùng I/O/status |
+| Docker container | Product-level object gom config, state, mounts, network, logs và metadata |
+
+Một Docker container `exited` vẫn tồn tại dù task/process đã hết. Image vẫn tồn tại sau khi container bị remove. Snapshot/content cleanup dựa trên references và garbage collection, không chỉ process state.
+
+## Low-level runtime không chạy daemon mãi mãi
+
+`runc` thường được invoke để thực hiện operation rồi command process của `runc` kết thúc; container application tiếp tục chạy. Shim giữ boundary để high-level runtime tương tác với task. Vì vậy, không kết luận container “không dùng runc” chỉ vì không thấy một `runc` process thường trực.
+
+Khi điều tra:
+
+```bash
+ps -ef | grep -E 'dockerd|containerd|shim|runc'
+```
+
+chỉ là snapshot hỗ trợ. Nhiều operation `runc` rất ngắn và có thể không xuất hiện. Dùng daemon debug logs/events hoặc tracing có kiểm soát nếu cần trace create path.
+
+## Alternative runtimes
+
+Docker Engine có thể dùng runtime khác nếu runtime tích hợp qua containerd shim API hoặc được cấu hình như `runc` drop-in theo tài liệu Engine.
+
+Ví dụ ecosystem:
+
+- **gVisor:** user-space kernel/sandbox làm trung gian nhiều syscall;
+- **Kata Containers:** dùng lightweight VM boundary;
+- **youki:** OCI runtime implementation có thể hoạt động như `runc` replacement;
+- **Wasm shims/runtime:** chạy WebAssembly workload theo integration experimental/specific.
+
+Sau khi admin cài và cấu hình runtime, user có thể chọn:
+
+```bash
+docker run --rm --runtime RUNTIME_NAME IMAGE
+```
+
+Ví dụ runtime type đầy đủ có thể có dạng:
+
+```bash
+docker run --rm --runtime io.containerd.kata.v2 IMAGE
+```
+
+Tên, setup, supported options và image requirements phụ thuộc runtime. Command chỉ minh họa interface, không chạy nếu host chưa cài shim/runtime.
+
+### Chọn runtime theo threat model
+
+| Nhu cầu | Hướng đánh giá |
+|---|---|
+| Compatibility Linux cao, overhead thấp | OCI runtime kiểu `runc`, hardening shared kernel |
+| Chạy code không tin cậy cần syscall mediation | Sandbox runtime như gVisor, test compatibility/performance |
+| Cần kernel boundary mạnh hơn | VM-based runtime như Kata/microVM, xem hardware/operations overhead |
+| Wasm workload | Wasm runtime/shim, kiểm tra OCI artifact/platform và maturity |
+
+Alternative runtime không tự bảo đảm an toàn. Cần xem CVE/update model, syscall/device support, networking/storage integration, observability, startup/latency và incident tooling.
+
+## Runtime configuration và daemon configuration
+
+Docker daemon có thể đăng ký runtimes trong `/etc/docker/daemon.json` trên Linux Engine, nhưng schema phụ thuộc loại shim/drop-in. Ví dụ khái niệm:
+
+```json
+{
+  "runtimes": {
+    "example": {
+      "runtimeType": "io.containerd.example.v1"
+    }
+  }
+}
+```
+
+Không copy example vào production nếu runtime không cung cấp đúng shim/type. Trước khi reload/restart daemon:
+
+1. validate JSON và runtime binary/shim availability;
+2. kiểm tra docs đúng Engine/runtime version;
+3. có terminal/root access ngoài Docker nếu daemon không start;
+4. canary bằng container không quan trọng;
+5. xác minh default runtime không bị đổi ngoài ý định;
+6. chuẩn bị rollback config.
+
+Một số daemon settings reload được, số khác cần restart. Theo docs của field/version cụ thể thay vì dùng `systemctl restart docker` như phản xạ đầu tiên.
+
+## Kubernetes và CRI
+
+Kubernetes kubelet giao tiếp với runtime qua Container Runtime Interface (CRI). Containerd có CRI plugin/integration; CRI-O là một CRI runtime khác. `runc` hoặc runtime thấp hơn vẫn có thể thực hiện OCI container creation bên dưới.
+
+```text
+Kubernetes kubelet
+       │ CRI
+       ▼
+containerd / CRI-O
+       │ runtime handler
+       ▼
+runc / gVisor / Kata / ...
+```
+
+Docker Engine không còn là CRI runtime integration mặc định kiểu dockershim cũ trong Kubernetes hiện đại, nhưng Docker-built OCI-compatible images vẫn chạy qua CRI runtime nếu platform/content tương thích.
+
+Không dùng Docker CLI để quản lý trực tiếp Kubernetes containers do containerd quản lý trong namespace/control plane khác. Dùng `kubectl`, CRI tools và node runbook phù hợp.
+
+## Troubleshooting theo layer
+
+### Phase 1: client có tới đúng daemon không?
+
+```bash
+docker context show
+docker version
+docker info
+```
+
+Nếu `docker version` chỉ hiện Client hoặc lỗi connect, chưa đi tới image/runtime layer.
+
+### Phase 2: image có resolve và unpack được không?
+
+Dấu hiệu lỗi:
+
+- authentication/authorization denied;
+- manifest/platform không khớp;
+- digest mismatch;
+- content download timeout;
+- snapshot mount/unpack lỗi;
+- data root hết disk/inode.
+
+Thu:
+
+```bash
+docker pull IMAGE
+docker image inspect IMAGE
+docker system df -v
+```
+
+### Phase 3: container create có lỗi không?
+
+Lỗi create thường liên quan invalid mount, device, cgroup, namespace, seccomp/AppArmor/SELinux hoặc runtime configuration. Container có thể ở `created` hoặc request thất bại trước khi object hoàn chỉnh.
+
+```bash
+docker inspect CONTAINER
+journalctl -u docker --since '15 minutes ago'
+```
+
+Trên distribution/service name khác, dùng log source tương ứng. Containerd/runtime logs có thể nằm trong Docker daemon journal hoặc service riêng tùy packaging.
+
+### Phase 4: process start rồi exit?
+
+```bash
+docker ps -a --no-trunc
+docker inspect --format '{{json .State}}' CONTAINER
+docker logs --timestamps CONTAINER
+```
+
+Phân biệt:
+
+- runtime không exec được binary (`no such file`, `exec format`, permission);
+- application start rồi exit non-zero;
+- OOM/signal;
+- healthcheck unhealthy nhưng process còn running.
+
+### Phase 5: runtime daemon/shim bất ổn?
+
+Thu evidence trước restart:
+
+- `docker events`;
+- daemon/containerd logs;
+- process tree;
+- disk/inode/mount state;
+- kernel logs/OOM/LSM/seccomp;
+- version/package inventory;
+- runtime configuration diff.
+
+Restart daemon có thể phục hồi control plane nhưng làm mất state điều tra và ảnh hưởng workload tùy live-restore/runtime behavior. Chỉ restart theo runbook có blast-radius assessment.
+
+## Không dùng `ctr` để sửa Docker state
+
+`ctr` là low-level containerd debug/admin client, không có Docker object semantics và không được đảm bảo là stable end-user interface. Docker dùng namespace/metadata riêng trong containerd và giữ state bổ sung ở daemon.
+
+Dùng `ctr` đọc state trong incident chỉ khi runbook/version hiểu rõ; không xóa task/content/snapshot mà Docker đang tham chiếu. Ưu tiên Docker API/CLI và vendor support path.
+
+## Operational checklist
+
+- Pin/support matrix cho Engine, containerd, runtime, kernel và OS packages.
+- Theo dõi security advisories của mọi layer, không chỉ Docker CLI.
+- Bảo vệ Docker/containerd sockets bằng filesystem permission và network isolation.
+- Giám sát daemon availability, task exits, snapshot/data-root capacity và shim leaks.
+- Test daemon restart, host reboot, runtime upgrade và rollback trên staging.
+- Không hard-code internal data-root paths/process names vào automation nếu có supported API.
+- Chọn alternative runtime theo workload class và benchmark compatibility.
+
+## Tự kiểm tra
+
+1. Docker daemon, containerd và `runc` khác trách nhiệm thế nào?
+2. Vì sao không thấy process `runc` thường trực vẫn là behavior bình thường?
+3. Snapshot khác image blob và running task ở đâu?
+4. Alternative runtime thay đổi threat model và trade-off nào?
+5. Vì sao không nên dùng `ctr` để xóa Docker-managed content?
+
+Tiếp theo, [Windows containers](/docs/nen-tang-container/windows-containers/) cho thấy cùng image/container workflow được hiện thực bằng primitives và compatibility rules khác Linux.
+
+## Nguồn đối chiếu
+
+- [Alternative container runtimes — Docker Docs](https://docs.docker.com/engine/daemon/alternative-runtimes/)
+- [Docker Engine](https://docs.docker.com/engine/)
+- [containerd documentation](https://containerd.io/docs/)
+- [runc repository](https://github.com/opencontainers/runc)
+- [OCI Runtime Specification](https://github.com/opencontainers/runtime-spec)

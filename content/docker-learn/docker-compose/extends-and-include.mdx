@@ -1,0 +1,247 @@
+---
+title: "Extends và include"
+description: "Tái sử dụng Compose model bằng service-level extends và top-level include; hiểu merge scope, relative paths, resource dependencies và version boundary."
+---
+
+`extends` và `include` đều tái sử dụng cấu hình nhưng ở scope khác:
+
+| Cơ chế | Scope | Kết quả |
+|---|---|---|
+| `extends` | Một service | Copy/merge thuộc tính của service base vào service hiện tại |
+| `include` | Một Compose application model | Import services, networks, volumes và resource của module |
+
+Chọn theo ownership boundary. Nếu chỉ hai process cùng image/runtime defaults, `extends` có thể đủ. Nếu team/module sở hữu nhiều service và resource với path riêng, `include` rõ hơn.
+
+## `extends`: kế thừa service
+
+`common.yaml`:
+
+```yaml
+services:
+  app-base:
+    image: example/app:1.8.3
+    init: true
+    environment:
+      LOG_LEVEL: info
+    networks:
+      - backend
+```
+
+`compose.yaml`:
+
+```yaml
+services:
+  api:
+    extends:
+      file: common.yaml
+      service: app-base
+    command: ["./app", "serve"]
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  worker:
+    extends:
+      file: common.yaml
+      service: app-base
+    command: ["./app", "worker"]
+
+networks:
+  backend: {}
+```
+
+Service base từ file khác không tự trở thành service trong final project. `api` và `worker` nhận thuộc tính được merge.
+
+## Merge semantics của `extends`
+
+Tổng quát:
+
+- mapping: key ở service hiện tại override base;
+- sequence: kết hợp base trước, service hiện tại sau theo rule field;
+- scalar: service hiện tại thắng;
+- volume/device được xét theo target path;
+- circular `extends` bị reject.
+
+Ví dụ:
+
+```yaml
+services:
+  base:
+    image: alpine:3.23
+    environment:
+      LOG_LEVEL: info
+      PORT: "8080"
+
+  debug:
+    extends:
+      service: base
+    environment:
+      LOG_LEVEL: debug
+```
+
+Resolved `debug` có `PORT=8080`, `LOG_LEVEL=debug` và image của `base`. Vì `base` ở cùng file, nó cũng là service trong project; dùng profile nếu không muốn start nó mặc định, hoặc đặt base ở file fragment riêng.
+
+## Resource dependency không tự import
+
+Nếu service base tham chiếu network, volume, config, secret hoặc service dependency, `extends` không tự copy mọi top-level resource cần thiết vào model hiện tại. Bạn phải khai báo chúng:
+
+```yaml
+networks:
+  backend: {}
+```
+
+Luôn chạy:
+
+```bash
+docker compose config
+```
+
+`extends` không được `docker stack deploy` hỗ trợ. Nếu cần portability sang platform khác, kiểm tra feature subset thay vì giả định mọi Compose field được chấp nhận.
+
+## `include`: nhập application module
+
+Top-level `include` (Compose 2.20.x trở lên; kiểm tra minimum version chính xác của deployment) tải mỗi file như một Compose application riêng, resolve relative path theo project directory của module rồi copy resource vào model hiện tại.
+
+```text
+shop/
+├── compose.yaml
+├── api/
+│   └── Dockerfile
+└── dependencies/
+    ├── compose.yaml
+    └── postgres/
+        └── init.sql
+```
+
+`dependencies/compose.yaml`:
+
+```yaml
+services:
+  db:
+    image: postgres:18-alpine
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - db-data:/var/lib/postgresql/data
+
+volumes:
+  db-data: {}
+```
+
+Root `compose.yaml`:
+
+```yaml
+include:
+  - ./dependencies/compose.yaml
+
+services:
+  api:
+    build: ./api
+    depends_on:
+      - db
+```
+
+Path `./postgres/init.sql` được resolve theo directory của included file, không theo root project. Đây là khác biệt lớn so với merge bằng nhiều `-f` files.
+
+## Long syntax của `include`
+
+```yaml
+include:
+  - path:
+      - ../platform/compose.yaml
+      - ./platform.override.yaml
+    project_directory: ../platform
+    env_file:
+      - ../platform/.env
+      - ../platform/local.env
+```
+
+- `path`: một file hoặc danh sách file được merge thành sub-model;
+- `project_directory`: base để resolve path của module;
+- `env_file`: default interpolation values của module; environment project cha vẫn có precedence.
+
+`include` có thể recursive. Giới hạn depth/ownership và pin source; không include remote artifact/repository không tin cậy vì Compose model có thể mount host path, cấp capability hoặc chạy image tùy ý.
+
+## Conflict và override included model
+
+`include` được áp dụng sau khi model chính đã merge. Resource trùng tên giữa included model và model hiện tại gây warning/error conflict thay vì merge im lặng.
+
+Khi cần tùy chỉnh module:
+
+```yaml
+include:
+  - path:
+      - third-party/compose.yaml
+      - third-party.override.yaml
+```
+
+Hoặc dùng global `compose.override.yaml` để override model sau include. Review kết quả bằng `docker compose config`; tránh tạo chuỗi override khó truy nguồn.
+
+## Chọn cơ chế
+
+| Tình huống | Nên dùng |
+|---|---|
+| `api` và `worker` share image/env/security defaults | YAML anchor hoặc `extends` |
+| Tái sử dụng một service từ file khác | `extends` |
+| Nhập database + admin + volume + network do module sở hữu | `include` |
+| Base + production deltas của cùng deployment | `-f` merge/override |
+| Chỉ bật debug service tùy lúc | profiles |
+| Một vài field lặp trong cùng YAML | `x-` extension + anchor |
+
+Không có cơ chế nào tự làm versioning. Module contract vẫn cần pin image/source, changelog và compatibility test.
+
+## Lab: include module có path riêng
+
+Tạo fixture:
+
+```bash
+mkdir -p module
+touch module/evidence.txt
+```
+
+`module/compose.yaml`:
+
+```yaml
+services:
+  module-reader:
+    image: alpine:3.23
+    command: ["sleep", "300"]
+    volumes:
+      - ./evidence.txt:/evidence.txt:ro
+```
+
+Root `compose.yaml`:
+
+```yaml
+name: compose-include-lab
+
+include:
+  - ./module/compose.yaml
+
+services:
+  caller:
+    image: alpine:3.23
+    command: ["sleep", "300"]
+```
+
+Validate path rồi chạy:
+
+```bash
+docker compose config
+docker compose up --detach
+docker compose exec module-reader ls -l /evidence.txt
+```
+
+Expected: bind source là `module/evidence.txt`, chứng minh module giữ path context riêng.
+
+## Cleanup
+
+```bash
+docker compose down
+rm -rf module
+```
+
+## Nguồn chính thức
+
+- [Extend your Compose file](https://docs.docker.com/compose/how-tos/multiple-compose-files/extends/)
+- [`extends` reference](https://docs.docker.com/reference/compose-file/services/#extends)
+- [Use `include` to modularize Compose files](https://docs.docker.com/reference/compose-file/include/)
+- [Working with multiple Compose files](https://docs.docker.com/compose/how-tos/multiple-compose-files/)

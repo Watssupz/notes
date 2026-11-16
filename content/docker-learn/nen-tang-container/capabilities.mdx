@@ -1,0 +1,285 @@
+---
+title: "Linux capabilities"
+description: "Cách Linux capabilities phân rã quyền root, các capability set, Docker cap-add/cap-drop, no-new-privileges và quy trình cấp quyền tối thiểu."
+---
+
+Linux capabilities chia các quyền truyền thống của superuser thành những đơn vị có thể bật/tắt độc lập. Thay vì trao toàn bộ quyền root chỉ để application thực hiện một thao tác đặc biệt, runtime có thể giữ capability cần thiết và drop phần còn lại.
+
+Capabilities là thuộc tính security của thread/process trong kernel, không phải role nghiệp vụ và không phải Docker permission. Docker chỉ cung cấp interface để cấu hình capability set cho process container.
+
+## Vì sao UID 0 chưa nói hết quyền
+
+Trong mô hình Unix truyền thống đơn giản hóa, UID 0 vượt qua nhiều permission check. Linux capabilities phân rã quyền đó:
+
+```text
+UID/GID + file mode/ACL
+          │
+          ├── capability checks cho privileged operations
+          ├── seccomp lọc syscall
+          ├── LSM policy như AppArmor/SELinux
+          └── namespace quyết định scope của quyền
+```
+
+Process có UID 0 trong container vẫn có thể thiếu capability để mount filesystem, load kernel module hoặc thay network configuration. Ngược lại, process non-root có thể nhận một capability hẹp qua runtime/file capability.
+
+Tuy vậy, root trong container không tự động an toàn. Capability còn lại, user namespace mapping, bind mounts, devices, kernel vulnerabilities và policy khác quyết định quyền thực tế.
+
+## Một số capability thường gặp
+
+Danh sách đầy đủ phụ thuộc kernel. Các capability sau minh họa cách quyền được chia:
+
+| Capability | Nhóm thao tác tiêu biểu | Rủi ro cần chú ý |
+|---|---|---|
+| `CAP_CHOWN` | Đổi UID/GID của file | Thay ownership trên writable bind mount |
+| `CAP_DAC_OVERRIDE` | Bypass nhiều file permission checks | Đọc/ghi file ngoài ý định trong mount scope |
+| `CAP_NET_BIND_SERVICE` | Bind privileged Internet ports theo kernel semantics | Thường có alternative bằng port cao/publishing |
+| `CAP_NET_RAW` | Raw/PACKET sockets | Packet crafting/sniffing trong network scope |
+| `CAP_NET_ADMIN` | Interface, route, firewall và network administration | Quyền rộng trong network namespace; nguy hiểm khi share host net |
+| `CAP_SYS_PTRACE` | Trace/đọc memory process theo permission rules | Lộ secret/process state trong PID scope |
+| `CAP_SYS_TIME` | Thay system clock | Có thể ảnh hưởng host nếu time không được namespaced phù hợp |
+| `CAP_SYS_MODULE` | Load/unload kernel modules | Tác động trực tiếp shared kernel |
+| `CAP_SYS_ADMIN` | Nhiều thao tác quản trị khác nhau | Capability rất rộng, thường được gọi là gần “new root” |
+
+`CAP_SYS_ADMIN` bao phủ nhiều operation như mount, namespace administration và privileged kernel interfaces. Nếu application yêu cầu nó, cần threat-model review và tìm alternative hẹp hơn thay vì coi đây là một capability bình thường.
+
+## Capability sets
+
+Linux theo dõi nhiều set để quyết định capability hiện tại và sau `execve()`:
+
+| Set | Ý nghĩa khái niệm |
+|---|---|
+| Permitted | Capability process có thể đưa vào Effective theo rules |
+| Effective | Capability kernel thực sự dùng cho permission check hiện tại |
+| Inheritable | Capability có thể tham gia phép tính inheritance qua `execve()` |
+| Bounding | Trần capability mà process/descendant có thể nhận theo cơ chế liên quan |
+| Ambient | Capability có thể giữ qua `execve()` của chương trình không privileged theo điều kiện kernel |
+
+File capabilities trên executable và các securebits/no-new-privileges rules còn ảnh hưởng transition. Vì vậy, “đã `cap-add`” không bảo đảm capability luôn Effective trong mọi child process; entrypoint có thể đổi UID, drop set hoặc exec binary có metadata khác.
+
+Kernel expose bitmask qua `/proc/<pid>/status`:
+
+```bash
+grep '^Cap' /proc/self/status
+```
+
+Output có các field như `CapInh`, `CapPrm`, `CapEff`, `CapBnd`, `CapAmb`. Bitmask cần được decode theo capability definitions của kernel/tool version.
+
+## Docker default không phải toàn bộ quyền root
+
+Docker chạy container với một restricted capability set mặc định và drop nhiều capability nguy hiểm. Tập mặc định có thể thay đổi theo Engine version, platform và runtime, nên không chép một danh sách cũ làm policy vĩnh viễn.
+
+Quan sát environment đang dùng thay vì đoán. Ví dụ lab sau cài `capsh` trong container tạm thời:
+
+```bash
+docker run --rm alpine:3.20 sh -c \
+  'apk add --no-cache libcap-utils >/dev/null && capsh --print'
+```
+
+Output package/install phụ thuộc network repository. Trong phần `Current`/`Bounding set`, `capsh` hiển thị capability names mà process quan sát được.
+
+So sánh với container drop toàn bộ:
+
+```bash
+docker run --rm --cap-drop ALL alpine:3.20 sh -c \
+  'apk add --no-cache libcap-utils >/dev/null && capsh --print'
+```
+
+Lưu ý: package installation trong container drop-all vẫn có thể thành công vì nó chủ yếu ghi vào filesystem của container dưới UID 0 và không phải mọi file operation cần capability. Nếu mirror/network không truy cập được, build một image lab có `capsh` trước; đừng kết luận capability từ lỗi download.
+
+## `--cap-drop` và `--cap-add`
+
+Docker cho phép thay đổi capability tương đối so với baseline:
+
+```bash
+docker run --rm --cap-drop NET_RAW IMAGE
+```
+
+Hoặc drop tất cả rồi add đúng capability đã chứng minh là cần:
+
+```bash
+docker run --rm \
+  --cap-drop ALL \
+  --cap-add NET_BIND_SERVICE \
+  IMAGE
+```
+
+Pattern drop-all dễ review hơn nhưng không phải application nào cũng chạy ngay. Hãy test startup, healthcheck, shutdown, certificate reload, file ownership, DNS/network và maintenance path; capability có thể chỉ cần ở startup rồi được application tự drop.
+
+Tên trên CLI thường bỏ prefix `CAP_`; `NET_ADMIN` tương ứng `CAP_NET_ADMIN`.
+
+<Callout type="warn" title="Quan trọng">
+  Chỉ add capability sau khi xác định permission check cụ thể. Không chuyển từ `Operation not permitted` thẳng sang `SYS_ADMIN` hoặc `--privileged`; cùng message có thể do seccomp, LSM, mount flags, user namespace hoặc device policy.
+</Callout>
+
+## Lab: đo capability delta
+
+Tạo một image lab để tránh cài package lặp lại:
+
+```dockerfile
+FROM alpine:3.20
+RUN apk add --no-cache libcap-utils
+CMD ["capsh", "--print"]
+```
+
+Build:
+
+```bash
+docker build -t local/cap-lab:1 .
+```
+
+Chạy ba cấu hình:
+
+```bash
+docker run --rm local/cap-lab:1
+docker run --rm --cap-drop ALL local/cap-lab:1
+docker run --rm --cap-drop ALL --cap-add CHOWN local/cap-lab:1
+```
+
+Expected observation:
+
+- lần đầu có baseline capability set của Docker hiện tại;
+- lần hai Effective/Bounding set bị thu hẹp mạnh;
+- lần ba chỉ bổ sung capability được yêu cầu theo runtime/kernel rules.
+
+Bạn có thể decode bitmask trực tiếp:
+
+```bash
+docker run --rm local/cap-lab:1 sh -c \
+  'grep CapEff /proc/1/status; capsh --decode=$(awk "/CapEff/ {print \$2}" /proc/1/status)'
+```
+
+Xóa image lab khi xong:
+
+```bash
+docker image rm local/cap-lab:1
+```
+
+## User namespace thay đổi scope capability
+
+Capability luôn được đánh giá trong quan hệ với user namespace. Process có capability trong descendant user namespace không nhất thiết có cùng quyền trong initial user namespace của host.
+
+Đây là cơ sở để rootless container và user namespace remapping giảm rủi ro của UID 0 trong container. Tuy nhiên:
+
+- kernel attack surface vẫn tồn tại;
+- bind mount ownership cần mapping đúng;
+- một số feature/device/network mode không tương thích hoặc cần helper;
+- capability đối với resource thuộc namespace nào phải được hiểu cụ thể.
+
+Không dùng câu “root trong container chỉ là user thường” nếu chưa xác nhận user namespace mode và UID mapping.
+
+Kiểm tra mapping của process container trên Linux host:
+
+```bash
+PID=$(docker inspect --format '{{.State.Pid}}' CONTAINER)
+cat "/proc/$PID/uid_map"
+cat "/proc/$PID/gid_map"
+```
+
+Một mapping bắt đầu `0 0 ...` khác về security implication với mapping container UID 0 sang host UID non-zero.
+
+## File capabilities và runtime capabilities
+
+Executable có thể mang file capability trong extended attributes, ví dụ cho phép binary non-root bind port đặc quyền. Nhưng behavior qua image build, filesystem layer, copy, archive và runtime còn phụ thuộc xattr preservation và kernel rules.
+
+Kiểm tra trong image/container:
+
+```bash
+getcap -r / 2>/dev/null
+```
+
+Không quét `/` trên container lớn trong hot path production. Giới hạn directory cần kiểm tra.
+
+File capability không vượt bounding set/no-new-privileges theo cách tùy ý. Nếu binary có xattr đúng nhưng operation vẫn lỗi, kiểm tra:
+
+1. process UID và capability sets trước/sau exec;
+2. bounding set;
+3. `no_new_privs`;
+4. user namespace scope;
+5. seccomp/LSM;
+6. filesystem có preserve/support xattr không.
+
+## `no-new-privileges`
+
+`no_new_privs` là process attribute khiến `execve()` không cấp thêm privilege theo một số cơ chế như set-user-ID/set-group-ID bits hoặc file capabilities. Docker expose qua security option:
+
+```bash
+docker run --rm \
+  --security-opt no-new-privileges=true \
+  IMAGE
+```
+
+Đây là defense-in-depth hữu ích cho workload không cần privilege transition. Nó không tự drop capability hiện tại; kết hợp với non-root, drop capabilities, seccomp và LSM.
+
+Kiểm tra field kernel từ trong container:
+
+```bash
+docker run --rm --security-opt no-new-privileges=true alpine:3.20 \
+  grep '^NoNewPrivs:' /proc/1/status
+```
+
+Expected value là `NoNewPrivs: 1`.
+
+## `--privileged` không phải “add mọi capability” đơn giản
+
+Privileged mode nới nhiều control cùng lúc, có thể gồm capability, device access và security profile behavior tùy platform/runtime. Vì vậy nó thay threat model lớn hơn nhiều so với `--cap-add` một capability.
+
+Chỉ dùng cho use case đã xác định như một số system-level agent, nested runtime lab hoặc hardware integration, kèm:
+
+- host/node dedicated nếu blast radius yêu cầu;
+- image/source đáng tin;
+- mount/device scope tối thiểu;
+- network và credential isolation;
+- logging/audit;
+- alternative như device-specific access, rootless builder hoặc sandbox được đánh giá.
+
+Không deploy `--privileged` chỉ vì application chạy thành công sau khi bật. Đó là bằng chứng lỗi thuộc một control bị nới, chưa phải root cause.
+
+## Troubleshooting `Operation not permitted`
+
+Dùng quy trình phân lớp:
+
+1. **Ghi lại syscall/operation thực tế.** Application đang `mount`, `ptrace`, mở raw socket hay chỉ ghi file?
+2. **Kiểm tra identity và file permission.** `id`, ownership, ACL, mount mode.
+3. **Kiểm tra capability sets.** `/proc/<pid>/status`, `capsh --print`.
+4. **Kiểm tra seccomp.** Engine security options, audit/kernel log nếu có.
+5. **Kiểm tra AppArmor/SELinux.** Tìm denial trong audit log, profile/label.
+6. **Kiểm tra namespace và device.** Operation có tác động host namespace hoặc device không được expose?
+7. **Tạo test hẹp.** Chỉ add capability nghi ngờ trong môi trường lab; nếu không đổi behavior, revert ngay.
+
+Ví dụ inspect security configuration:
+
+```bash
+docker inspect --format \
+  'CapAdd={{json .HostConfig.CapAdd}} CapDrop={{json .HostConfig.CapDrop}} SecurityOpt={{json .HostConfig.SecurityOpt}} Privileged={{.HostConfig.Privileged}}' \
+  CONTAINER
+```
+
+Giá trị `null`/rỗng có thể nghĩa dùng baseline, không phải không có capability.
+
+## Least-privilege checklist
+
+- Chạy non-root nếu workload hỗ trợ.
+- Bắt đầu bằng Docker default hoặc drop-all trong test; ghi lại capability thực sự cần.
+- Tránh `SYS_ADMIN`, `SYS_MODULE`, `SYS_PTRACE`, `NET_ADMIN` trừ use case cụ thể.
+- Bật `no-new-privileges` nếu application không cần privilege transition.
+- Không share host PID/network namespace khi capability có thể tác động resource host.
+- Mount filesystem read-only và chỉ expose path/device cần thiết.
+- Kết hợp seccomp và AppArmor/SELinux; capability không lọc mọi syscall/path.
+- Regression-test capability policy khi upgrade base image/runtime/application.
+
+## Tự kiểm tra
+
+1. Vì sao UID 0 và capability set là hai dimension khác nhau?
+2. Effective, Permitted và Bounding sets trả lời câu hỏi gì?
+3. Vì sao `CAP_SYS_ADMIN` cần review đặc biệt?
+4. `no-new-privileges` khác `--cap-drop ALL` thế nào?
+5. Vì sao `--privileged` không phải một fix permission phù hợp?
+
+Tiếp theo, [Seccomp](/docs/nen-tang-container/seccomp/) giải thích cách lọc syscall ngay cả khi process đã có identity và capability nhất định.
+
+## Nguồn đối chiếu
+
+- [capabilities(7) — Linux manual](https://man7.org/linux/man-pages/man7/capabilities.7.html)
+- [Docker Engine security](https://docs.docker.com/engine/security/)
+- [`docker container run` capability options](https://docs.docker.com/reference/cli/docker/container/run/#runtime-privilege-and-linux-capabilities)
+- [No New Privileges Flag — Linux kernel documentation](https://docs.kernel.org/userspace-api/no_new_privs.html)

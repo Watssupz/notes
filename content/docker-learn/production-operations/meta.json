@@ -1,0 +1,18 @@
+{
+  "title": "Vận hành production",
+  "pages": [
+    "index",
+    "host-hardening",
+    "daemon-high-availability",
+    "capacity-planning",
+    "resource-governance",
+    "data-protection",
+    "backup-restore-drills",
+    "upgrade-strategy",
+    "rollback-strategy",
+    "patch-management",
+    "disaster-recovery",
+    "cost-optimization",
+    "production-checklist"
+  ]
+}

@@ -1,0 +1,235 @@
+---
+title: "ulimits"
+description: "Cấu hình POSIX resource limits cho process trong container, hiểu soft/hard limit, inheritance, daemon defaults và khác biệt với cgroup limits."
+---
+
+`ulimit` là giao diện shell quen thuộc cho **process resource limits** (`setrlimit`/`getrlimit`). Docker truyền các rlimits vào process khởi đầu của container; child process kế thừa rồi có thể hạ limit hoặc nâng soft limit tới hard limit nếu quyền cho phép.
+
+Rlimits không thay thế cgroups:
+
+- cgroup giới hạn/account một nhóm process theo hierarchy;
+- rlimit áp vào process và có semantics riêng theo từng resource;
+- một workload thường cần cả hai.
+
+## Soft và hard limit
+
+- **Soft limit:** giá trị kernel đang enforce cho process.
+- **Hard limit:** trần mà process không đặc quyền có thể dùng để nâng soft limit.
+
+Docker syntax:
+
+```text
+--ulimit TYPE=SOFT:HARD
+```
+
+Nếu chỉ truyền một giá trị, Docker dùng nó cho cả soft và hard:
+
+```bash
+docker run --rm --ulimit nofile=1024 debian:13-slim \
+  sh -c 'ulimit -Sn; ulimit -Hn'
+```
+
+Truyền riêng:
+
+```bash
+docker run --rm --ulimit nofile=1024:4096 debian:13-slim \
+  sh -c 'printf "soft="; ulimit -Sn; printf "hard="; ulimit -Hn'
+```
+
+## Các limit thường gặp
+
+| Type | Kernel resource | Tình huống |
+|---|---|---|
+| `nofile` | Open file descriptors | Socket, file, pipe, event descriptor |
+| `nproc` | Process theo real user ID semantics | Có caveat cross-container khi dùng cùng UID |
+| `core` | Core dump size | Debug crash, nhưng có rủi ro secret/disk |
+| `memlock` | Locked memory | Database, crypto, eBPF hoặc RDMA tùy workload |
+| `stack` | Stack size mỗi thread/process | Runtime/native code; quá lớn tăng virtual memory budget |
+| `fsize` | Maximum file size | Chặn một process tạo file vượt ngưỡng |
+| `cpu` | CPU time của process | Khác cgroup CPU quota theo wall-clock period |
+| `rtprio`, `rttime`, `nice` | Real-time/nice scheduling | Advanced; cần capability/host policy phù hợp |
+| `msgqueue`, `sigpending`, `locks` | Kernel objects per user/process semantics | Workload IPC hoặc native đặc thù |
+
+Docker CLI cũng liệt kê `data`, `rss` và các type khác, nhưng hiệu lực có thể phụ thuộc kernel; option `as` đã được Docker đánh dấu deprecated. Không dùng rlimit lịch sử để thay hard cgroup memory limit.
+
+<Callout type="warn" title="Đơn vị không đồng nhất">
+  Docker chuyển số tới OS syscall và không tự đổi byte. Mỗi rlimit có đơn vị riêng như số descriptor, bytes hoặc seconds. Đọc CLI/kernel docs cho đúng type trước khi đặt giá trị.
+</Callout>
+
+## Lab `nofile`
+
+Giới hạn soft/hard ở `32`, sau đó mở `/dev/null` tới khi kernel trả lỗi:
+
+```bash
+docker run --rm --ulimit nofile=32:32 python:3.13-alpine \
+  python -c '
+import resource
+handles = []
+print("limit=", resource.getrlimit(resource.RLIMIT_NOFILE))
+try:
+    while True:
+        handles.append(open("/dev/null", "rb"))
+except OSError as error:
+    print("opened_by_loop=", len(handles))
+    print(type(error).__name__, error)
+'
+```
+
+Số handle vòng lặp mở được nhỏ hơn `32` vì stdin/stdout/stderr, loader/runtime và descriptor khác đã dùng budget. Đây là lý do không sizing `nofile` đúng bằng connection count.
+
+## `nofile` và connection capacity
+
+Một TCP connection thường dùng ít nhất một file descriptor ở process server; còn có listener, log, config, file, pipe, epoll/kqueue descriptor và side connection tới database/cache.
+
+Khi chạm limit, symptom có thể là:
+
+- `Too many open files`;
+- accept/open thất bại;
+- log writer lỗi;
+- healthcheck timeout;
+- connection pool không tạo được socket.
+
+Thu evidence trong process/container:
+
+```bash
+docker exec CONTAINER sh -c '
+  printf "soft="; ulimit -Sn
+  printf "hard="; ulimit -Hn
+  printf "pid1_fds="; ls /proc/1/fd | wc -l
+  cat /proc/1/limits
+'
+```
+
+`ls /proc/1/fd` là snapshot và cần permission phù hợp. Với multi-process service, kiểm tra đúng PID; PID 1 không nhất thiết giữ connection.
+
+## `nproc` không phải container-wide PIDs limit
+
+Docker docs cảnh báo Linux áp `nproc` theo user, không theo container. Nhiều container chạy cùng real UID phía host có thể dùng chung quota liên quan. Root/user namespace còn làm mapping phức tạp hơn.
+
+Để giới hạn tổng tasks trong container cgroup, dùng:
+
+```bash
+docker run --pids-limit 256 IMAGE
+```
+
+Đọc [PID limits](/docs/tai-nguyen-va-hieu-nang/pids-limit/). Chỉ thêm `--ulimit nproc` khi hiểu user-ID scope và đã test trên target host.
+
+## Core dumps
+
+Cho phép core dump cần nhiều hơn `--ulimit core`:
+
+```bash
+docker run --ulimit core=-1 IMAGE
+```
+
+Còn phụ thuộc:
+
+- host `kernel.core_pattern` và namespace behavior;
+- writable path/disk capacity;
+- dumpability, UID và security policy;
+- executable symbols;
+- host collector như systemd-coredump;
+- secret/PII trong process memory.
+
+Core dump có thể chứa token, customer data và key material. Phải có encryption, access control, retention, redaction workflow và disk quota. Không bật unlimited core dumps trên toàn fleet chỉ để chuẩn bị debug.
+
+## `memlock` và capability
+
+`RLIMIT_MEMLOCK` giới hạn memory process có thể lock để tránh swap. Một số database, crypto library, eBPF/RDMA workload cần tăng:
+
+```bash
+docker run --ulimit memlock=67108864:67108864 IMAGE
+```
+
+Tăng rlimit không tự cấp mọi quyền syscall/capability và không thay cgroup memory accounting. Chỉ thêm capability/device/security exception được chứng minh cần thiết; không dùng `--privileged` để sửa lỗi `mlock`.
+
+## Daemon defaults
+
+Nếu container không truyền `--ulimit`, nó kế thừa default ulimits do daemon thiết lập. Trên Linux daemon có thể cấu hình `default-ulimits` trong `/etc/docker/daemon.json`, ví dụ:
+
+```json
+{
+  "default-ulimits": {
+    "nofile": {
+      "Name": "nofile",
+      "Soft": 4096,
+      "Hard": 8192
+    }
+  }
+}
+```
+
+Đây là host-wide behavior change. Trước khi reload/restart daemon:
+
+1. validate JSON và Engine-version support;
+2. inventory workload phụ thuộc default cũ;
+3. rollout trên host thử nghiệm;
+4. kiểm tra container mới — container đã tồn tại không tự nhận create-time config mới;
+5. có rollback và maintenance plan.
+
+Ưu tiên khai báo rlimit quan trọng trong deployment source để giảm phụ thuộc host default ẩn.
+
+## Compose
+
+```yaml
+services:
+  api:
+    image: example/api:1.4.2
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+      core: 0
+```
+
+Short form phù hợp khi soft bằng hard:
+
+```yaml
+services:
+  worker:
+    image: example/worker:1.2.0
+    ulimits:
+      nofile: 4096
+```
+
+Validate:
+
+```bash
+docker compose config
+docker compose up --detach
+docker compose exec api sh -c 'cat /proc/1/limits'
+```
+
+Inspect Engine config cũng hữu ích:
+
+```bash
+docker compose ps --quiet api | xargs docker inspect --format '{{json .HostConfig.Ulimits}}'
+```
+
+## Rlimit nào kết hợp với cgroup nào?
+
+| Mục tiêu | Primary control | Control bổ sung |
+|---|---|---|
+| Tổng memory container | `--memory` | Heap/cache setting, `memlock`, swap policy |
+| Tổng CPU time rate | `--cpus` | `cpu` rlimit hiếm khi phù hợp long-running service |
+| Tổng task container | `--pids-limit` | `nproc` nếu cần user-level boundary |
+| Open descriptors | `nofile` | Connection/worker pool và monitoring |
+| File size đơn lẻ | `fsize` | Filesystem quota, log rotation, disk monitoring |
+| Core dump | `core` | `core_pattern`, retention, security, disk quota |
+
+## Troubleshooting
+
+1. Capture exact error và process PID/UID.
+2. Đọc `/proc/<pid>/limits`, không chỉ shell hiện tại.
+3. Đo current usage tương ứng: FD count, tasks, locked memory hoặc file size.
+4. Kiểm tra container create config và daemon defaults.
+5. Kiểm tra cgroup/host boundary có gây symptom tương tự không.
+6. Tìm leak/queue/concurrency root cause trước khi tăng limit.
+7. Load test giá trị mới và ghi vào deployment source.
+
+## Nguồn chính thức
+
+- [`docker container run`: Set ulimits](https://docs.docker.com/reference/cli/docker/container/run/#set-ulimits-in-container---ulimit)
+- [`dockerd`: default-ulimits](https://docs.docker.com/reference/cli/dockerd/)
+- [`getrlimit(2)` Linux manual](https://man7.org/linux/man-pages/man2/getrlimit.2.html)
+- [`proc_pid_limits(5)` Linux manual](https://man7.org/linux/man-pages/man5/proc_pid_limits.5.html)

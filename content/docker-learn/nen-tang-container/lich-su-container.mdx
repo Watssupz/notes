@@ -1,0 +1,230 @@
+---
+title: "Lịch sử container"
+description: "Dòng phát triển từ chroot, operating-system virtualization, Linux namespaces và cgroups đến Docker, OCI, containerd và hệ sinh thái container hiện đại."
+---
+
+Container không xuất hiện từ một phát minh duy nhất. Công nghệ hiện nay là kết quả của nhiều nhánh phát triển: giới hạn filesystem view, tách process và network, account tài nguyên, đóng gói root filesystem, phân phối artifact và chuẩn hóa runtime interface.
+
+Nhìn lịch sử theo **vấn đề được giải quyết** hữu ích hơn ghi nhớ mốc thời gian. `chroot` giúp đổi root directory nhưng chưa tạo container; namespaces tạo nhiều isolated views nhưng chưa tạo image ecosystem; Docker phổ biến workflow build–ship–run nhưng không phải nơi mọi kernel primitive bắt đầu.
+
+## Dòng phát triển tổng quát
+
+```text
+Filesystem view
+chroot
+   │
+   ├── OS-level virtualization
+   │   FreeBSD Jails · Solaris Zones · Linux VServer/OpenVZ
+   │
+   ├── Linux kernel primitives
+   │   namespaces · cgroups · capabilities · LSM · seccomp
+   │
+   ├── Linux container tooling
+   │   LXC và các tool/runtime khác
+   │
+   ├── Product workflow
+   │   Docker: image + registry + API + CLI + build/run UX
+   │
+   └── Open standards và component hóa
+       OCI specs · runc · containerd · CRI ecosystem
+```
+
+Các nhánh chồng lấp theo thời gian. Sơ đồ không ngụ ý một project trực tiếp kế thừa toàn bộ project đứng trước, mà cho thấy abstraction ngày càng được ghép đầy đủ hơn.
+
+## Giai đoạn 1: giới hạn filesystem chưa phải container
+
+`chroot` thay root directory mà process dùng để resolve pathname. Điều này hữu ích cho build environment, recovery, package installation hoặc giảm phạm vi filesystem nhìn thấy. Tuy nhiên, chỉ `chroot` không mặc định tách:
+
+- process ID và process list;
+- network interfaces, routes và ports;
+- hostname;
+- users theo một mapping riêng;
+- CPU, memory hoặc I/O;
+- syscall và kernel attack surface.
+
+Một process có đủ quyền và cấu hình không an toàn có thể thoát hoặc phá giả định của một `chroot`. Bài học còn nguyên giá trị: **đổi root filesystem view không tự tạo security boundary hoàn chỉnh**.
+
+Container hiện đại vẫn cần một root filesystem riêng, nhưng runtime dựng nó trong mount namespace, áp mount propagation, pseudo-filesystems, capabilities, seccomp và các control khác thay vì chỉ gọi `chroot` rồi dừng lại.
+
+## Giai đoạn 2: operating-system-level virtualization
+
+Các hệ điều hành phát triển mô hình cho phép nhiều environment cách ly cùng dùng một kernel. FreeBSD Jails, Solaris Zones và các công nghệ Linux như Linux VServer/OpenVZ là những mốc quan trọng của hướng đi này.
+
+So với một filesystem jail đơn giản, các hệ thống đó bổ sung nhiều dimension hơn: process, network, hostname, resource control và administration boundary. Chúng chứng minh một host kernel có thể phục vụ nhiều workload tách biệt mà không cần boot một guest kernel đầy đủ cho từng workload.
+
+Mental model cốt lõi hình thành ở đây là:
+
+```text
+Một kernel
+├── Environment A: process + filesystem + network view riêng
+├── Environment B: process + filesystem + network view riêng
+└── Host/global resources được policy và resource control bảo vệ
+```
+
+Trade-off cũng rõ hơn: mật độ và startup tốt hơn VM, nhưng mọi environment cùng đặt niềm tin vào một kernel và isolation implementation.
+
+## Giai đoạn 3: Linux ghép các primitive tổng quát
+
+Linux không có một syscall tên “create_container”. Thay vào đó, kernel phát triển các primitive có thể kết hợp:
+
+- **namespaces** bọc global resource thành view riêng;
+- **cgroups** gom process theo hierarchy để account, giới hạn và ưu tiên resource;
+- **capabilities** chia quyền superuser thành các đơn vị nhỏ hơn;
+- **seccomp** lọc syscall;
+- **Linux Security Modules** như SELinux/AppArmor áp mandatory access control;
+- **mount và copy-on-write filesystem features** hỗ trợ root filesystem/layer hiệu quả.
+
+Điểm mạnh của cách thiết kế này là tính composable. Runtime có thể chọn namespace nào riêng, controller nào có limit, capability nào giữ lại và profile nào áp dụng. Điểm yếu là số lượng cấu hình tăng: một environment có vẻ giống container nhưng có thể share network, PID hoặc mount namespace với host.
+
+### Namespaces và cgroups giải quyết hai nửa khác nhau
+
+Namespaces trả lời “process nhìn thấy resource nào?”. Cgroups trả lời “nhóm process dùng bao nhiêu resource và được schedule ra sao?”. Hai cơ chế thường được nhắc cùng nhau vì container cần cả isolation lẫn resource governance, nhưng chúng độc lập về mục tiêu.
+
+Ví dụ, một process có PID namespace riêng vẫn có thể gây áp lực memory lên host nếu không có cgroup limit. Ngược lại, một process bị giới hạn memory nhưng vẫn ở host PID namespace có thể nhìn thấy nhiều process ngoài workload.
+
+## Giai đoạn 4: tooling biến primitives thành container
+
+Các tool Linux container như LXC cung cấp user-space interface để phối hợp namespace, cgroup, mount, network và root filesystem. Điều này chuyển bài toán từ việc application tự gọi nhiều kernel API thành một cấu hình/lifecycle có thể quản lý.
+
+Tuy nhiên, “có thể tạo isolated process tree” vẫn chưa tự giải quyết toàn bộ developer workflow:
+
+- root filesystem được tạo và version thế nào;
+- artifact được đặt tên và phân phối ra sao;
+- dependency được build lặp lại thế nào;
+- runtime configuration được truyền qua API nào;
+- team chia sẻ cùng artifact bằng cách nào.
+
+Khoảng trống đó dẫn tới giai đoạn packaging và distribution trở thành trọng tâm.
+
+## Giai đoạn 5: Docker phổ biến build–ship–run
+
+Docker được public/open-source năm 2013 và làm container dễ tiếp cận qua một workflow thống nhất. Giá trị quan trọng không chỉ là gọi namespace/cgroup, mà là ghép:
+
+- image có layers và metadata;
+- Dockerfile/build workflow;
+- registry để push/pull;
+- daemon API;
+- CLI với object model image/container/network/volume;
+- naming và developer experience nhất quán.
+
+```text
+Source + Dockerfile
+        │ build
+        ▼
+      Image ── push/pull ── Registry
+        │ run + runtime configuration
+        ▼
+     Container process
+```
+
+Docker khiến image trở thành release artifact thực tế cho nhiều team. Cùng lúc, sự phổ biến đó làm lộ nhu cầu interoperability: image do công cụ A build có thể được runtime B chạy không, lifecycle và bundle cần field nào, registry API nên trao đổi content ra sao?
+
+<Callout type="info" title="Lưu ý">
+  Docker không “phát minh ra container” theo nghĩa tạo ra mọi primitive. Docker chuẩn hóa và phổ biến một product workflow trên nền nhiều cơ chế hệ điều hành đã phát triển trước đó, đồng thời đóng góp đáng kể vào các component và standard sau này.
+</Callout>
+
+## Giai đoạn 6: OCI chuẩn hóa các đường biên
+
+Open Container Initiative (OCI) được thành lập năm 2015 dưới Linux Foundation. OCI hiện duy trì ba specification chính:
+
+| Specification | Chuẩn hóa câu hỏi |
+|---|---|
+| Image Specification | Image gồm manifest, config, layers, descriptor và index như thế nào? |
+| Runtime Specification | Một filesystem bundle và `config.json` được create/start/kill/delete theo lifecycle nào? |
+| Distribution Specification | Client push, pull và discover manifests/blobs qua registry API thế nào? |
+
+Docker đóng góp container format và `runc` làm nền cho nỗ lực ban đầu. Việc tách specification giúp ecosystem không cần phụ thuộc một daemon hoặc CLI duy nhất để trao đổi artifact.
+
+OCI không quy định toàn bộ platform behavior. Networking model cấp cao, orchestration, logging backend, build cache, secret management và user experience vẫn do implementation/platform quyết định.
+
+## Giai đoạn 7: component hóa runtime stack
+
+Stack container hiện đại thường chia trách nhiệm thành nhiều daemon/tool:
+
+```text
+Engine hoặc orchestrator
+        │
+        ▼
+High-level runtime, ví dụ containerd
+        │
+        ├── content/image management
+        ├── snapshot lifecycle
+        ├── task lifecycle
+        └── shim integration
+                │
+                ▼
+OCI runtime, ví dụ runc
+                │
+                ▼
+Linux process
+```
+
+Trong Docker Engine hiện đại, Engine dùng containerd để quản lý container lifecycle và containerd mặc định dùng `runc` làm OCI runtime. Shim giữ đường quản lý runtime/process tách khỏi lifecycle của daemon cấp cao và hỗ trợ các runtime implementation khác.
+
+Ở Kubernetes, Container Runtime Interface (CRI) là boundary giữa kubelet và CRI-compatible runtime. Việc Kubernetes không dùng Docker Engine làm CRI integration kiểu cũ không làm OCI image do Docker build trở nên không chạy được. Image compatibility và node runtime integration là hai câu hỏi khác nhau.
+
+## Image đã thay đổi cách release phần mềm
+
+Trước workflow image, deployment thường là một chuỗi thao tác lên server đang tồn tại:
+
+```text
+Provision server → cài package → copy source → sửa config → restart
+```
+
+Container image thúc đẩy model khác:
+
+```text
+Build artifact → test/scan → push digest → pull → replace workload
+```
+
+Model này giúp artifact promotion và rollback rõ hơn, nhưng không tự bảo đảm reproducibility hay supply-chain security. Tag có thể thay đổi; base image có thể cập nhật; build có thể tải dependency không pin; registry và credential vẫn là trust boundary.
+
+Do đó, lịch sử container không kết thúc ở “đóng gói được application”. Các chủ đề hiện đại chuyển sang provenance, SBOM, signature/attestation, policy, sandboxed runtime và confidential computing.
+
+## Những bài học còn áp dụng
+
+### Isolation luôn có nhiều dimension
+
+Không đánh giá container chỉ bằng filesystem riêng. PID, user, network, mount, IPC, time, cgroup, capability, syscall, LSM, device và host integration đều có thể thay đổi ranh giới.
+
+### Shared kernel là lợi thế và trust boundary
+
+Không boot kernel riêng giúp startup nhanh và mật độ cao. Đồng thời, kernel vulnerability hoặc quyền expose quá mức có thể ảnh hưởng blast radius. Workload không tin cậy có thể cần VM, microVM hoặc sandbox runtime bên cạnh container controls.
+
+### Portability đến từ contract, không phải phép màu
+
+OCI giúp công cụ đồng thuận về image content và runtime bundle, nhưng binary vẫn phụ thuộc OS, CPU architecture, ABI/syscall, kernel feature và external environment. Một Linux `amd64` image không tự trở thành Windows `amd64` image.
+
+### Developer experience không thay thế operations
+
+Một command chạy được local chưa cung cấp backup, high availability, capacity, observability hay security policy. Container đơn giản hóa deployment unit; hệ thống production vẫn cần thiết kế vận hành.
+
+## Cách đọc các mốc lịch sử cẩn thận
+
+Khi gặp bài viết khẳng định một project là “container đầu tiên”, hãy hỏi họ đang dùng định nghĩa nào:
+
+- đổi filesystem root;
+- OS-level virtual environment;
+- Linux namespace/cgroup container;
+- portable image format;
+- cloud-native orchestration unit.
+
+Các định nghĩa khác nhau tạo ra mốc “đầu tiên” khác nhau. Với mục tiêu học Docker, điều cần giữ là chuỗi abstraction và vấn đề mỗi abstraction giải quyết.
+
+## Tự kiểm tra
+
+1. Vì sao `chroot` một mình không đủ để gọi là container isolation hiện đại?
+2. Namespaces và cgroups đóng góp khác nhau thế nào?
+3. Docker đã bổ sung lớp giá trị gì ngoài kernel primitives?
+4. Vì sao OCI tách Image, Runtime và Distribution Specifications?
+5. Vì sao OCI-compatible image vẫn không bảo đảm chạy trên mọi OS/architecture?
+
+Tiếp theo, [Process isolation](/docs/nen-tang-container/process-isolation/) bắt đầu từ primitive quan trọng nhất: application cuối cùng vẫn là một hoặc nhiều process do host kernel thực thi.
+
+## Nguồn đối chiếu
+
+- [OCI overview](https://opencontainers.org/about/overview/)
+- [Docker Engine security](https://docs.docker.com/engine/security/)
+- [Linux namespaces manual](https://man7.org/linux/man-pages/man7/namespaces.7.html)
+- [Control Group v2 — Linux kernel documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+- [Alternative container runtimes — Docker Docs](https://docs.docker.com/engine/daemon/alternative-runtimes/)

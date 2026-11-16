@@ -1,0 +1,220 @@
+---
+title: "Docker là gì?"
+description: "Mental model về Docker, image, container, registry và luồng client-daemon giúp đóng gói, phân phối và chạy application nhất quán."
+---
+
+Docker là một platform để **build, phân phối và chạy application trong container**. Thay vì chuẩn bị thủ công runtime và dependency trên từng máy, bạn mô tả cách tạo một image, phân phối image qua registry rồi yêu cầu Docker Engine tạo container từ image đó.
+
+Câu mô tả trên có ba động từ quan trọng:
+
+- **Build:** biến source code, runtime, library và metadata thành image.
+- **Ship:** gắn tên/tag hoặc digest và lưu image trong registry.
+- **Run:** tạo container với cấu hình process, network, storage và resource riêng.
+
+Docker không phải tên gọi chung cho mọi container technology. Docker là một hệ sinh thái công cụ xây trên container primitives và các chuẩn như OCI; container có thể được build hoặc chạy bằng những công cụ khác.
+
+## Vấn đề Docker giải quyết
+
+Một application hiếm khi chỉ gồm source code. Nó còn phụ thuộc vào runtime, system package, certificate, user, biến môi trường và startup command. Nếu mỗi môi trường cài các dependency này theo cách khác nhau, cùng một commit có thể chạy ở laptop nhưng lỗi trên CI hoặc server.
+
+Docker chuyển phần lớn mô tả môi trường runtime thành artifact có thể version và phân phối:
+
+```text
+┌──────────────────────────────────────────┐
+│ Source code + Dockerfile + build context │
+└────────────────────┬─────────────────────┘
+                     │ docker build
+                     ▼
+              ┌─────────────┐
+              │    Image    │
+              └──────┬──────┘
+                     │ push / pull qua registry
+                     │ docker run + runtime configuration
+                     ▼
+              ┌─────────────┐
+              │  Container  │
+              └─────────────┘
+```
+
+Image không loại bỏ mọi khác biệt môi trường. Kernel, CPU architecture, Docker configuration, mounted data, secret, network policy và external service vẫn nằm ngoài image. Vì vậy, “chạy trong container” cải thiện tính nhất quán nhưng không có nghĩa là application chạy giống hệt trên mọi host bất kể platform và configuration.
+
+## Ba object cốt lõi
+
+### Image: package dùng để tạo container
+
+Image là template read-only chứa filesystem và metadata cần để khởi động workload, chẳng hạn startup command, working directory hoặc default environment variables. Image thường được tạo từ `Dockerfile`; mỗi build step có thể đóng góp một layer để tái sử dụng và cache.
+
+Image có thể được tham chiếu bằng tên và tag:
+
+```text
+nginx:alpine
+```
+
+hoặc bằng digest bất biến:
+
+```text
+nginx@sha256:<digest>
+```
+
+Tag là nhãn có thể được di chuyển sang image khác; digest nhận diện content cụ thể. Trong tutorial, tag dễ đọc và thuận tiện. Trong workflow cần tái tạo hoặc promotion nghiêm ngặt, digest giúp tránh việc cùng một tag trỏ tới content mới ngoài dự kiến.
+
+### Container: instance đang hoặc đã từng chạy
+
+Container là instance được tạo từ image cùng runtime configuration. Configuration đó bao gồm command, environment, port publishing, mount, network, resource limit và security option.
+
+Khi container chạy, process bên trong sử dụng filesystem từ image cộng với một writable layer của riêng container. Nếu xóa container, thay đổi chỉ nằm trong writable layer cũng bị xóa. Dữ liệu cần tồn tại lâu hơn lifecycle container phải được đưa vào volume, bind mount hoặc external data service phù hợp.
+
+Một image có thể tạo nhiều container độc lập:
+
+```text
+                    ┌────────────────────┐
+                ┌──▶│ Container web-1    │
+┌──────────────┐│   └────────────────────┘
+│ Image web:1.0├┼──▶┌────────────────────┐
+└──────────────┘│   │ Container web-2    │
+                │   └────────────────────┘
+                └──▶┌────────────────────┐
+                    │ Container web-test │
+                    └────────────────────┘
+```
+
+Các container cùng dùng content từ image nhưng có writable layer, process và runtime configuration riêng.
+
+### Registry: nơi lưu và phân phối image
+
+Registry cung cấp API để push và pull image. Docker Hub là public registry Docker sử dụng mặc định trong nhiều workflow, nhưng tổ chức có thể dùng private registry hoặc dịch vụ registry của cloud provider.
+
+Cần phân biệt:
+
+- **Registry:** dịch vụ lưu trữ và phân phối, ví dụ `docker.io`.
+- **Repository:** nhóm image có cùng tên trong registry, ví dụ `library/nginx`.
+- **Tag:** nhãn trong repository, ví dụ `alpine`.
+- **Digest:** định danh content, thường bắt đầu bằng `sha256:`.
+
+Một image reference đầy đủ có dạng khái niệm:
+
+```text
+[registry/][namespace/]repository[:tag][@digest]
+```
+
+Không phải lúc nào mọi phần cũng xuất hiện. Khi lược registry hoặc tag, Docker áp dụng quy tắc mặc định; hãy đọc reference đã được resolve trong output của `docker image inspect` hoặc workflow build thay vì suy luận trong các pipeline quan trọng.
+
+## Docker hoạt động theo kiến trúc client-server
+
+Khi chạy command, CLI không tự tạo container. Docker client gửi request qua Docker API tới daemon `dockerd`. Daemon quản lý image, container, network và volume, đồng thời phối hợp với container runtime ở layer thấp hơn.
+
+```text
+┌────────────┐      docker run       ┌────────────┐
+│    Bạn     │ ────────────────────▶ │ Docker CLI │
+└────────────┘                       └─────┬──────┘
+                                         │ Docker API
+                                         ▼
+                              ┌──────────────────────┐
+                              │    Docker daemon     │
+                              └──────────┬───────────┘
+                                         ├─ Tìm hoặc pull image
+                                         ├─ Tạo filesystem và network
+                                         ├─ Áp dụng runtime configuration
+                                         └─ Khởi động process container
+```
+
+Client và daemon thường ở cùng máy khi học local, nhưng chúng có thể ở hai máy khác nhau. Đây là lý do `docker version` hiển thị riêng phần **Client** và **Server**, còn Docker context có thể đổi daemon đích mà command đang điều khiển.
+
+<Callout type="warn" title="Quan trọng">
+  Quyền truy cập Docker daemon là một trust boundary quan trọng. Người hoặc process có quyền điều khiển daemon thông thường có thể tạo container với mount và quyền ảnh hưởng mạnh tới host. Không chia sẻ Docker socket tùy tiện và luôn kiểm tra context trước command có tác động phá hủy.
+</Callout>
+
+## Điều gì xảy ra khi chạy `docker run`?
+
+Xét command:
+
+```bash
+docker run --name demo -d -p 127.0.0.1:8080:80 nginx:alpine
+```
+
+Theo thứ tự khái niệm, Docker thực hiện các việc sau:
+
+1. Docker client parse option và gửi request đến daemon hiện tại.
+2. Daemon tìm `nginx:alpine` trong local image store; nếu thiếu, nó pull image theo registry configuration.
+3. Daemon tạo container với tên `demo` và writable layer.
+4. Docker cấu hình network, ánh xạ host `127.0.0.1:8080` tới port `80` của container.
+5. Runtime khởi động process được image và command xác định.
+6. Do có `-d`, client không attach vào output liên tục mà trả container ID rồi kết thúc; process container vẫn chạy nền.
+
+`docker run` là thao tác kết hợp **create + start**. Nếu container đã tồn tại và đang dừng, dùng `docker start demo`; chạy lại nguyên command với cùng `--name demo` sẽ lỗi vì tên đã được sử dụng.
+
+## Vì sao container thường nhẹ hơn virtual machine?
+
+Linux container thường cách ly process bằng kernel primitives như namespaces và kiểm soát tài nguyên bằng cgroups. Các container trên cùng host chia sẻ host kernel thay vì mỗi container mang theo một guest operating system hoàn chỉnh.
+
+Điều này thường làm container có startup nhanh và overhead thấp hơn VM. Tuy nhiên, “nhẹ hơn” không đồng nghĩa “an toàn tuyệt đối” hoặc “không tốn tài nguyên”. Process trong container vẫn tiêu thụ CPU, memory, I/O và network của host; thiếu limit hoặc cấu hình sai có thể ảnh hưởng workload khác.
+
+Trên macOS và Windows, Linux container cần Linux kernel. Docker Desktop thường cung cấp kernel đó qua một Linux VM được quản lý. Vì vậy, container và VM không loại trừ nhau: container có thể chạy bên trong VM để kết hợp ranh giới isolation của VM với workflow đóng gói của container.
+
+Đọc phân tích chi tiết tại [Container và virtual machine](/docs/bat-dau/container-va-virtual-machine/).
+
+## Docker mang lại giá trị gì?
+
+### Môi trường phát triển và CI nhất quán hơn
+
+Team có thể build cùng một image và chạy cùng startup command ở local, test và CI. Điều này giảm nhóm lỗi do thiếu package hoặc khác runtime version. Configuration và secret theo môi trường vẫn phải được quản lý riêng, không bake secret vào image.
+
+### Artifact phân phối rõ ràng
+
+Thay vì copy source rồi cài dependency trên server, pipeline có thể build image một lần, scan/test artifact đó và promote đúng digest qua các môi trường. Cách này làm provenance và rollback dễ kiểm chứng hơn nếu registry, metadata và policy được thiết kế đúng.
+
+### Isolation và mật độ workload
+
+Nhiều container có thể chạy trên một host với process, network và filesystem view tương đối tách biệt. Resource limit và security control cho phép thu hẹp tác động, nhưng container mặc định không phải security boundary tương đương một VM cho mọi threat model.
+
+### Lifecycle có thể tự động hóa
+
+CLI và API cung cấp object model nhất quán cho create, start, stop, inspect và remove. Compose bổ sung mô hình khai báo cho application nhiều container; orchestrator bổ sung scheduling, desired state và rollout trên nhiều node.
+
+## Docker không tự giải quyết điều gì?
+
+Docker không tự động cung cấp tất cả đặc tính production sau:
+
+- **High availability:** một daemon và một container trên một host vẫn là single point of failure.
+- **Backup:** volume không tự trở thành bản backup; cần policy, nơi lưu độc lập và restore test.
+- **Bảo mật image:** đóng gói dependency không đảm bảo dependency không có vulnerability hoặc secret.
+- **Observability hoàn chỉnh:** `docker logs` hữu ích nhưng không thay thế chiến lược metrics, logs, traces và alerting.
+- **Portability tuyệt đối:** image vẫn phụ thuộc OS/architecture, kernel capability, device, storage và external service.
+- **Orchestration nhiều node:** cần Swarm, Kubernetes hoặc platform khác nếu bài toán yêu cầu scheduling và reconciliation trên cluster.
+
+Hiểu ranh giới này giúp tránh biến Docker thành lời giải mặc định cho vấn đề mà nó không được thiết kế để giải quyết.
+
+## Khi nào nên và chưa nên dùng container?
+
+Container phù hợp khi application có thể đóng gói runtime rõ ràng, khởi động theo process model, nhận configuration bên ngoài image và tách persistent data khỏi writable layer. Web service, worker, scheduled job, toolchain build và môi trường test là các ví dụ phổ biến.
+
+Cần đánh giá kỹ hơn khi workload phụ thuộc sâu vào kernel/driver cụ thể, cần GUI desktop truyền thống, yêu cầu isolation cứng giữa tenant không tin cậy, hoặc có stateful lifecycle mà team chưa có năng lực backup và phục hồi. Trong nhiều hệ thống, giải pháp hợp lý là chạy container **trong VM**, không phải chọn một và loại bỏ hoàn toàn cái còn lại.
+
+## Những hiểu lầm cần loại bỏ sớm
+
+| Hiểu lầm | Mental model đúng |
+|---|---|
+| “Image là một container đang tắt” | Image là template; stopped container vẫn là một container có configuration và writable layer riêng. |
+| “Xóa container là xóa luôn image” | Image và container là object riêng; chỉ xóa image khi không còn reference phụ thuộc và bạn chủ động remove. |
+| “`EXPOSE` mở port ra host” | Publishing bằng `-p`/`--publish` mới tạo ánh xạ host; `EXPOSE` chủ yếu là metadata/documentation của image. |
+| “Container không cần OS” | Container không mang guest kernel riêng theo mô hình Linux thông thường, nhưng vẫn chứa user-space files và dùng host kernel. |
+| “Chạy được local thì chắc chắn chạy được production” | Production còn phụ thuộc data, network, secrets, resource, security, availability và operational process. |
+| “Container tự động an toàn” | Isolation giảm phạm vi nhìn thấy nhưng security còn phụ thuộc image, user, capability, mount, socket, kernel và policy. |
+
+## Tự kiểm tra mental model
+
+Bạn đã nắm nội dung trang này nếu có thể trả lời:
+
+1. Vì sao một image có thể tạo nhiều container?
+2. Dữ liệu ghi vào writable layer sẽ ra sao khi container bị remove?
+3. Docker client và Docker daemon có vai trò khác nhau thế nào?
+4. Registry khác repository và tag ở điểm nào?
+5. Docker cải thiện tính nhất quán nhưng vì sao không đảm bảo portability tuyệt đối?
+
+Bước tiếp theo là so sánh ranh giới isolation và resource model tại [Container và virtual machine](/docs/bat-dau/container-va-virtual-machine/), sau đó ghép các thành phần cụ thể trong [Hệ sinh thái Docker](/docs/bat-dau/he-sinh-thai-docker/).
+
+## Nguồn chính thức để đối chiếu
+
+- [What is Docker?](https://docs.docker.com/get-started/docker-overview/)
+- [Docker Engine](https://docs.docker.com/engine/)
+- [Docker CLI reference](https://docs.docker.com/reference/cli/docker/)

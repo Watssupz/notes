@@ -1,0 +1,201 @@
+---
+title: "Compose profiles"
+description: "Bật tắt service tùy chọn bằng Compose profiles, hiểu auto-start khi target service, dependency resolution và cách giữ core services luôn hoạt động."
+---
+
+Profiles cho phép một Compose model chứa service tùy chọn như debugger, admin UI, seed job hoặc observability local mà không start chúng ở mọi invocation. Service không có `profiles` luôn được enable; service có profile chỉ được enable khi profile active hoặc service được target trực tiếp.
+
+```yaml
+services:
+  api:
+    image: example/api:1
+
+  db:
+    image: postgres:18-alpine
+
+  adminer:
+    image: adminer:5
+    profiles: [debug]
+    depends_on: [db]
+
+  seed:
+    image: example/api:1
+    command: ["./app", "seed"]
+    profiles: [tools]
+    depends_on: [db]
+```
+
+<Callout type="info" title="Giữ core services không có profile">
+  Service bắt buộc để application vận hành nên luôn enabled. Profile phù hợp cho capability tùy chọn, không phải cách thay thế toàn bộ config giữa production và development.
+</Callout>
+
+## Kích hoạt profile
+
+```bash
+docker compose --profile debug up --detach
+```
+
+Hoặc qua environment:
+
+```bash
+COMPOSE_PROFILES=debug docker compose up --detach
+```
+
+Nhiều profile:
+
+```bash
+docker compose \
+  --profile debug \
+  --profile observability \
+  up --detach
+```
+
+Enable tất cả:
+
+```bash
+docker compose --profile "*" up --detach
+```
+
+Không profile nào active thì `api` và `db` vẫn chạy, còn `adminer`/`seed` không tự start.
+
+## Target service tự kích hoạt profile của nó
+
+```bash
+docker compose run --rm seed
+```
+
+Khi target trực tiếp service có profile, Compose chạy service đó mà không cần `--profile tools`, đồng thời xử lý dependencies khai báo. Các service khác cùng profile **không** tự start chỉ vì share profile.
+
+Ví dụ `debug-shell` và `adminer` cùng profile `debug`:
+
+```bash
+docker compose run --rm debug-shell
+```
+
+Invocation này không tự start `adminer` trừ khi profile được enable hoặc `adminer` được target/dependency.
+
+## Dependency consistency
+
+```yaml
+services:
+  report:
+    image: example/report:1
+    profiles: [reports]
+    depends_on:
+      analytics-db:
+        condition: service_healthy
+
+  analytics-db:
+    image: postgres:18-alpine
+    profiles: [analytics]
+```
+
+Nếu chỉ enable `reports`, model có thể không hợp lệ/không chạy được vì dependency nằm sau profile khác. Chọn một trong các thiết kế:
+
+- cho cả hai cùng profile;
+- để dependency core không có profile;
+- enable cả hai profiles;
+- tách module bằng include/file khác nếu lifecycle thực sự độc lập.
+
+Audit profile model:
+
+```bash
+docker compose config --profiles
+docker compose --profile reports config --services
+docker compose --profile reports --profile analytics config
+```
+
+## Profiles khác override files
+
+| Nhu cầu | Profiles | Override files |
+|---|---:|---:|
+| Bật/tắt service tùy chọn | Tốt | Có thể nhưng nặng |
+| Đổi image tag/resource/ports của cùng service | Không | Tốt |
+| Một file cho debug tool | Tốt | Có thể |
+| Production bỏ bind mount dev | Không trực tiếp | Tốt với `!reset`/`!override` |
+| Module do team khác sở hữu, path riêng | Không | `include` phù hợp hơn |
+
+Có thể kết hợp: base/production override quyết định config, profiles quyết định optional services.
+
+## Profile naming
+
+Tên phải bắt đầu bằng chữ/số và chỉ dùng chữ, số, `_`, `.`, `-` theo regex Compose. Dùng tên theo capability:
+
+- `debug`;
+- `observability`;
+- `tools`;
+- `gpu`;
+- `integration`.
+
+Tránh tên mơ hồ `extra`, `test2` hoặc tên môi trường nếu mục tiêu thật là thay hàng loạt config.
+
+## Lab: core, debug và one-off tool
+
+Tạo `compose.yaml`:
+
+```yaml
+name: compose-profile-lab
+
+services:
+  core:
+    image: alpine:3.23
+    command: ["sleep", "300"]
+
+  dashboard:
+    image: alpine:3.23
+    command: ["sleep", "300"]
+    profiles: [debug]
+
+  task:
+    image: alpine:3.23
+    command: ["sh", "-c", "echo one-off-task"]
+    profiles: [tools]
+    depends_on: [core]
+```
+
+Không profile:
+
+```bash
+docker compose up --detach
+docker compose ps --all
+```
+
+Expected: chỉ `core` chạy. Enable debug:
+
+```bash
+docker compose --profile debug up --detach
+docker compose ps
+```
+
+Target task trực tiếp:
+
+```bash
+docker compose run --rm task
+```
+
+Expected: task chạy dù profile `tools` chưa được enable; `dashboard` không bị ảnh hưởng.
+
+## Stop và cleanup
+
+Profile cũng ảnh hưởng tập service được command xử lý. Để cleanup tất cả service từng bật, truyền profile tương ứng hoặc tất cả:
+
+```bash
+docker compose --profile "*" down --remove-orphans
+```
+
+`down` không profile có thể không xử lý optional service theo cách bạn kỳ vọng trong mọi workflow/version; pipeline nên dùng cùng profile set lúc start hoặc `"*"` khi cleanup lab.
+
+## Best practices
+
+- Giữ dependency graph hợp lệ với mọi profile combination được hỗ trợ.
+- Dùng direct target cho one-off tools.
+- Không publish admin/debug port trên mọi host interface.
+- Không để debug image/tool vào production model nếu supply-chain policy không cho phép.
+- Test `docker compose --profile ... config` trong CI cho từng combination chính.
+- Document command chuẩn thay vì yêu cầu người dùng nhớ profile ngầm.
+
+## Nguồn chính thức
+
+- [Using profiles with Compose](https://docs.docker.com/compose/how-tos/profiles/)
+- [`profiles` service attribute](https://docs.docker.com/reference/compose-file/profiles/)
+- [Pre-defined Compose environment variables](https://docs.docker.com/compose/how-tos/environment-variables/envvars/)

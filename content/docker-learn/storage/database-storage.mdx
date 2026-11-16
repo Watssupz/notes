@@ -1,0 +1,200 @@
+---
+title: "Storage cho database"
+description: "Thiết kế database container với volume, ownership, graceful shutdown, native backup và một writer rõ ràng thay vì dựa vào writable layer."
+---
+
+Database là workload write-intensive có invariant giữa data files, log và memory buffers. Đặt data directory trên container writable layer vừa tăng coupling với storage backend vừa làm dữ liệu mất khi container bị remove.
+
+```text
+Database process
+   ├── data directory ──> named/external volume
+   ├── transaction log ─> theo layout và policy của database
+   ├── logical backup ──> failure domain khác
+   └── metrics/logs ────> observability pipeline
+```
+
+Volume giải quyết persistence qua container recreate. Nó không tự cung cấp replication, backup, point-in-time recovery hay high availability.
+
+## Nguyên tắc thiết kế
+
+1. Mount chính xác data directory mà image/database yêu cầu.
+2. Pin image version và đọc migration note trước major upgrade.
+3. Chạy một database writer cho một local data directory.
+4. Provision UID/GID và filesystem semantics phù hợp.
+5. Dừng graceful; không dùng `kill -9` làm quy trình bình thường.
+6. Dùng native backup hoặc snapshot được database hỗ trợ.
+7. Restore drill trên volume độc lập.
+8. Theo dõi capacity, inode, latency và backup lag.
+
+<Callout type="warn" title="Không chia sẻ data directory tùy ý">
+  Việc Docker cho phép hai container mount cùng volume không có nghĩa hai database process được phép mở cùng data directory. Nếu database không hỗ trợ mô hình đó, nguy cơ corruption hoặc split-brain là rất cao.
+</Callout>
+
+## Lab: PostgreSQL sống qua recreate container
+
+Ví dụ dùng PostgreSQL 18 và named volume. Password chỉ dành cho lab; production nên dùng secret mechanism và rotation phù hợp.
+
+```bash
+docker volume create postgres-data
+docker run -d --name storage-postgres \
+  --env POSTGRES_PASSWORD=lab-only-change-me \
+  --mount type=volume,src=postgres-data,dst=/var/lib/postgresql \
+  postgres:18-alpine
+```
+
+Chờ database sẵn sàng:
+
+```bash
+until docker exec storage-postgres pg_isready -U postgres >/dev/null 2>&1; do
+  sleep 1
+done
+```
+
+Tạo dữ liệu:
+
+```bash
+docker exec storage-postgres \
+  psql -U postgres -c 'CREATE TABLE storage_lab (id integer PRIMARY KEY, value text);'
+docker exec storage-postgres \
+  psql -U postgres -c "INSERT INTO storage_lab VALUES (1, 'persisted');"
+```
+
+Dừng graceful và xóa container, nhưng giữ volume:
+
+```bash
+docker stop --time 30 storage-postgres
+docker rm storage-postgres
+```
+
+Recreate bằng cùng major version và volume:
+
+```bash
+docker run -d --name storage-postgres \
+  --env POSTGRES_PASSWORD=lab-only-change-me \
+  --mount type=volume,src=postgres-data,dst=/var/lib/postgresql \
+  postgres:18-alpine
+
+until docker exec storage-postgres pg_isready -U postgres >/dev/null 2>&1; do
+  sleep 1
+done
+
+docker exec storage-postgres \
+  psql -U postgres -c 'TABLE storage_lab;'
+```
+
+Expected row có `1 | persisted`. Container mới nhận lại data vì state nằm trên volume.
+
+<Callout type="info" title="Mount path thay đổi từ PostgreSQL 18">
+  Official image PostgreSQL 18 trở lên đặt `PGDATA` theo major version, ví dụ `/var/lib/postgresql/18/docker`, và khai báo volume tại `/var/lib/postgresql`. Với PostgreSQL 17 trở xuống, path được khuyến nghị là `/var/lib/postgresql/data`. Luôn kiểm tra tài liệu đúng tag image trước khi mount.
+</Callout>
+
+## Initialization chỉ xảy ra với data directory rỗng
+
+Official database images thường chạy initialization script khi data directory chưa có database. Với volume đã khởi tạo:
+
+- đổi biến password có thể không đổi password đang lưu trong database;
+- thêm init script không tự chạy lại;
+- image mới không overwrite schema/data cũ;
+- permission hoặc version mismatch có thể làm startup fail.
+
+Coi initialization và migration là hai lifecycle khác nhau. Dùng migration tool hoặc database command có versioning, không xóa volume để “chạy init lại”.
+
+## Permission và filesystem semantics
+
+Database image thường chạy bằng non-root UID sau initialization. Kiểm tra identity và volume owner thay vì hard-code từ trí nhớ:
+
+```bash
+docker exec storage-postgres id
+docker exec storage-postgres sh -c \
+  'printf "PGDATA=%s\n" "$PGDATA"; stat -c "%u:%g %a %n" "$PGDATA"'
+```
+
+Backend phải đáp ứng semantics database cần, gồm file locking, atomic rename, durable sync và error reporting. Network filesystem hoặc volume plugin phải được database/vendor hỗ trợ và test dưới failure, không chỉ benchmark throughput.
+
+Không tắt `fsync`, WAL durability hoặc checksum chỉ để benchmark đẹp nếu bạn không chấp nhận mất/corrupt dữ liệu theo failure model tương ứng.
+
+## Backup đúng cấp
+
+PostgreSQL phân biệt logical dump, filesystem-level backup và continuous archiving/PITR. Ví dụ logical backup nhỏ:
+
+```bash
+mkdir -p "$PWD/storage-db-backups"
+docker exec storage-postgres \
+  pg_dump -U postgres --format=custom --file=/tmp/storage-lab.dump postgres
+docker cp storage-postgres:/tmp/storage-lab.dump \
+  "$PWD/storage-db-backups/storage-lab.dump"
+```
+
+Đây là ví dụ học tập; production cần:
+
+- lưu artifact ngoài host/failure domain;
+- mã hóa và kiểm soát quyền;
+- capture roles/global objects nếu cần;
+- kiểm tra return code và backup logs;
+- restore bằng `pg_restore` vào database test;
+- chọn PITR nếu RPO yêu cầu nhỏ hơn khoảng dump.
+
+Tar trực tiếp live data directory không tự trở thành consistent backup. Nếu dùng storage snapshot, phối hợp theo tài liệu database và backend.
+
+## Graceful shutdown và restart policy
+
+`docker stop` gửi stop signal rồi chờ timeout trước khi force kill. Database cần đủ thời gian checkpoint/shutdown theo workload.
+
+```bash
+docker stop --time 60 storage-postgres
+```
+
+Timeout phù hợp phải đo trên dataset thật. Restart policy giúp process được start lại sau exit, nhưng không sửa corruption, disk full hay incompatible upgrade. Restart loop có thể làm mất evidence và tăng tải I/O.
+
+## Capacity và observability
+
+Theo dõi ít nhất:
+
+- filesystem bytes và inodes;
+- database-reported size;
+- transaction/WAL growth;
+- checkpoint latency và storage latency;
+- backup age, duration, size và restore test gần nhất;
+- volume/backend health và quota.
+
+Từ Docker có thể xem inventory:
+
+```bash
+docker system df -v
+docker inspect storage-postgres \
+  --format '{{range .Mounts}}{{println .Type .Name .Destination .RW}}{{end}}'
+```
+
+Nhưng `docker system df` không thay thế database/backend metrics.
+
+## Upgrade và rollback
+
+Major upgrade thường thay đổi on-disk format. Quy trình tối thiểu:
+
+1. đọc release/official image notes;
+2. tạo và xác minh backup;
+3. test migration trên bản copy;
+4. đo duration và disk headroom;
+5. dừng writer cũ;
+6. migrate bằng tool được hỗ trợ;
+7. validate schema, query và performance;
+8. chỉ xóa dataset cũ sau rollback window.
+
+Không mount volume đã được nâng major trở lại image major cũ và kỳ vọng rollback tự động.
+
+## Cleanup bài thực hành
+
+```bash
+docker rm -f storage-postgres
+docker volume rm postgres-data
+rm -rf "$PWD/storage-db-backups"
+```
+
+Các command này xóa toàn bộ database và backup lab.
+
+## Nguồn chính thức
+
+- [Docker volumes](https://docs.docker.com/engine/storage/volumes/)
+- [PostgreSQL official image](https://hub.docker.com/_/postgres)
+- [PostgreSQL backup and restore](https://www.postgresql.org/docs/current/backup.html)
+- [PostgreSQL server shutdown](https://www.postgresql.org/docs/current/server-shutdown.html)

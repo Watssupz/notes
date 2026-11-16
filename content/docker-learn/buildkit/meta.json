@@ -1,0 +1,15 @@
+{
+  "title": "BuildKit và Buildx",
+  "pages": [
+    "index",
+    "buildx",
+    "cache-mounts",
+    "secret-and-ssh-mounts",
+    "external-cache",
+    "multi-platform-builds",
+    "builders-and-drivers",
+    "bake",
+    "attestations-sbom-provenance",
+    "build-troubleshooting"
+  ]
+}

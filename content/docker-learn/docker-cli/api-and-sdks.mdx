@@ -1,0 +1,317 @@
+---
+title: "Docker Engine API và SDKs"
+description: "Gọi Docker Engine qua Unix socket hoặc SDK, negotiate API version, xử lý lifecycle và stream đúng cách, đồng thời bảo vệ daemon endpoint như một privileged control plane."
+---
+
+Docker CLI là một client của Docker Engine API. Khi shell command không còn đủ cho reconciliation, structured error handling, concurrency hoặc tích hợp application, bạn có thể gọi REST API trực tiếp hoặc dùng SDK.
+
+```text
+CLI / SDK / HTTP client
+        │
+        │ Engine API over Unix socket, named pipe, SSH tunnel hoặc TLS
+        ▼
+Docker daemon
+        ├── images
+        ├── containers
+        ├── networks
+        ├── volumes
+        └── events/build/runtime integration
+```
+
+<Callout type="error" title="Engine API là privileged control plane">
+  Quyền gọi Docker daemon rootful thường có thể dẫn tới quyền tương đương root trên daemon host. Không expose plaintext TCP, không mount socket vào workload không tin cậy và không coi HTTP API là một application API thông thường.
+</Callout>
+
+## Khi dùng CLI, API hoặc SDK?
+
+| Cách | Phù hợp | Trade-off |
+|---|---|---|
+| Docker CLI | Runbook, thao tác tương tác, script nhỏ | Dễ dùng nhưng parse output/stream/error phức tạp khi scale |
+| HTTP API trực tiếp | Debug protocol, integration cần endpoint chính xác, ngôn ngữ không có SDK tốt | Phải tự version, encode request, multiplex stream, retry và security |
+| Official Go/Python SDK | Service/tool cần typed abstraction và lifecycle | Thêm dependency; vẫn phải hiểu API version và daemon semantics |
+| Community SDK | Ngôn ngữ khác | Support/compatibility thuộc maintainer, không phải Docker |
+
+Không xây production service bằng cách shell-out `docker` nếu cần high concurrency và structured cancellation; SDK thường dễ kiểm soát context, timeout và response hơn. Ngược lại, không cần viết API client cho runbook một lần.
+
+## Xác định endpoint và API range
+
+Trước khi gọi trực tiếp:
+
+```bash
+docker context show
+docker context inspect "$(docker context show)"
+docker version
+```
+
+`docker version` hiển thị API version phía Client/Server và minimum version daemon hỗ trợ. Không copy API version từ ví dụ trên Internet; dùng version có feature cần thiết và nằm trong range của daemon.
+
+Docker client/daemon hỗ trợ API negotiation. Khi ép `DOCKER_API_VERSION`, negotiation bị tắt:
+
+```bash
+DOCKER_API_VERSION=1.54 docker version
+```
+
+Chỉ pin như trên sau khi xác minh environment. Bình thường để SDK/client negotiate giúp tương thích tốt hơn.
+
+## Lab HTTP qua Unix socket
+
+Phần này áp dụng Linux Engine local với Unix socket và user đã có quyền. Không chạy trên shared/production daemon.
+
+### Ping daemon
+
+```bash
+curl --fail --silent --show-error \
+  --unix-socket /var/run/docker.sock \
+  http://localhost/_ping
+```
+
+Expected body là `OK`. Hostname `localhost` không quyết định destination vì cURL kết nối Unix socket.
+
+### Đọc version
+
+```bash
+curl --fail --silent --show-error \
+  --unix-socket /var/run/docker.sock \
+  http://localhost/version | jq '.'
+```
+
+Response cho biết `ApiVersion` và `MinAPIVersion` trên Engine hỗ trợ. Các endpoint versioned dùng prefix như `/v1.54/...`; không hard-code giá trị đó cho mọi daemon. Trong lab, lấy maximum API version từ Server hiện tại:
+
+```bash
+API_VERSION=$(docker version --format '{{.Server.APIVersion}}')
+printf 'Using Engine API v%s\n' "$API_VERSION"
+```
+
+### Liệt kê container
+
+```bash
+curl --fail --silent --show-error \
+  --unix-socket /var/run/docker.sock \
+  "http://localhost/v${API_VERSION}/containers/json?all=true" |
+  jq 'map({id: .Id, names: .Names, state: .State, status: .Status})'
+```
+
+URL query phải được encode đúng trong integration thực tế. `curl --get --data-urlencode` hữu ích với filter JSON phức tạp.
+
+### Tạo, start, wait, logs và remove
+
+Pull image trước bằng CLI cho lab để tập trung vào lifecycle API:
+
+```bash
+docker image pull alpine:latest
+```
+
+Các command tiếp tục dùng `API_VERSION` đã lấy từ Server ở bước trước. Tạo container:
+
+```bash
+container_id=$(
+  curl --fail --silent --show-error \
+    --unix-socket /var/run/docker.sock \
+    --header 'Content-Type: application/json' \
+    --request POST \
+    --data '{"Image":"alpine:latest","Cmd":["echo","api-ok"],"Labels":{"com.example.lab":"engine-api"}}' \
+    "http://localhost/v${API_VERSION}/containers/create?name=engine-api-lab" |
+  jq -r '.Id'
+)
+
+printf 'container_id=%s\n' "$container_id"
+```
+
+Start và wait:
+
+```bash
+curl --fail --silent --show-error \
+  --unix-socket /var/run/docker.sock \
+  --request POST \
+  "http://localhost/v${API_VERSION}/containers/${container_id}/start"
+
+curl --fail --silent --show-error \
+  --unix-socket /var/run/docker.sock \
+  --request POST \
+  "http://localhost/v${API_VERSION}/containers/${container_id}/wait?condition=not-running" |
+  jq '.'
+```
+
+Đọc logs:
+
+```bash
+curl --fail --silent --show-error \
+  --unix-socket /var/run/docker.sock \
+  "http://localhost/v${API_VERSION}/containers/${container_id}/logs?stdout=1&stderr=1"
+```
+
+Với non-TTY container, attach/log stream có thể dùng multiplexed framing thay vì raw UTF-8 trong trường hợp tổng quát. Ví dụ nhỏ có thể trông như text, nhưng production client nên dùng SDK helper để demultiplex stdout/stderr.
+
+Cleanup:
+
+```bash
+curl --fail --silent --show-error \
+  --unix-socket /var/run/docker.sock \
+  --request DELETE \
+  "http://localhost/v${API_VERSION}/containers/${container_id}"
+```
+
+Xác minh `404` sau delete hoặc list theo label. Nếu bất kỳ bước nào fail giữa chừng, giữ `container_id` và cleanup có chủ đích; không chạy system prune.
+
+## HTTP status và error body
+
+Đừng chỉ parse JSON body. Integration phải xử lý:
+
+- transport error: socket/TLS/DNS/timeout;
+- HTTP status: success, bad request, not found, conflict, server error;
+- Docker error message trong response;
+- partial stream/disconnect;
+- operation đã có side effect trước khi client timeout.
+
+Dùng `curl --fail-with-body` nếu cURL version hỗ trợ để giữ body khi status lỗi:
+
+```bash
+curl --fail-with-body --silent --show-error \
+  --unix-socket /var/run/docker.sock \
+  "http://localhost/v${API_VERSION}/containers/does-not-exist/json"
+```
+
+Retry mù một POST create/start/remove có thể tạo conflict hoặc lặp side effect. Thiết kế idempotency bằng deterministic name/label, inspect current state và reconcile.
+
+## Python SDK
+
+Cài trong virtual environment theo dependency policy:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install docker
+```
+
+Ví dụ read-only trước:
+
+```python
+import docker
+
+client = docker.from_env()
+
+try:
+    assert client.ping()
+    version = client.version()
+    print({
+        "engine_version": version.get("Version"),
+        "api_version": version.get("ApiVersion"),
+        "min_api_version": version.get("MinAPIVersion"),
+    })
+finally:
+    client.close()
+```
+
+Lifecycle có cleanup:
+
+```python
+import docker
+
+client = docker.from_env()
+container = None
+
+try:
+    container = client.containers.run(
+        "alpine:latest",
+        ["echo", "sdk-ok"],
+        name="sdk-lab",
+        labels={"com.example.lab": "engine-sdk"},
+        detach=True,
+    )
+    result = container.wait(timeout=30)
+    print(result)
+    print(container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace"))
+finally:
+    if container is not None:
+        container.remove(force=True)
+    client.close()
+```
+
+`force=True` trong `finally` giới hạn ở container lab có deterministic name; không áp pattern này cho object do user/controller khác sở hữu. Production code phải xử lý name conflict, image pull policy, timeout, cancellation và cleanup error riêng.
+
+Docker Desktop for Linux dùng per-user socket theo official SDK guide; SDK không tự động giả định `/var/run/docker.sock` trong mọi setup. Dùng endpoint/context được platform hỗ trợ và test `client.ping()`.
+
+## Go SDK
+
+Official current documentation dùng module Moby client:
+
+```bash
+go get github.com/moby/moby/client
+```
+
+Go integration nên:
+
+- tạo `context.Context` có timeout/cancellation;
+- khởi tạo client từ environment phù hợp;
+- bật API version negotiation theo SDK API hiện tại;
+- `defer client.Close()`;
+- consume/close response body và stream;
+- dùng `stdcopy` helper khi demultiplex Docker stream;
+- pin/test module version trong `go.mod`.
+
+API surface của Go SDK thay đổi theo module release; dùng examples/reference đúng version đã pin, không copy signature từ một release khác.
+
+## Remote API security
+
+### Unix socket
+
+Filesystem permission là access control. Membership nhóm `docker` trên rootful Engine là quyền rất mạnh. Không `chmod 666 /var/run/docker.sock`.
+
+### SSH
+
+Docker context qua SSH phù hợp thao tác CLI. Application service cần connection pooling/latency/reconnect rõ ràng; không tự dựng shell command SSH nếu SDK/transport hỗ trợ tốt hơn.
+
+### TLS TCP
+
+Nếu expose TCP, dùng mutual TLS, firewall allowlist, certificate rotation và hostname verification. Port convention thường là `2376` cho TLS và `2375` cho insecure, nhưng security không đến từ port number; daemon phải thực sự cấu hình TLS verification.
+
+Không publish Docker API qua reverse proxy có authentication yếu. Engine API không cung cấp multi-tenant authorization model đầy đủ cho untrusted users chỉ nhờ HTTP path filtering.
+
+### Socket trong container
+
+Mount `/var/run/docker.sock` cho CI agent hoặc management container trao quyền điều khiển host daemon. Nếu bắt buộc:
+
+- isolate dedicated daemon/runner;
+- không chạy untrusted pull request;
+- hạn chế credential và network;
+- monitor API action;
+- dùng ephemeral host;
+- đánh giá rootless/remote builder hoặc purpose-built build service thay thế.
+
+## Events, streams và long-running connection
+
+Endpoint events/logs/attach có streaming semantics. Client cần:
+
+- read loop có cancellation;
+- reconnect với bounded `since` window;
+- deduplicate event;
+- xử lý 256-event history limit;
+- backpressure;
+- close body/socket;
+- không retry từ đầu vô hạn.
+
+Xem [Theo dõi Docker events](/docs/docker-cli/events/) để thiết kế consumer dựa event như trigger rồi reconcile current state.
+
+## Compatibility và test strategy
+
+Ma trận test tối thiểu cho integration:
+
+| Dimension | Case cần test |
+|---|---|
+| Engine version | Minimum supported và current |
+| API negotiation | Daemon cũ hơn client; feature absent |
+| Platform | Linux Engine/Desktop/Windows nếu support |
+| Endpoint | Unix socket và remote TLS/SSH theo product |
+| State | Object absent, created, running, exited, deleting |
+| Failure | Timeout, disconnect, 404, 409, 500 |
+| Stream | Empty, partial, reconnect, high event rate |
+| Security | Unauthorized, bad cert, wrong context/socket |
+
+Contract test nên chạy trên disposable daemon, tạo object có unique label và cleanup theo ID. Không chạy destructive test trên shared daemon.
+
+## Nguồn chính thức
+
+- [Docker Engine API](https://docs.docker.com/reference/api/engine/)
+- [Develop with Docker Engine SDKs](https://docs.docker.com/reference/api/engine/sdk/)
+- [Protect the Docker daemon socket](https://docs.docker.com/engine/security/protect-access/)
+- [Docker contexts](https://docs.docker.com/engine/manage-resources/contexts/)

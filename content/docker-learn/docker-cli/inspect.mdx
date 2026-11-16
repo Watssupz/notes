@@ -1,0 +1,288 @@
+---
+title: "Inspect Docker object"
+description: "Đọc low-level JSON của container, image, network và volume; phân biệt desired config với runtime state, trích field an toàn và dùng inspect trong troubleshooting."
+---
+
+`docker inspect` trả low-level information về object do Docker quản lý. Đây là nguồn dữ liệu chính để trả lời các câu hỏi như:
+
+- container được cấu hình chạy image/command nào;
+- process đang ở state gì và exit code bao nhiêu;
+- mount source/destination effective là gì;
+- port được bind vào host address nào;
+- object có label, network hoặc restart policy nào.
+
+Mặc định, output là **JSON array**, kể cả khi chỉ inspect một object:
+
+```bash
+docker container inspect web
+```
+
+## Chọn command theo object type
+
+Ưu tiên object-specific inspect:
+
+```bash
+docker container inspect web
+docker image inspect nginx:alpine
+docker network inspect frontend
+docker volume inspect app-data
+```
+
+Generic command cũng hỗ trợ type:
+
+```bash
+docker inspect --type container web
+docker inspect --type volume app-data
+```
+
+Nếu container và volume trùng tên, `docker inspect NAME` có thể mơ hồ. Type explicit làm intent và schema rõ hơn.
+
+## Mental model của container inspect
+
+Các nhóm field quan trọng thường gồm:
+
+| Nhóm | Câu hỏi trả lời |
+|---|---|
+| `Id`, `Name`, `Created` | Object nào và được tạo khi nào? |
+| `Config` | Image, command, env, labels, healthcheck mà container nhận là gì? |
+| `HostConfig` | Mount/bind, resource, restart, security và network mode phía host là gì? |
+| `State` | Process hiện chạy/dừng, exit code, OOM, health ra sao? |
+| `NetworkSettings` | Endpoint, IP và published port runtime là gì? |
+| `Mounts` | Mount effective, source, destination và read/write state là gì? |
+| `LogPath` | Daemon lưu log file ở đâu với driver phù hợp? |
+
+Schema thay đổi theo object type, Engine version, platform và feature. Dùng JSON thực tế làm source trước khi tạo template.
+
+<Callout type="warn" title="Inspect có thể lộ dữ liệu nhạy cảm">
+  Output có environment variable, label, command argument, bind-mount host path, registry/image metadata và network address. Chỉ trích field cần thiết; redact trước khi gửi vào ticket hoặc log tập trung.
+</Callout>
+
+## Lab tạo object có state quan sát được
+
+Tạo container đã dừng:
+
+```bash
+docker container create \
+  --name inspect-lab \
+  --label com.example.lab=inspect \
+  --env APP_MODE=demo \
+  --read-only \
+  alpine:latest sh -c 'echo inspect-ok; exit 7'
+
+docker container start --attach inspect-lab || true
+```
+
+`|| true` chỉ dùng trong lab vì process cố ý exit `7`. Xác minh state:
+
+```bash
+docker container inspect inspect-lab \
+  --format 'status={{.State.Status}} exit={{.State.ExitCode}} readonly={{.HostConfig.ReadonlyRootfs}}'
+```
+
+Expected: status `exited`, exit code `7`, read-only root filesystem `true`.
+
+Cleanup sau khi hoàn thành trang:
+
+```bash
+docker container rm inspect-lab
+```
+
+## Đọc desired config và runtime state
+
+### Image, entrypoint, command
+
+```bash
+docker container inspect inspect-lab \
+  --format 'image={{.Config.Image}} entrypoint={{json .Config.Entrypoint}} cmd={{json .Config.Cmd}}'
+```
+
+Dùng `json` để giữ boundary list argument. Ghép thành string có thể làm mất khác biệt giữa một argument chứa space và hai argument riêng.
+
+### Environment và labels
+
+```bash
+docker container inspect inspect-lab \
+  --format '{{json .Config.Env}}' | jq '.'
+
+docker container inspect inspect-lab \
+  --format '{{json .Config.Labels}}' | jq '.'
+```
+
+Không in toàn bộ env trong production incident nếu có secret.
+
+### State, exit và health
+
+```bash
+docker container inspect inspect-lab \
+  --format '{{json .State}}' | jq '.'
+```
+
+Các field cần đọc cùng nhau:
+
+- `.State.Status`: lifecycle state;
+- `.State.Running`: process còn chạy không;
+- `.State.ExitCode`: exit status lần chạy gần nhất;
+- `.State.Error`: lỗi runtime/start;
+- `.State.OOMKilled`: kernel/runtime ghi nhận OOM kill;
+- `.State.Health`: chỉ có khi container cấu hình healthcheck.
+
+Template safe cho health optional:
+
+```bash
+docker container inspect inspect-lab \
+  --format '{{with .State.Health}}{{.Status}}{{else}}no-healthcheck{{end}}'
+```
+
+Health `unhealthy` không tự động đồng nghĩa container bị restart; restart policy gắn với process exit, còn orchestrator/automation có thể có policy riêng.
+
+## Mount và storage
+
+```bash
+docker container inspect web \
+  --format '{{json .Mounts}}' |
+  jq -r '.[] | [.Type, .Source, .Destination, (.RW|tostring), .Propagation] | @tsv'
+```
+
+Đọc:
+
+- `Type`: bind, volume, tmpfs hoặc type được platform hỗ trợ;
+- `Source`: host path hoặc volume path/name tùy type;
+- `Destination`: path trong container;
+- `RW`: mount có writable không;
+- `Propagation`: behavior propagation khi áp dụng.
+
+Không chỉnh sửa trực tiếp `Source` hoặc dữ liệu dưới Docker data root khi daemon đang quản lý. Với volume, inspect object riêng:
+
+```bash
+docker volume inspect app-data
+```
+
+`Mountpoint` là implementation detail phía daemon host; backup/restore phải theo storage driver và application consistency, không chỉ tar path tùy tiện.
+
+## Network và port
+
+Xem network map:
+
+```bash
+docker container inspect web \
+  --format '{{json .NetworkSettings.Networks}}' | jq '.'
+```
+
+Xem port bindings:
+
+```bash
+docker container inspect web \
+  --format '{{json .NetworkSettings.Ports}}' | jq '.'
+```
+
+Một key như `80/tcp` không dùng dot notation được; dùng `index`:
+
+```bash
+docker container inspect web \
+  --format '{{json (index .NetworkSettings.Ports "80/tcp")}}'
+```
+
+Value có thể `null`, có nhiều binding, hoặc host port được cấp động. Không index phần tử đầu tiên nếu chưa kiểm tra list.
+
+Để xem nhanh:
+
+```bash
+docker container port web
+```
+
+Với remote context, host IP/port thuộc daemon host.
+
+## Image inspect
+
+```bash
+docker image inspect nginx:alpine \
+  --format 'id={{.Id}} os={{.Os}} arch={{.Architecture}} digests={{json .RepoDigests}}'
+```
+
+Phân biệt:
+
+- image ID nhận diện local image content/config graph;
+- tag là mutable reference;
+- repo digest gắn registry repository với content digest, nhưng có thể absent trong local-only workflow;
+- architecture/platform phải được kiểm tra khi chạy multi-platform.
+
+Để xem layer/history ở góc nhìn build, kết hợp `docker image history`; inspect không thay thế SBOM hoặc vulnerability scan.
+
+## Network inspect
+
+```bash
+docker network inspect frontend \
+  --format '{{json .IPAM.Config}}' | jq '.'
+
+docker network inspect frontend \
+  --format '{{json .Containers}}' | jq '.'
+```
+
+Dữ liệu giúp xác minh subnet/gateway và endpoint attached. Trên dynamic environment, state có thể đổi giữa lúc inspect và action; không coi snapshot là transaction lock.
+
+## Container size
+
+Generic `docker inspect --size` hoặc container inspect option tương ứng thêm:
+
+- `SizeRw`: dữ liệu tạo/thay đổi trong writable layer so với image;
+- `SizeRootFs`: tổng filesystem size nhìn theo image + writable layer.
+
+```bash
+docker inspect --size inspect-lab \
+  --format 'rw={{.SizeRw}} rootfs={{.SizeRootFs}}'
+```
+
+Size calculation có cost và không phản ánh đầy đủ volume/bind mount data. Dùng `docker system df -v` cho inventory daemon disk và storage tooling cho filesystem thực tế.
+
+## Inspect trong troubleshooting
+
+### Container không start
+
+Thu evidence trước khi xóa/recreate:
+
+```bash
+docker container inspect web \
+  --format '{{json .State}}' | jq '.'
+docker container logs --tail 200 web
+docker events --since '15m' --until '0s' \
+  --filter 'container=web'
+```
+
+Review `.State.Error`, exit code, OOM, command, mount, security option và logs. Xem [Container không start](/docs/observability-va-troubleshooting/container-wont-start/).
+
+### Port không truy cập được
+
+```bash
+docker container inspect web \
+  --format '{{json .NetworkSettings.Ports}}' | jq '.'
+docker container port web
+```
+
+Phân biệt container process lắng nghe, Docker publish, host firewall và remote context. Inspect chỉ xác nhận Docker state, không chứng minh application đang listen.
+
+### Restart loop
+
+```bash
+docker container inspect web \
+  --format 'status={{.State.Status}} exit={{.State.ExitCode}} restarts={{.RestartCount}} policy={{.HostConfig.RestartPolicy.Name}}'
+```
+
+Kết hợp timestamp/event/log; một snapshot có thể bỏ lỡ transition nhanh.
+
+## Race condition và schema drift
+
+Inspect là snapshot. Giữa inspect và command tiếp theo, object có thể bị restart, update hoặc delete. Automation cần:
+
+- xử lý `404/not found` như một state hợp lệ khi object dynamic;
+- dùng immutable ID khi name có thể được reuse;
+- không dựa vào ordering của JSON map;
+- pin/test minimum Engine API version;
+- validate optional field trước dereference;
+- dùng controller/API transaction phù hợp nếu cần reconciliation, không xây lock bằng shell sleep.
+
+## Nguồn chính thức
+
+- [docker inspect](https://docs.docker.com/reference/cli/docker/inspect/)
+- [Format command and log output](https://docs.docker.com/go/formatting/)
+- [docker container inspect](https://docs.docker.com/reference/cli/docker/container/inspect/)
+- [docker image inspect](https://docs.docker.com/reference/cli/docker/image/inspect/)

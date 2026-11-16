@@ -1,0 +1,215 @@
+---
+title: "Login, push và pull image"
+description: "Thực hành đăng nhập registry, đặt tên, push, pull và xác minh digest mà không làm lộ credential hoặc phát hành nhầm repository."
+---
+
+Ba command `docker login`, `docker push` và `docker pull` tạo đường đi từ local image store tới registry rồi sang host khác. Sai sót phổ biến không nằm ở cú pháp mà ở identity, full image reference, tag mutable và cách truyền secret.
+
+## Chuẩn bị reference
+
+Dùng biến để tránh gõ nhầm namespace:
+
+```bash
+export REGISTRY='registry.example.com'
+export REPOSITORY='team/hello'
+export VERSION='0.1.0'
+export IMAGE="${REGISTRY}/${REPOSITORY}:${VERSION}"
+```
+
+Reference không chứa `https://`; registry address cho `docker login` chỉ gồm hostname và port tùy chọn:
+
+```text
+registry.example.com
+registry.example.com:5000
+```
+
+Không dùng:
+
+```text
+https://registry.example.com/team
+```
+
+## Login an toàn
+
+Interactive login phù hợp máy developer:
+
+```bash
+docker login registry.example.com
+```
+
+CI nên đọc token từ standard input:
+
+```bash
+printf '%s' "$REGISTRY_TOKEN" | \
+  docker login registry.example.com \
+  --username "$REGISTRY_USERNAME" \
+  --password-stdin
+```
+
+`--password-stdin` tránh secret xuất hiện trong shell history hoặc process argument. Tuy vậy CI vẫn phải mask biến, không bật `set -x` quanh command và không in environment khi debug.
+
+<Callout type="warn" title="Credential local">
+  Nếu không cấu hình credential store/helper, Docker có thể lưu credential dạng base64 trong `~/.docker/config.json`. Base64 không phải mã hóa. Dùng OS keychain hoặc helper phù hợp.
+</Callout>
+
+Logout khỏi đúng registry:
+
+```bash
+docker logout registry.example.com
+```
+
+Logout xóa credential client đang lưu; nó không revoke token tại provider. Nếu token lộ, phải revoke ở registry/IAM.
+
+## Build và tag đúng đích
+
+Tạo lab nhỏ:
+
+```bash
+mkdir registry-flow-lab
+cd registry-flow-lab
+```
+
+```dockerfile
+FROM alpine:3.23
+ARG REVISION=dev
+LABEL org.opencontainers.image.revision=$REVISION
+CMD ["echo", "registry flow works"]
+```
+
+Build trực tiếp với full destination reference:
+
+```bash
+docker build \
+  --build-arg REVISION="${GIT_SHA:-dev}" \
+  --tag "$IMAGE" .
+```
+
+Hoặc retag image có sẵn:
+
+```bash
+docker tag hello:local "$IMAGE"
+```
+
+`docker tag` chỉ tạo local reference, không copy layer và chưa gửi gì tới registry.
+
+## Push
+
+```bash
+docker push "$IMAGE"
+```
+
+Push upload những blob registry chưa có rồi cập nhật manifest/tag. Progress bar có thể hiển thị kích thước chưa nén, không nhất thiết bằng bytes thực truyền qua network.
+
+Ghi lại dòng digest từ output:
+
+```text
+0.1.0: digest: sha256:... size: ...
+```
+
+Sau push, xác minh remote artifact thay vì chỉ xem local image:
+
+```bash
+docker buildx imagetools inspect "$IMAGE"
+```
+
+Push mọi local tag trong repository bằng `--all-tags` có thể phát hành nhầm tag dev/test:
+
+```bash
+docker push --all-tags registry.example.com/team/hello
+```
+
+Chỉ dùng khi đã liệt kê và approve toàn bộ tag. CI release nên push explicit tag.
+
+## Pull bằng tag và digest
+
+Pull bằng tag:
+
+```bash
+docker pull "$IMAGE"
+```
+
+Pull bằng digest khóa đúng remote manifest:
+
+```bash
+export DIGEST='sha256:<DIGEST_TỪ_PUSH>'
+docker pull "${REGISTRY}/${REPOSITORY}@${DIGEST}"
+```
+
+Chạy artifact đã pull:
+
+```bash
+docker run --rm "${REGISTRY}/${REPOSITORY}@${DIGEST}"
+```
+
+Expected output:
+
+```text
+registry flow works
+```
+
+Pin digest cho reproducibility nhưng phải có automation cập nhật digest khi dependency/image có bản vá.
+
+## Multi-platform image
+
+Buildx có thể push image index trực tiếp:
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --tag "$IMAGE" \
+  --push .
+```
+
+Inspect platforms:
+
+```bash
+docker buildx imagetools inspect "$IMAGE"
+```
+
+`docker push --platform linux/amd64 "$IMAGE"` chỉ push manifest platform được chọn theo behavior CLI hiện hành và có thể không giữ image index, manifest khác hoặc attestation. Không dùng như shortcut release nếu cần artifact multi-platform hoàn chỉnh.
+
+## Xử lý lỗi theo lớp
+
+| Triệu chứng | Kiểm tra đầu tiên |
+|---|---|
+| `unauthorized` | Đúng registry, username/token, token hết hạn và scope pull/push |
+| `denied` | Identity đã xác thực nhưng không có quyền repository/action |
+| `name unknown` | Namespace/repository/tag có tồn tại và viết đúng không |
+| `manifest unknown` | Tag/digest hoặc platform manifest đã được push chưa |
+| `x509: certificate signed by unknown authority` | CA chain và trust store của Docker daemon |
+| Timeout khi push/pull | DNS, proxy, MTU, firewall, concurrent transfer và registry logs |
+| `429 Too Many Requests` | Pull/abuse limit của provider và mức authentication |
+| `no matching manifest` | Image index có platform của host không |
+
+Docker CLI giao tiếp registry qua daemon trong mô hình Docker Engine thông thường. Cấu hình proxy/CA cho shell chưa chắc áp dụng cho daemon; kiểm tra đúng trust boundary.
+
+## Quy trình release tối thiểu
+
+1. Build một lần từ source revision rõ ràng.
+2. Test image local hoặc trong environment cô lập.
+3. Login bằng identity có scope tối thiểu.
+4. Push exact release tag.
+5. Ghi remote digest và platforms.
+6. Scan/ký/attest artifact theo digest.
+7. Promote cùng digest, không rebuild theo environment.
+8. Deploy digest đã approve.
+9. Logout và xóa secret khỏi runner.
+
+## Cleanup lab
+
+Lệnh sau chỉ xóa local image và file lab:
+
+```bash
+docker image rm "$IMAGE" 2>/dev/null || true
+cd ..
+rm -rf registry-flow-lab
+```
+
+Không tự động xóa remote tag vì đây là thao tác ảnh hưởng artifact dùng chung. Nếu là repository lab, xóa qua UI/API sau khi xác nhận không còn consumer.
+
+## Nguồn chính thức
+
+- [`docker login`](https://docs.docker.com/reference/cli/docker/login/)
+- [`docker image push`](https://docs.docker.com/reference/cli/docker/image/push/)
+- [`docker image pull`](https://docs.docker.com/reference/cli/docker/image/pull/)
+- [`docker image tag`](https://docs.docker.com/reference/cli/docker/image/tag/)

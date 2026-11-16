@@ -1,0 +1,13 @@
+{
+  "title": "Kubernetes và Docker",
+  "pages": [
+    "index",
+    "docker-vs-kubernetes",
+    "cri-and-containerd",
+    "build-images-for-kubernetes",
+    "compose-to-kubernetes",
+    "kind",
+    "registry-integration",
+    "migration-strategy"
+  ]
+}

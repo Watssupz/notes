@@ -1,0 +1,258 @@
+---
+title: "Stop, kill và restart"
+description: "Hiểu signal flow của docker stop, kill và restart; thiết kế graceful shutdown cho PID 1, chọn timeout đúng và xác minh nguyên nhân container dừng."
+---
+
+Ba command cùng làm thay đổi state nhưng có mục đích khác nhau:
+
+- `docker stop` yêu cầu application shutdown có trật tự và chỉ force kill khi hết grace period;
+- `docker kill` gửi một signal ngay, mặc định là `SIGKILL`;
+- `docker restart` dừng rồi start lại **cùng container object**.
+
+Trong production, `stop` là đường mặc định. `kill` phù hợp khi process treo, cần gửi một control signal cụ thể hoặc grace period không còn ý nghĩa.
+
+## Signal flow của `docker stop`
+
+Luồng mặc định trên Linux container:
+
+```text
+docker stop
+  → gửi StopSignal cho PID 1 (mặc định SIGTERM nếu chưa cấu hình)
+  → chờ process thoát trong timeout
+  → nếu vẫn chạy, gửi SIGKILL
+  → container chuyển sang exited
+```
+
+Nguồn của stop signal theo thứ tự cấu hình effective:
+
+1. `--stop-signal` lúc `docker run` hoặc `docker create`;
+2. `STOPSIGNAL` trong image;
+3. `SIGTERM` nếu không cấu hình.
+
+Timeout có thể đặt cho từng lần stop:
+
+```bash
+docker container stop --time 30 api
+```
+
+Hoặc đặt default của container ngay lúc tạo bằng `--stop-timeout`. Theo CLI reference hiện hành, nếu container không có default riêng, daemon dùng 10 giây cho Linux container và 30 giây cho Windows container. Kiểm tra `docker container stop --help` trên client/daemon mục tiêu khi viết automation có yêu cầu version cụ thể.
+
+`--time -1` yêu cầu daemon chờ vô hạn. Chỉ dùng khi một lớp orchestration khác áp deadline; nếu không, rollout có thể treo mãi khi application không shutdown được.
+
+## `docker kill`: signal không có grace period
+
+Không chỉ định option:
+
+```bash
+docker container kill api
+```
+
+Docker gửi `SIGKILL` cho PID 1. Process không thể catch signal này để flush buffer, đóng connection hoặc hoàn tất transaction.
+
+Chọn signal khác:
+
+```bash
+docker container kill --signal SIGHUP api
+docker container kill --signal SIGUSR1 api
+```
+
+Custom signal có thể không làm container dừng. Ví dụ nhiều daemon dùng `SIGHUP` để reload config. Sau command, luôn xác minh state thay vì hiểu chữ “kill” theo nghĩa process chắc chắn đã chết.
+
+<Callout type="warn" title="Force kill có thể làm mất dữ liệu đang xử lý">
+  Trước `SIGKILL`, cân nhắc transaction, write buffer, queue lease và filesystem consistency của application. Thu logs/inspect trước nếu incident cần post-mortem evidence.
+</Callout>
+
+## `docker restart`: stop rồi start cùng identity
+
+```bash
+docker container restart --time 30 api
+```
+
+Command dùng stop signal/timeout như `stop`, sau đó khởi chạy lại process chính. Container ID, writable layer, mount configuration và image ID không đổi. PID và start timestamp đổi.
+
+Do đó `restart`:
+
+- không pull hoặc deploy image mới;
+- không nhận environment variable mới từ shell/Compose file;
+- không sửa mount, port hay security configuration;
+- không xóa file được ghi vào writable layer;
+- không chữa nguyên nhân crash nếu input/config cũ vẫn giữ nguyên.
+
+Restart có thể là mitigation ngắn hạn, nhưng không thay thế chẩn đoán hoặc immutable rollout.
+
+## PID 1 phải nhận và xử lý signal
+
+Docker gửi signal đến process chính của container. Trên Linux, PID 1 có semantics signal và trách nhiệm reap child đặc biệt. Hai lỗi thường gặp là application không đăng ký handler và shell wrapper không forward signal.
+
+### Ưu tiên exec form
+
+```dockerfile
+ENTRYPOINT ["/app/server"]
+CMD ["--listen", ":8080"]
+```
+
+Application trở thành PID 1 và nhận stop signal trực tiếp.
+
+Shell form thêm `/bin/sh -c`:
+
+```dockerfile
+ENTRYPOINT /app/server --listen :8080
+```
+
+Shell có thể là PID 1 trong khi server là child; signal không nhất thiết được forward đúng. Nếu cần wrapper, kết thúc setup bằng `exec`:
+
+```sh
+#!/bin/sh
+set -eu
+
+# Chuẩn bị file/config cần thiết.
+exec /app/server "$@"
+```
+
+Với process sinh nhiều child mà application không reap đúng, `--init` thêm một init process nhỏ để forward signal và reap zombie:
+
+```bash
+docker container run --init app:1.0
+```
+
+`--init` không tự tạo graceful shutdown logic cho application; process vẫn phải xử lý signal và deadline.
+
+## Thiết kế graceful shutdown
+
+Một service nhận stop signal nên:
+
+1. ngừng nhận work/connection mới;
+2. báo not-ready hoặc rút khỏi traffic trước khi bị dừng nếu deployment layer hỗ trợ;
+3. hoàn tất request/transaction đang trong giới hạn deadline;
+4. flush log/metric cần thiết;
+5. đóng connection và release lease;
+6. exit với code phản ánh kết quả shutdown.
+
+Timeout Docker phải lớn hơn worst-case shutdown có chủ đích cộng một margin nhỏ, nhưng vẫn nằm trong deadline rollout. Đặt timeout rất dài không sửa handler bị treo; đặt quá ngắn biến mọi stop thành `SIGKILL`.
+
+## Lab: quan sát TERM, restart và KILL
+
+Tạo process có handler cho `SIGTERM`:
+
+```bash
+docker container run --detach \
+  --name lifecycle-signal-demo \
+  --label com.example.lab=stop-kill-restart \
+  alpine:3.22 \
+  sh -c 'trap "echo TERM-received; exit 0" TERM; echo ready; while :; do sleep 1; done'
+```
+
+Xác minh process đang chạy:
+
+```bash
+docker container logs lifecycle-signal-demo
+docker container inspect lifecycle-signal-demo \
+  --format 'id={{.Id}} pid={{.State.Pid}} status={{.State.Status}}'
+```
+
+### Graceful stop
+
+```bash
+docker container stop --time 5 lifecycle-signal-demo
+docker container logs lifecycle-signal-demo
+docker container inspect lifecycle-signal-demo \
+  --format 'status={{.State.Status}} exit={{.State.ExitCode}}'
+```
+
+Expected: log có `TERM-received`, state `exited`, exit code `0`. Nếu handler không chạy trước deadline, kiểm tra shell/PID 1 và timeout.
+
+### Start lại và xác minh identity
+
+```bash
+container_id=$(docker container inspect lifecycle-signal-demo --format '{{.Id}}')
+docker container start lifecycle-signal-demo
+pid_before=$(docker container inspect lifecycle-signal-demo --format '{{.State.Pid}}')
+
+docker container restart --time 5 lifecycle-signal-demo
+
+docker container inspect lifecycle-signal-demo \
+  --format 'id={{.Id}} pid={{.State.Pid}} started={{.State.StartedAt}}'
+printf 'original-id=%s original-pid=%s\n' "$container_id" "$pid_before"
+```
+
+ID phải giữ nguyên; PID thường thay đổi vì đây là process instance mới.
+
+### Force kill
+
+```bash
+docker container kill lifecycle-signal-demo
+docker container inspect lifecycle-signal-demo \
+  --format 'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}'
+```
+
+Trên Linux, exit code thường là `137` (`128 + SIGKILL 9`), nhưng phải đọc cùng `.State.OOMKilled`, event và host evidence; `137` một mình không chứng minh OOM.
+
+Cleanup:
+
+```bash
+docker container rm lifecycle-signal-demo
+```
+
+## Phân biệt operator action và restart policy
+
+- `docker restart` là hành động tường minh ngay lúc operator chạy command.
+- `--restart=...` là policy daemon áp dụng sau process exit và khi daemon khởi động lại theo semantics của từng policy.
+- Healthcheck thất bại không tự gọi `docker restart` trên standalone Engine.
+
+Timeline gần đây giúp phân biệt các nguyên nhân:
+
+```bash
+docker events \
+  --since '10m' \
+  --until '0s' \
+  --filter 'container=api'
+```
+
+Kết hợp với restart count:
+
+```bash
+docker container inspect api \
+  --format 'restart-count={{.RestartCount}} exit={{.State.ExitCode}} error={{json .State.Error}}'
+```
+
+## Troubleshooting
+
+### `docker stop` luôn chờ hết timeout
+
+Kiểm tra process tree và command thực tế:
+
+```bash
+docker container top api -eo pid,ppid,user,stat,args
+docker container inspect api \
+  --format 'path={{.Path}} args={{json .Args}} stop-signal={{.Config.StopSignal}}'
+```
+
+Nếu shell wrapper là PID 1, sửa image để dùng exec form/`exec`. Nếu application nhận signal nhưng chưa thoát, đo từng bước shutdown và điều chỉnh handler hoặc deadline.
+
+### Container dừng với `137`
+
+Ba giả thuyết phổ biến là operator/runtime gửi `SIGKILL`, stop hết timeout hoặc kernel OOM kill. Thu evidence:
+
+```bash
+docker container inspect api --format '{{json .State}}'
+docker events --since '15m' --until '0s' --filter 'container=api'
+docker container logs --timestamps --tail 500 api
+```
+
+Kiểm tra thêm kernel/daemon logs trên Docker host. Không kết luận OOM chỉ từ số `137`.
+
+### Restart xong vẫn chạy version cũ
+
+Đây là expected behavior. So sánh container image ID với image/tag hiện tại, rồi recreate theo quy trình rollout:
+
+```bash
+docker container inspect api --format 'container-image-id={{.Image}} ref={{.Config.Image}}'
+docker image inspect app:stable --format 'tag-image-id={{.Id}}'
+```
+
+## Nguồn chính thức
+
+- [docker container stop](https://docs.docker.com/reference/cli/docker/container/stop/)
+- [docker container kill](https://docs.docker.com/reference/cli/docker/container/kill/)
+- [docker container restart](https://docs.docker.com/reference/cli/docker/container/restart/)
+- [Dockerfile `STOPSIGNAL`, `ENTRYPOINT` và `CMD`](https://docs.docker.com/reference/dockerfile/)

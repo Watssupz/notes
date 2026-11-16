@@ -1,0 +1,373 @@
+---
+title: "Cấu hình Docker daemon"
+description: "Quản lý daemon.json an toàn: xác định đúng file và flag, validate trước restart, rollout từng thay đổi, xác minh effective config và rollback khi daemon lỗi."
+---
+
+`dockerd` có thể nhận option từ JSON configuration và command-line flags của service. JSON thuận tiện cho configuration management, nhưng một dấu phẩy sai, field không hợp lệ hoặc option bị khai báo trùng với systemd flag có thể làm daemon không start.
+
+Trang này xây workflow **inventory → backup → edit → validate → restart/reload → verify → rollback**. Các value chỉ là ví dụ lab; production phải chọn theo network, storage, logging, SLO và Engine version thực tế.
+
+## Xác định đúng daemon và file
+
+Default path theo Docker documentation:
+
+| Môi trường | Daemon config mặc định |
+|---|---|
+| Linux rootful | `/etc/docker/daemon.json` |
+| Linux rootless | `~/.config/docker/daemon.json` |
+| Rootless với `XDG_CONFIG_HOME` | `$XDG_CONFIG_HOME/docker/daemon.json` |
+| Windows daemon | `C:\ProgramData\docker\config\daemon.json` |
+| Docker Desktop | Dùng Desktop Settings/admin settings cho option được hỗ trợ |
+
+`~/.docker/config.json` là **client config**, không phải daemon config.
+
+Trước khi sửa:
+
+```bash
+docker context show
+docker version
+systemctl cat docker
+ps -ef | grep '[d]ockerd'
+```
+
+Rootless dùng:
+
+```bash
+docker context show
+systemctl --user cat docker
+ps -u "$USER" -f | grep '[d]ockerd'
+```
+
+`systemctl cat` cho biết unit/drop-in có truyền `--config-file`, `--host` hoặc option khác không. Nếu daemon dùng custom `--config-file`, sửa default path sẽ không có tác dụng.
+
+## JSON và flags tương tác thế nào?
+
+Docker cho phép dùng JSON cùng flags **nếu không khai báo cùng một option ở hai nơi**. Khi bị trùng, daemon từ chối start thay vì âm thầm chọn một giá trị.
+
+Ví dụ unit có:
+
+```text
+ExecStart=/usr/bin/dockerd --log-level=info
+```
+
+thì không thêm đồng thời:
+
+```json
+{
+  "log-level": "warn"
+}
+```
+
+Trước thay đổi, kiểm tra cả unit vendor, drop-in và process arguments. Không sửa trực tiếp file unit trong `/usr/lib/systemd/system` hoặc `/lib/systemd/system`; package upgrade có thể ghi đè. Dùng systemd drop-in khi thật sự cần flag/environment, còn daemon options nên tập trung trong JSON.
+
+## Workflow thay đổi an toàn
+
+### 1. Thu baseline và đánh giá blast radius
+
+```bash
+docker info
+sudo systemctl status docker --no-pager
+sudo systemctl cat docker
+sudo journalctl -u docker -n 100 --no-pager
+```
+
+Ghi lại:
+
+- containers đang chạy và restart policy;
+- host có maintenance window hay `live-restore` được test không;
+- remote console/SSH độc lập với Docker;
+- current config, unit/drop-in và package version;
+- rollback file và người có quyền phục hồi nếu daemon không lên.
+
+Restart daemon có thể ảnh hưởng control plane, networking và containers tùy config/platform. Không áp config network/storage trên nhiều production nodes cùng lúc.
+
+### 2. Backup config hiện tại
+
+```bash
+sudo install -d -m 0755 /etc/docker
+sudo cp -a /etc/docker/daemon.json \
+  "/etc/docker/daemon.json.bak.$(date +%Y%m%d%H%M%S)" \
+  2>/dev/null || true
+```
+
+Nếu file chưa tồn tại, `cp` không tạo backup và `true` giữ command sequence. Trong automation, nên xử lý hai trạng thái “file absent” và “file exists” tường minh thay vì che mọi lỗi.
+
+Rootless:
+
+```bash
+install -d -m 0700 "$HOME/.config/docker"
+cp -a "$HOME/.config/docker/daemon.json" \
+  "$HOME/.config/docker/daemon.json.bak.$(date +%Y%m%d%H%M%S)" \
+  2>/dev/null || true
+```
+
+Config có thể chứa proxy credential hoặc endpoint nội bộ. Giữ backup mode hạn chế và không commit secret vào Git.
+
+### 3. Soạn một JSON object hợp lệ
+
+Ví dụ logging baseline:
+
+```json
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+```
+
+Nếu file đã có key, phải merge trong cùng object. Hai block JSON nối tiếp nhau không hợp lệ. Dùng editor hoặc configuration-management serializer thay vì `echo` nhiều fragment.
+
+Format bằng `jq` nếu đã cài:
+
+```bash
+jq . /etc/docker/daemon.json
+```
+
+`jq` chỉ kiểm tra JSON syntax; nó không biết Docker option/type/version.
+
+### 4. Validate bằng `dockerd`
+
+```bash
+sudo dockerd --validate --config-file=/etc/docker/daemon.json
+```
+
+Kết quả thành công thường báo configuration valid và exit code `0`. Kiểm tra ngay:
+
+```bash
+echo $?
+```
+
+Rootless:
+
+```bash
+dockerd --validate --config-file="$HOME/.config/docker/daemon.json"
+```
+
+Validation phát hiện syntax, unknown directive và một số conflict/type error, nhưng không chứng minh filesystem/network/runtime dependency hoạt động khi start. Ví dụ path có thể hợp lệ về schema nhưng mount chưa tồn tại hoặc permission sai.
+
+### 5. Restart hoặc reload có kiểm soát
+
+Không phải mọi option hỗ trợ live reload. Nếu docs của field/version không nói rõ, lên maintenance plan cho restart:
+
+```bash
+sudo systemctl restart docker
+sudo systemctl is-active docker
+```
+
+Rootless:
+
+```bash
+systemctl --user restart docker
+systemctl --user is-active docker
+```
+
+Dùng `systemctl reload docker` chỉ với option được Engine version hiện tại hỗ trợ reload và vẫn xác minh behavior. Reload thành công ở service manager không đảm bảo field mong muốn đã thay đổi.
+
+### 6. Xác minh effective behavior
+
+```bash
+docker version
+docker info
+sudo journalctl -u docker --since '5 minutes ago' --no-pager
+```
+
+Sau đó chạy test liên quan đến setting. Ví dụ đổi default logging driver:
+
+```bash
+docker run --name config-check alpine true
+docker inspect config-check --format '{{json .HostConfig.LogConfig}}'
+docker rm config-check
+```
+
+Container cũ không tự nhận default mới. Test bằng object được **tạo sau thay đổi**.
+
+### 7. Rollback nếu daemon không start
+
+Từ shell/console ngoài Docker:
+
+```bash
+sudo journalctl -u docker -n 200 --no-pager
+sudo dockerd --validate --config-file=/etc/docker/daemon.json
+sudo systemctl cat docker
+```
+
+Khôi phục đúng backup đã ghi nhận:
+
+```bash
+sudo cp -a <BACKUP_FILE> /etc/docker/daemon.json
+sudo systemctl restart docker
+```
+
+Nếu trước thay đổi không có config file, rollback có thể là chuyển file mới ra ngoài thay vì copy backup:
+
+```bash
+sudo mv /etc/docker/daemon.json /etc/docker/daemon.json.failed
+sudo systemctl restart docker
+```
+
+Sau rollback vẫn phải xác minh containers/application, không chỉ `systemctl active`.
+
+## Các nhóm option thường dùng
+
+| Nhu cầu | Key tiêu biểu | Điều cần đánh giá |
+|---|---|---|
+| Log mặc định | `log-driver`, `log-opts` | Chỉ container mới; retention, disk và log collector compatibility |
+| Data location | `data-root` | Filesystem support, permission, SELinux, downtime và migration; containerd image store có path riêng |
+| Network address pools | `default-address-pools` | Tránh overlap với LAN/VPN/VPC; chỉ network tạo sau thay đổi |
+| DNS cho containers | `dns`, `dns-search`, `dns-opts` | Internal resolution, split DNS và failure behavior |
+| Registry | `registry-mirrors`, `insecure-registries` | Mirror trust/auth; tránh insecure registry production |
+| Proxy daemon | `proxies` | Chỉ daemon egress; Desktop xử lý khác; bảo vệ credential |
+| Runtime | `runtimes`, `default-runtime` | Shim/binary availability, compatibility và rollback |
+| Security defaults | `no-new-privileges`, `userns-remap` | Workload compatibility, UID mapping, bind mounts |
+| Control plane endpoint | `hosts` hoặc `-H` | Docker API tương đương quyền mạnh; TCP phải có TLS/auth/network policy |
+| Availability | `live-restore` | Không thay thế orchestration/HA; test upgrade/restart behavior |
+| Metrics | `metrics-addr` | Bind loopback/private address, auth boundary và scrape policy |
+
+Không copy một “production daemon.json” tổng hợp từ internet. Mỗi global default có thể phá workload đang dựa vào behavior cũ.
+
+## Ví dụ: address pool tránh VPN overlap
+
+Docker tự cấp subnet khi tạo bridge network. Nếu pool overlap corporate VPN/VPC, container có thể route sai. Ví dụ lab dành một private range:
+
+```json
+{
+  "default-address-pools": [
+    {
+      "base": "10.240.0.0/16",
+      "size": 24
+    }
+  ]
+}
+```
+
+`base` và `size` phải do network team cấp, không dùng ví dụ này nếu `10.240.0.0/16` đã tồn tại. Sau restart, tạo network mới và inspect:
+
+```bash
+docker network create pool-check
+docker network inspect pool-check --format '{{json .IPAM.Config}}'
+docker network rm pool-check
+```
+
+Existing networks giữ subnet cũ. Thay pool không tự migrate network/container.
+
+## Ví dụ: DNS mặc định
+
+```json
+{
+  "dns": ["10.0.0.53", "10.0.0.54"],
+  "dns-search": ["corp.example"]
+}
+```
+
+Đây là placeholder. DNS server phải reachable từ Docker networking path và có policy cho container queries. Test trong container mới:
+
+```bash
+docker run --rm alpine cat /etc/resolv.conf
+docker run --rm alpine nslookup <INTERNAL_NAME>
+```
+
+Image/tool có thể khác; `alpine` thường có BusyBox `nslookup`, nhưng hãy dùng approved diagnostic image của tổ chức nếu registry egress bị giới hạn.
+
+## Di chuyển data root: thay config chưa đủ
+
+Ví dụ schema:
+
+```json
+{
+  "data-root": "/mnt/docker-data"
+}
+```
+
+Trước khi dùng:
+
+1. xác định Engine đang dùng classic storage driver hay containerd image store;
+2. chuẩn bị local filesystem hỗ trợ và mount ổn định trước Docker service;
+3. backup application-consistent volume/data;
+4. stop Docker và containerd theo runbook;
+5. copy state bằng tool giữ ownership, xattr, hardlink/sparse semantics phù hợp;
+6. relabel SELinux nếu platform yêu cầu;
+7. validate config, start canary và kiểm tra image/container/volume;
+8. giữ source cũ để rollback cho đến khi acceptance test xong.
+
+Theo Docker docs hiện hành, trên fresh Engine 29+ dùng containerd image store, image content và snapshots nằm dưới `/var/lib/containerd`; `data-root` không chuyển phần đó. Muốn đổi containerd root phải quản lý `/etc/containerd/config.toml` và support model tương ứng. Không cho hai daemon chia sẻ cùng data directory, đặc biệt qua NFS.
+
+## Docker API remote access
+
+Plain TCP socket như `tcp://0.0.0.0:2375` không mã hóa và không authentication. Bất kỳ ai tới được port có thể tạo privileged container/mount host và chiếm host.
+
+Ưu tiên Docker context qua SSH:
+
+```bash
+docker context create remote-lab --docker 'host=ssh://user@host'
+docker --context remote-lab version
+```
+
+SSH user trên remote vẫn cần quyền Docker socket và được coi là privileged. Với TCP, dùng mutual TLS, firewall allowlist, certificate rotation và không expose internet. Không bật remote API chỉ để CI “dễ kết nối”; dùng runner/SSH/context hoặc platform integration có authorization boundary.
+
+## Troubleshooting config
+
+### `the following directives are specified both as a flag and in the configuration file`
+
+```bash
+systemctl cat docker
+ps -ef | grep '[d]ockerd'
+cat /etc/docker/daemon.json
+```
+
+Giữ option ở một nguồn. Với packaged systemd unit, đừng xóa `-H fd://` hoặc socket activation flag tùy tiện nếu distribution integration cần nó; xem vendor unit và Docker docs đúng package.
+
+### `unable to configure the Docker daemon with file ...`
+
+Chạy validator, kiểm tra JSON type và spelling:
+
+```bash
+sudo dockerd --validate --config-file=/etc/docker/daemon.json
+jq . /etc/docker/daemon.json
+```
+
+Nhiều `log-opts` phải là string dù trông như số/boolean.
+
+### Config valid nhưng daemon vẫn lỗi
+
+Thu:
+
+```bash
+sudo journalctl -u docker -b --no-pager
+sudo journalctl -u containerd -b --no-pager
+findmnt /var/lib/docker /var/lib/containerd /mnt/docker-data 2>/dev/null || true
+```
+
+Điều tra path permission/filesystem, port/socket conflict, runtime binary, iptables, cgroup, certificate và SELinux/AppArmor. Validation không thực hiện đầy đủ startup side effects.
+
+### Setting không có hiệu lực
+
+- Có sửa đúng daemon/context không?
+- Service có dùng custom config path không?
+- Field có cần restart không?
+- Test object có được tạo sau thay đổi không?
+- Docker Desktop có bỏ qua field đó không?
+- `docker info`, inspect hoặc daemon logs có signal nào chứng minh effective value?
+
+## Checklist rollout production
+
+- [ ] Tài liệu Engine version và field support đã được đối chiếu.
+- [ ] Config/unit/current behavior đã backup.
+- [ ] Không có option trùng JSON và flags.
+- [ ] `dockerd --validate` thành công.
+- [ ] Maintenance, canary node và rollback owner đã xác định.
+- [ ] Có console/SSH ngoài Docker control plane.
+- [ ] Service, daemon logs và object mới đã được verify.
+- [ ] Application request, persistence và monitoring đã được test.
+- [ ] Config không chứa secret plaintext ngoài secret-management policy.
+- [ ] Rollback đã trả environment về baseline nếu acceptance test fail.
+
+Tiếp theo, cấu hình network egress tại [Proxy và registry mirror](/docs/cai-dat-va-moi-truong/proxy-and-mirror/) hoặc thực hành checklist toàn stack tại [Xác minh môi trường](/docs/cai-dat-va-moi-truong/verify-environment/).
+
+## Nguồn chính thức để đối chiếu
+
+- [Docker daemon configuration overview](https://docs.docker.com/engine/daemon/)
+- [`dockerd` reference](https://docs.docker.com/reference/cli/dockerd/)
+- [Configure remote access](https://docs.docker.com/engine/daemon/remote-access/)
+- [Live restore](https://docs.docker.com/engine/daemon/live-restore/)

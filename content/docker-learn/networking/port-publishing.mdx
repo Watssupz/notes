@@ -1,0 +1,177 @@
+---
+title: "Publish và expose port"
+description: "Phân biệt container port, EXPOSE và published host port; bind đúng host IP/protocol, tránh public exposure ngoài ý muốn và kiểm tra NAT path."
+---
+
+Application listen trên một **container port** không đồng nghĩa client bên ngoài Docker host truy cập được. Với bridge network, `-p`/`--publish` tạo mapping từ host address/port tới container address/port bằng firewall/NAT hoặc routing mode tương ứng.
+
+```text
+Client -> 192.0.2.10:8080 -> Docker host rule -> container:80/tcp
+```
+
+## Bốn khái niệm khác nhau
+
+| Khái niệm | Ví dụ | Tác dụng |
+|---|---|---|
+| Application listen | `0.0.0.0:80` trong container | Mở socket trong network namespace |
+| Dockerfile `EXPOSE` | `EXPOSE 80` | Metadata/documentation; không publish |
+| Runtime `--expose` | `--expose 80` | Thêm exposed-port metadata; không bind host |
+| Publish | `-p 127.0.0.1:8080:80` | Tạo host entry point tới container port |
+
+Peer cùng user-defined network gọi `service:80` trực tiếp, không cần publish.
+
+## Syntax
+
+```text
+-p [HOST_IP:]HOST_PORT:CONTAINER_PORT[/PROTOCOL]
+```
+
+| Flag | Ý nghĩa |
+|---|---|
+| `-p 8080:80` | Host port 8080 trên default/all addresses tới TCP 80 |
+| `-p 127.0.0.1:8080:80` | Chỉ IPv4 loopback |
+| `-p '[::1]:8080:80'` | Chỉ IPv6 loopback |
+| `-p 53:53/udp` | UDP 53, không tự publish TCP 53 |
+| `-p 8080:80/tcp -p 8080:80/udp` | Cùng số host port cho hai protocol riêng |
+| `-p 127.0.0.1::80` | Docker chọn ephemeral host port |
+| `-P` | Publish mọi `EXPOSE` port tới ephemeral host ports |
+
+<Callout type="warn" title="Mặc định có thể public">
+  Bỏ `HOST_IP`, ví dụ `-p 8080:80`, thường bind trên mọi host address IPv4/IPv6. Nếu firewall/cloud route cho phép, dịch vụ có thể reachable từ mạng ngoài. Dùng loopback hoặc IP interface cụ thể theo intent.
+</Callout>
+
+## Lab: internal và host entry point
+
+```bash
+docker network create publish-lab
+docker run -d --name publish-web \
+  --network publish-lab \
+  -p 127.0.0.1:8080:80 \
+  nginx:1.29-alpine
+```
+
+Từ peer nội bộ:
+
+```bash
+docker run --rm --network publish-lab alpine:3.23 \
+  wget -qO- http://publish-web:80/
+```
+
+Từ host:
+
+```bash
+curl http://127.0.0.1:8080/
+docker port publish-web
+docker inspect publish-web \
+  --format '{{json .NetworkSettings.Ports}}'
+```
+
+Kiểm tra socket/rules từ host:
+
+```bash
+sudo ss -lntp 'sport = :8080'
+```
+
+Tùy Docker version và `userland-proxy`, `ss` có thể hoặc không hiển thị process proxy; source of truth còn gồm `docker inspect` và firewall rules.
+
+## Application phải listen đúng address
+
+Nếu process chỉ listen `127.0.0.1:80` **bên trong container**, packet tới container interface IP không vào socket dù host mapping tồn tại. Với bridge networking, server thường phải listen `0.0.0.0`, `::` hoặc container interface address.
+
+Xác minh:
+
+```bash
+docker exec CONTAINER ss -lntup
+```
+
+Phân biệt:
+
+- `connection refused`: route đến endpoint nhưng không có socket/policy reject;
+- timeout: packet bị drop, route sai hoặc response path lỗi;
+- host port conflict: Docker không tạo được mapping vì socket/rule đã dùng.
+
+## TCP, UDP và SCTP
+
+Protocol là một phần của mapping. Publish TCP không publish UDP. DNS thường cần cả UDP và TCP tùy response/use case:
+
+```bash
+-p 5353:53/udp -p 5353:53/tcp
+```
+
+Test bằng client đúng protocol; `curl` không chứng minh UDP path.
+
+## Ephemeral host port
+
+Để Docker chọn host port:
+
+```bash
+docker run -d --name random-port \
+  -p 127.0.0.1::80 \
+  nginx:1.29-alpine
+docker port random-port 80/tcp
+```
+
+Không parse `docker ps` text trong automation. Dùng inspect/API hoặc orchestrator service discovery để lấy mapping.
+
+## IPv4 và IPv6
+
+Publish không ghi host IP có thể tạo mapping trên cả IPv4 và IPv6. Behavior còn phụ thuộc bridge dual-stack, gateway mode và `userland-proxy`.
+
+Bind loopback rõ ràng:
+
+```bash
+-p 127.0.0.1:8080:80 -p '[::1]:8080:80'
+```
+
+Dùng dấu ngoặc vuông quanh IPv6 literal trong CLI/URL:
+
+```bash
+curl 'http://[::1]:8080/'
+```
+
+## Direct routing và gateway mode
+
+Docker Engine hiện hỗ trợ bridge gateway modes như `nat`, `routed`, `nat-unprotected`, `isolated`:
+
+- `nat` mặc định: host port mapping và masquerade outbound;
+- `routed`: không NAT cho address family đó, external network phải route tới container subnet; chỉ published container ports được phép;
+- `nat-unprotected`: cho direct access cả unpublished ports, chủ yếu compatibility;
+- `isolated`: dùng với internal network để bridge không có gateway address.
+
+Đây là thiết kế network nâng cao. Route container prefix, firewall và return path phải được cấu hình cùng lúc; không bật `allow-direct-routing` daemon-wide mà chưa review exposure.
+
+## Firewall và cloud boundary
+
+Host bind `0.0.0.0` chưa đủ để Internet truy cập nếu cloud security group/upstream firewall chặn. Ngược lại, UFW rule tưởng là chặn có thể không thấy packet đã được Docker DNAT qua forwarding path.
+
+Kiểm tra theo thứ tự:
+
+1. application listen trong container;
+2. Docker mapping và host bind address;
+3. host firewall packet path;
+4. cloud security group/NACL/load balancer;
+5. route và client source IP;
+6. response return path.
+
+## Security checklist
+
+- Bind loopback cho database/admin UI dùng local.
+- Chỉ publish reverse proxy; giữ backend trên internal network khi có thể.
+- Không coi random high port là access control.
+- Áp source restriction ở firewall/load balancer và application auth.
+- Scan effective host listeners sau deploy.
+- Review cả TCP/UDP và IPv4/IPv6.
+- Không dùng `-P` ở production nếu không kiểm soát toàn bộ `EXPOSE` metadata.
+
+## Cleanup
+
+```bash
+docker rm -f publish-web random-port 2>/dev/null || true
+docker network rm publish-lab 2>/dev/null || true
+```
+
+## Nguồn chính thức
+
+- [Port publishing and mapping](https://docs.docker.com/engine/network/port-publishing/)
+- [Bridge network driver](https://docs.docker.com/engine/network/drivers/bridge/)
+- [docker container run](https://docs.docker.com/reference/cli/docker/container/run/)

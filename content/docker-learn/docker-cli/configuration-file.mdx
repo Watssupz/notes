@@ -1,0 +1,320 @@
+---
+title: "Docker CLI configuration"
+description: "Quản lý ~/.docker/config.json an toàn, hiểu precedence, credential helpers, proxy defaults, detach keys và format mặc định mà không nhầm với daemon.json."
+---
+
+Docker CLI mặc định dùng directory `$HOME/.docker`; file cấu hình có thể chỉnh sửa là `config.json`. File này điều khiển behavior phía **client** như credential store, default output format, proxy được inject vào container/build và detach key.
+
+Nó không phải `/etc/docker/daemon.json`:
+
+| File | Process đọc | Ví dụ setting |
+|---|---|---|
+| `~/.docker/config.json` | `docker` CLI và plugin liên quan | `credsStore`, `credHelpers`, `psFormat`, `proxies` |
+| `/etc/docker/daemon.json` | `dockerd` rootful trên Linux | log driver, data root, registry mirror, daemon proxy |
+
+Sửa nhầm file là nguyên nhân phổ biến của “config hợp lệ nhưng không có tác dụng”.
+
+## Xác định config directory effective
+
+```bash
+printf 'HOME=%s\n' "$HOME"
+printf 'DOCKER_CONFIG=%s\n' "${DOCKER_CONFIG-<unset>}"
+docker --help | sed -n '/Global Options:/,$p' | head
+```
+
+Mặc định config ở:
+
+```text
+$HOME/.docker/config.json
+```
+
+Đổi theo process bằng global flag:
+
+```bash
+docker --config "$HOME/.docker-ci" context ls
+```
+
+Hoặc theo environment:
+
+```bash
+export DOCKER_CONFIG="$HOME/.docker-ci"
+docker context ls
+```
+
+`--config` có precedence cao hơn `DOCKER_CONFIG`. Khi dùng `sudo docker`, HOME/config/credential helper có thể đổi sang user root; đây không phải cùng client state với user hiện tại.
+
+## Security boundary của config directory
+
+`config.json` và các file dưới Docker config directory có thể chứa:
+
+- registry auth material hoặc reference tới credential helper;
+- proxy URL có username/password;
+- context endpoint và TLS material;
+- custom header hoặc plugin state;
+- hostname nội bộ.
+
+Thiết lập permission tối thiểu trên Linux/macOS:
+
+```bash
+install -d -m 0700 "$HOME/.docker"
+[ ! -f "$HOME/.docker/config.json" ] || chmod 0600 "$HOME/.docker/config.json"
+```
+
+<Callout type="error" title="Không commit Docker config">
+  Không thêm `config.json`, `contexts/`, TLS key hoặc file `.dockercontext` vào Git. Trước khi gửi diagnostic, review và redact `auths`, `proxies`, header, endpoint cùng internal registry name.
+</Callout>
+
+## JSON tối thiểu và validation
+
+File rỗng hợp lệ về mặt intent nên là JSON object:
+
+```json
+{}
+```
+
+Ví dụ client config nhỏ:
+
+```json
+{
+  "detachKeys": "ctrl-e,e",
+  "psFormat": "table {{.ID}}\t{{.Names}}\t{{.Status}}"
+}
+```
+
+Validate syntax trước khi thay file:
+
+```bash
+python3 -m json.tool "$HOME/.docker/config.json" >/dev/null
+```
+
+Hoặc dùng `jq` nếu đã cài:
+
+```bash
+jq empty "$HOME/.docker/config.json"
+```
+
+Backup atomically trước thay đổi:
+
+```bash
+cp -a "$HOME/.docker/config.json" \
+  "$HOME/.docker/config.json.bak.$(date +%Y%m%d%H%M%S)"
+```
+
+CLI không phải schema validator đầy đủ cho mọi field/plugin. Sau syntax check, chạy đúng command sử dụng setting và xác minh effective output.
+
+## Precedence
+
+Khi cùng behavior có thể cấu hình ở nhiều layer, thứ tự tổng quát là:
+
+```text
+command-line option > environment variable > config.json
+```
+
+Ví dụ directory:
+
+```bash
+DOCKER_CONFIG="$HOME/.docker-a" \
+  docker --config "$HOME/.docker-b" context ls
+```
+
+Command trên dùng `.docker-b`. Để tránh drift, đừng cấu hình cùng setting ở shell profile, CI variable và nhiều config file nếu không cần.
+
+## Credential store và credential helper
+
+Nếu không cấu hình external store, registry credential có thể xuất hiện trong `auths` dưới dạng encoded data; encoding không phải encryption. `credsStore` yêu cầu binary `docker-credential-<suffix>` trên `PATH`:
+
+```json
+{
+  "credsStore": "secretservice"
+}
+```
+
+Với config này, CLI tìm `docker-credential-secretservice`.
+
+`credHelpers` chọn helper riêng theo registry và có precedence cho registry đó:
+
+```json
+{
+  "credsStore": "secretservice",
+  "credHelpers": {
+    "registry.example.com": "pass"
+  }
+}
+```
+
+Kiểm tra binary:
+
+```bash
+command -v docker-credential-secretservice
+command -v docker-credential-pass
+```
+
+Đăng nhập bằng stdin để token không nằm trực tiếp trong command history:
+
+```bash
+printf '%s' "$REGISTRY_TOKEN" | \
+  docker login registry.example.com \
+    --username "$REGISTRY_USER" \
+    --password-stdin
+```
+
+Xác minh login bằng pull/push vào repository test được cấp quyền, rồi logout khi credential không còn cần:
+
+```bash
+docker logout registry.example.com
+```
+
+`docker logout` cập nhật client credential state; việc revoke token phải thực hiện ở identity/registry system nếu policy yêu cầu.
+
+## Default output format
+
+CLI hỗ trợ các property đặt format mặc định cho một số command, như `psFormat`, `imagesFormat`, `volumesFormat`, `networksFormat` và `statsFormat`.
+
+```json
+{
+  "psFormat": "table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}",
+  "imagesFormat": "table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}"
+}
+```
+
+Format field phụ thuộc command. Test:
+
+```bash
+docker container ls
+docker image ls
+```
+
+Per-command `--format` override default:
+
+```bash
+docker container ls --format '{{.ID}}\t{{.Names}}'
+```
+
+<Callout type="warn" title="Đừng để script phụ thuộc format cá nhân">
+  Automation phải truyền `--format` hoặc dùng API/JSON tường minh. `psFormat` của từng user có thể đổi số cột, header và field bất kỳ lúc nào.
+</Callout>
+
+## Proxy mặc định cho container và build
+
+Property `proxies` có thể inject proxy environment vào container mới và build argument tương ứng:
+
+```json
+{
+  "proxies": {
+    "default": {
+      "httpProxy": "http://proxy.example.com:3128",
+      "httpsProxy": "http://proxy.example.com:3128",
+      "noProxy": "localhost,127.0.0.1,.example.com"
+    }
+  }
+}
+```
+
+Có thể cấu hình theo daemon endpoint thay vì `default`. Tuy nhiên, setting này:
+
+- không cấu hình proxy cho `dockerd`;
+- không nhất thiết cấu hình mọi CLI/plugin request;
+- lưu proxy value trong container configuration và build metadata có thể inspect được;
+- có thể làm lộ proxy credential nếu URL chứa username/password.
+
+Xác minh trên một container lab:
+
+```bash
+docker container run --rm alpine:latest env | grep -i '_proxy='
+```
+
+Nếu mục tiêu là sửa `docker pull`, cần cấu hình daemon proxy ở đúng host. Xem [Proxy và registry mirror](/docs/cai-dat-va-moi-truong/proxy-and-mirror/).
+
+## Detach key
+
+Mặc định Docker dùng chuỗi `Ctrl-p`, `Ctrl-q` để detach khỏi attached container mà không dừng process. Đổi global client default:
+
+```json
+{
+  "detachKeys": "ctrl-e,e"
+}
+```
+
+Per-command flag `--detach-keys` có thể override cho `attach`, `exec`, `run` hoặc `start` khi command hỗ trợ:
+
+```bash
+docker container attach --detach-keys 'ctrl-e,e' web
+```
+
+Chọn sequence không xung đột terminal multiplexer, shell/editor và ghi lại trong team runbook. Detach khác stop: detach chỉ ngắt client stream, container tiếp tục chạy.
+
+## Custom HTTP header và plugin config
+
+`HttpHeaders` thêm header vào request mà client gửi daemon; CLI không cho override header nội bộ của nó. Environment `DOCKER_CUSTOM_HEADERS` là alternative experimental trên CLI đủ mới.
+
+```json
+{
+  "HttpHeaders": {
+    "X-Client-Owner": "platform-team"
+  }
+}
+```
+
+Không đặt bearer token hoặc secret vào custom header nếu không kiểm soát proxy/logging path.
+
+`plugins` là map setting theo CLI plugin:
+
+```json
+{
+  "plugins": {
+    "example-plugin": {
+      "option": "value"
+    }
+  }
+}
+```
+
+Schema và support do plugin quyết định. Đọc documentation đúng plugin/version; core Docker CLI không xác nhận semantics cho mọi key.
+
+## Workflow thay đổi an toàn
+
+1. Xác định OS user, `$HOME`, `DOCKER_CONFIG` và context.
+2. Backup file cùng permission.
+3. Sửa đúng một nhóm setting.
+4. Validate JSON.
+5. Chạy command cụ thể dùng setting.
+6. Kiểm tra không có credential bị chuyển vào output/log.
+7. Rollback file backup nếu behavior sai.
+
+Ví dụ tạo config tách biệt để test không ảnh hưởng profile chính:
+
+```bash
+set -euo pipefail
+
+test_config=$(mktemp -d)
+trap 'rm -rf "$test_config"' EXIT
+chmod 0700 "$test_config"
+
+cat >"$test_config/config.json" <<'JSON'
+{
+  "psFormat": "table {{.ID}}\t{{.Names}}\t{{.Status}}"
+}
+JSON
+
+python3 -m json.tool "$test_config/config.json" >/dev/null
+docker --config "$test_config" container ls
+```
+
+Config directory test không có context/credential từ profile chính. Nếu command cần remote context/private registry, provision tối thiểu thay vì copy tất cả secret.
+
+## Troubleshooting
+
+| Triệu chứng | Kiểm tra | Hướng xử lý |
+|---|---|---|
+| Config không có tác dụng | `$HOME`, `DOCKER_CONFIG`, `--config`, user chạy CLI | Sửa file trong effective directory |
+| JSON parse error | `python3 -m json.tool` | Sửa comma, quote, brace; rollback backup |
+| Login báo helper không có | `command -v docker-credential-...` | Cài đúng helper hoặc sửa suffix |
+| CI không tìm helper | `PATH`, HOME và package trong runner | Provision helper trong image/job |
+| Proxy không ảnh hưởng pull | Phân biệt CLI/daemon/container boundary | Cấu hình daemon proxy |
+| Script đổi output giữa máy | Kiểm tra `psFormat` | Truyền `--format` trong script |
+
+## Nguồn chính thức
+
+- [Docker CLI configuration file](https://docs.docker.com/reference/cli/docker/#configuration-files)
+- [docker login và credential stores](https://docs.docker.com/reference/cli/docker/login/)
+- [Docker CLI proxy configuration](https://docs.docker.com/engine/cli/proxy/)

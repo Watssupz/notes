@@ -1,0 +1,276 @@
+---
+title: "Linux namespaces"
+description: "Cách Linux namespaces tách PID, mount, network, IPC, UTS, user, cgroup và time view; kèm lab đối chiếu namespace inode của container với host."
+---
+
+Linux namespace bọc một global resource trong abstraction để process trong namespace thấy một instance riêng. Đây là cơ chế nền tảng giúp process trong container thấy hostname, PID tree, mount points và network stack khác host dù cùng dùng một kernel.
+
+Namespace trả lời câu hỏi **“process nhìn thấy view nào?”**. Nó không tự giới hạn CPU/memory, không tự bỏ quyền root và không tự lọc syscall. Các trách nhiệm đó thuộc cgroups, credentials/capabilities, seccomp và LSM.
+
+## Tám loại namespace chính
+
+Linux manual hiện liệt kê các namespace sau:
+
+| Namespace | `/proc/<pid>/ns` | Resource được tách |
+|---|---|---|
+| Mount | `mnt` | Mount points và mount tree |
+| PID | `pid`, `pid_for_children` | Process ID space và process hierarchy view |
+| Network | `net` | Network device, protocol stack, route, firewall state và ports |
+| IPC | `ipc` | System V IPC và POSIX message queues |
+| UTS | `uts` | Hostname và NIS domain name |
+| User | `user` | UID/GID mapping và capability scope |
+| Cgroup | `cgroup` | View về cgroup root directory |
+| Time | `time`, `time_for_children` | Một số boot/monotonic clock offsets |
+
+Runtime không bắt buộc tạo namespace mới cho mọi loại. Time namespace chẳng hạn không phải namespace Docker luôn tạo riêng cho container thông thường. Cấu hình cũng có thể yêu cầu share namespace với host hoặc container khác.
+
+## Namespace là membership của process
+
+Mỗi process là thành viên của một namespace cho từng type. Kernel expose handle qua symlink dưới `/proc/<pid>/ns/`:
+
+```bash
+ls -l /proc/self/ns/
+```
+
+Output rút gọn có dạng:
+
+```text
+mnt -> mnt:[4026531841]
+net -> net:[4026531992]
+pid -> pid:[4026531836]
+user -> user:[4026531837]
+uts -> uts:[4026531838]
+```
+
+Con số trong ngoặc vuông đại diện namespace object/inode theo interface này. Hai process có cùng namespace type và cùng inode đang share namespace đó.
+
+Namespace có lifecycle riêng. Thông thường nó biến mất khi không còn process/reference giữ lại, nhưng open file descriptor, bind mount namespace handle, child namespace hoặc một số kernel object có thể giữ namespace tồn tại.
+
+## Runtime tạo và tham gia namespace thế nào?
+
+Linux cung cấp các API chính:
+
+- `clone()`/`clone3()` có flags `CLONE_NEW*` để tạo child trong namespace mới;
+- `unshare()` chuyển calling process sang namespace mới cho resource được chọn;
+- `setns()` đưa thread vào namespace hiện có thông qua file descriptor;
+- `/proc/<pid>/ns/*` cung cấp handle để quan sát hoặc join.
+
+Việc tạo/join nhiều namespace cần capability phù hợp, thường liên quan `CAP_SYS_ADMIN` trong user namespace thích hợp. User namespace có rules riêng và cho phép một số thao tác không cần privilege ở initial user namespace.
+
+Container runtime thực hiện chuỗi thao tác cẩn thận hơn một lệnh `unshare`: tạo process trung gian, cấu hình UID/GID map, mount root filesystem, dựng `/proc`, thiết lập network endpoint, áp capabilities/seccomp rồi `exec` application. Không dùng một thử nghiệm `unshare` nhỏ để suy ra đầy đủ security profile của Docker.
+
+## Vai trò từng namespace trong container
+
+### PID namespace: process tree riêng
+
+PID namespace cho process có PID khác tùy layer namespace. Process đầu tiên trong namespace có PID 1 và mang trách nhiệm init cho namespace. Namespace PID có hierarchy: process ở ancestor namespace có thể nhìn process trong descendant namespace, chiều ngược lại không đúng.
+
+PID namespace không ẩn mọi metadata nếu host mount hoặc permission expose `/proc` theo cách khác. Runtime phải dựng `/proc` phù hợp với PID namespace để tool như `ps` trả view mong đợi.
+
+### Mount namespace: filesystem view riêng
+
+Mount namespace tách danh sách mount và mount propagation. Runtime dùng nó để:
+
+- gắn image root filesystem;
+- mount `/proc`, `/sys`, `/dev` theo policy;
+- thêm volume/bind mount;
+- áp read-only, nosuid hoặc các mount flags;
+- chuyển root bằng `pivot_root` hoặc cơ chế phù hợp.
+
+Mount namespace không copy dữ liệu. Hai namespace có thể mount cùng backing filesystem; thay đổi dữ liệu vẫn được chia sẻ theo mount/source permission. Bind mount host path là ví dụ rõ nhất: path xuất hiện trong container qua mount view riêng nhưng content vẫn là host content.
+
+### Network namespace: network stack riêng
+
+Mỗi network namespace có interfaces, loopback, routes, socket/port space và nhiều network resources riêng. Docker thường nối container network namespace với host bridge qua cặp virtual Ethernet.
+
+`localhost` bên trong container thuộc network namespace của container. Nó không mặc định là host hoặc container database khác. Với `--network host`, container dùng host network namespace, mất sự tách port/interface thông thường.
+
+### UTS namespace: hostname riêng
+
+UTS namespace cho phép hostname/domain name khác host. `--hostname` thay hostname view trong container; nó không tự tạo DNS record từ mọi nơi và không thay image identity.
+
+### IPC namespace: IPC objects riêng
+
+IPC namespace tách System V IPC và POSIX message queue. Share IPC namespace có thể cần cho workload phối hợp đặc biệt nhưng làm tăng vùng tương tác. Shared memory dựa trên mount như `/dev/shm` còn phụ thuộc mount/runtime configuration, không chỉ một label “IPC”.
+
+### User namespace: identity được map
+
+User namespace tách UID/GID number space và scope capabilities. UID 0 trong descendant user namespace có thể map sang non-zero UID trên host. Điều này giúp giảm quyền của container root đối với host resources.
+
+Cần phân biệt:
+
+- **Docker user namespace remapping:** daemon/container IDs được map qua subordinate UID/GID ranges;
+- **rootless mode:** daemon và container chạy mà không cần root privileges trên host, dùng user namespace cùng các kỹ thuật hỗ trợ;
+- **`USER` trong Dockerfile hoặc `--user`:** chọn UID/GID cho process bên trong container, không tự bật user namespace mapping.
+
+User namespace làm permission với bind mount phức tạp hơn vì ownership host và container có mapping. Đừng “sửa” bằng `chmod 777`; hãy kiểm tra UID/GID map và thiết kế ownership rõ ràng.
+
+### Cgroup namespace: che vị trí hierarchy
+
+Cgroup namespace ảo hóa view về cgroup path/root mà process thấy. Nó không tạo resource limit; cgroup controller/hierarchy mới thực hiện accounting và control. Đây là ví dụ điển hình về việc namespace và cgroup có tên liên quan nhưng trách nhiệm khác nhau.
+
+### Time namespace: offset một số clock
+
+Time namespace cho phép offset boot-time và monotonic clocks được hỗ trợ. Nó không đơn giản biến mọi khái niệm thời gian thành đồng hồ độc lập, và không phải default container primitive cần chỉnh trong hầu hết Docker workload.
+
+## Lab: so sánh namespace inode
+
+Lab này cần Linux Docker host native và quyền đọc `/proc/<pid>/ns`. Khởi động container:
+
+```bash
+docker run --name ns-demo -d alpine:3.20 sleep 300
+HOST_PID=$(docker inspect --format '{{.State.Pid}}' ns-demo)
+```
+
+Liệt kê namespace của shell host và process container:
+
+```bash
+printf '%-10s %-24s %-24s\n' TYPE HOST CONTAINER
+for ns in mnt net pid ipc uts user cgroup; do
+  printf '%-10s %-24s %-24s\n' \
+    "$ns" \
+    "$(readlink "/proc/self/ns/$ns")" \
+    "$(readlink "/proc/$HOST_PID/ns/$ns")"
+done
+```
+
+Cách đọc kết quả:
+
+- inode khác nhau: hai process ở namespace object khác cho type đó;
+- inode giống nhau: namespace đang được share;
+- file không tồn tại: kernel hoặc environment không expose namespace type đó.
+
+Không giả định `user` luôn khác. Docker Engine rootful mặc định có thể chạy container trong initial user namespace nếu user namespace remapping không bật.
+
+Đối chiếu hostname:
+
+```bash
+printf 'Host:      '; hostname
+printf 'Container: '; docker exec ns-demo hostname
+```
+
+Đối chiếu network view nếu image có utility cần thiết:
+
+```bash
+docker exec ns-demo cat /proc/net/dev
+cat /proc/net/dev
+```
+
+Dọn lab:
+
+```bash
+docker rm -f ns-demo
+```
+
+## Lab: chứng minh namespace có thể được share
+
+Chạy container dùng host PID namespace:
+
+```bash
+docker run --name ns-host-pid -d --pid host alpine:3.20 sleep 300
+PID=$(docker inspect --format '{{.State.Pid}}' ns-host-pid)
+readlink /proc/self/ns/pid
+readlink "/proc/$PID/ns/pid"
+```
+
+Hai PID namespace handles dự kiến giống nhau. Dọn container ngay sau lab:
+
+```bash
+docker rm -f ns-host-pid
+```
+
+<Callout type="warn" title="Cảnh báo">
+  Share host PID/network/IPC namespace có thể expose metadata và tăng khả năng tương tác với host. Chỉ dùng khi use case đã được threat-model review; không bật để né lỗi cấu hình application.
+</Callout>
+
+## Inspect namespace mode từ Docker
+
+Docker metadata cho biết các mode được yêu cầu:
+
+```bash
+docker inspect --format '{{json .HostConfig}}' CONTAINER
+```
+
+Để xem gọn hơn:
+
+```bash
+docker inspect --format \
+  'PidMode={{.HostConfig.PidMode}} IpcMode={{.HostConfig.IpcMode}} NetworkMode={{.HostConfig.NetworkMode}} UsernsMode={{.HostConfig.UsernsMode}}' \
+  CONTAINER
+```
+
+Mode rỗng thường có nghĩa dùng default của daemon/API field, không phải “không có namespace”. Khi cần kết luận security, kết hợp metadata với namespace inode thực tế và daemon configuration.
+
+Các tool host hữu ích:
+
+```bash
+lsns
+lsns -p "$HOST_PID"
+nsenter --target "$HOST_PID" --mount --uts --ipc --net --pid COMMAND
+```
+
+`nsenter` có thể chạy command trong namespace của target và thường cần quyền cao. Đây là tool chẩn đoán mạnh; command bạn chạy có thể tác động network/filesystem view của container hoặc host. Dùng read-only observation trước.
+
+## Mount propagation: lỗi khó thấy
+
+Mount namespace có propagation relationship như shared, slave và private. Nó quyết định một mount event phát sinh ở namespace này có lan sang peer/child namespace khác không. Docker bind mount hỗ trợ propagation options trên platform phù hợp.
+
+Đây là chủ đề dễ gây lỗi với nested mount, container quản lý storage hoặc workload cần thấy mount mới từ host. Không đổi sang `rshared` một cách mù quáng: propagation rộng làm mount event lan xa hơn và thay đổi security boundary. Inspect mount source, destination, flags và propagation từ cả host lẫn container.
+
+## Failure modes thường gặp
+
+### `localhost` trỏ sai nơi
+
+**Triệu chứng:** application trong container không kết nối database ở container khác qua `localhost`.
+
+**Giải thích:** mỗi network namespace có loopback riêng.
+
+**Xử lý:** đặt hai container vào user-defined network và dùng service/container DNS name trong network scope. Không chuyển sang host network chỉ để tránh học service discovery.
+
+### Host process không xuất hiện trong `ps`
+
+Đây thường là behavior đúng của PID namespace. Nếu tool monitoring cần host-wide visibility, chạy agent ở boundary phù hợp với quyền tối thiểu, thay vì bật `--pid host` cho mọi workload.
+
+### Bind mount báo permission denied
+
+Kiểm tra theo thứ tự:
+
+1. source path và read-only/read-write mode;
+2. UID/GID của process trong container;
+3. user namespace mapping/subuid/subgid;
+4. Unix mode/ACL;
+5. SELinux/AppArmor label/policy;
+6. filesystem/platform semantics.
+
+Namespace inode khác nhau không giải thích trực tiếp file permission.
+
+### `Operation not permitted` khi gọi `unshare`
+
+Có thể do thiếu `CAP_SYS_ADMIN`, seccomp profile chặn syscall/flag, user namespace bị host policy hạn chế hoặc namespace limit. Chỉ chạy `seccomp=unconfined`/thêm capability trong môi trường test để phân lớp nguyên nhân; không dùng kết quả làm production fix mặc định.
+
+## Security guidance
+
+- Không share host namespace nếu application không cần.
+- Bật user namespace remapping hoặc rootless mode khi phù hợp với feature/operations requirements.
+- Xem bind mount, device và socket như những điểm xuyên namespace boundary.
+- Kết hợp namespaces với cgroups, capabilities, seccomp và LSM.
+- Giới hạn quyền truy cập `/proc`, `/sys` và namespace handles.
+- Theo dõi daemon/runtime configuration drift; Docker CLI command không thể hiện mọi host default.
+
+## Tự kiểm tra
+
+1. Namespace tách view nhưng không giới hạn resource như thế nào?
+2. Vì sao PID trong container và trên host khác nhau nhưng vẫn là cùng process?
+3. User namespace remapping khác `USER` trong Dockerfile ở đâu?
+4. Vì sao bind mount vẫn có thể sửa dữ liệu host dù mount namespace riêng?
+5. Dùng evidence nào để chứng minh hai process share một namespace?
+
+Tiếp theo, [Control groups](/docs/nen-tang-container/control-groups/) giải thích cách kernel account và kiểm soát resource cho nhóm process.
+
+## Nguồn đối chiếu
+
+- [namespaces(7) — Linux manual](https://man7.org/linux/man-pages/man7/namespaces.7.html)
+- [user_namespaces(7) — Linux manual](https://man7.org/linux/man-pages/man7/user_namespaces.7.html)
+- [mount_namespaces(7) — Linux manual](https://man7.org/linux/man-pages/man7/mount_namespaces.7.html)
+- [Docker Engine security](https://docs.docker.com/engine/security/)
+- [Isolate containers with a user namespace](https://docs.docker.com/engine/security/userns-remap/)

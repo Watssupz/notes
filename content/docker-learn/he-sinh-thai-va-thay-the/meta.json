@@ -1,0 +1,13 @@
+{
+  "title": "Hệ sinh thái và công cụ thay thế",
+  "pages": [
+    "index",
+    "podman",
+    "nerdctl",
+    "buildah",
+    "kaniko",
+    "lima-colima",
+    "rancher-desktop",
+    "migration-compatibility"
+  ]
+}

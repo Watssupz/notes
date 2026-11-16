@@ -1,0 +1,19 @@
+{
+  "title": "Networking",
+  "pages": [
+    "index",
+    "network-model",
+    "bridge-network",
+    "host-network",
+    "none-network",
+    "overlay-network",
+    "macvlan",
+    "ipvlan",
+    "dns-service-discovery",
+    "port-publishing",
+    "container-communication",
+    "ipv6",
+    "firewall-iptables-nftables",
+    "network-troubleshooting"
+  ]
+}

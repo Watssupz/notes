@@ -1,0 +1,275 @@
+---
+title: "Shell completion cho Docker CLI"
+description: "Bật và kiểm tra completion của Docker cho Bash, Zsh và Fish; xử lý script cũ, plugin missing và startup chậm mà không tải mã không kiểm chứng vào shell."
+---
+
+Shell completion gợi ý command, option, context, container, image, network và volume khi nhấn `Tab`. Nó giảm typo nhưng không phải validation: suggestion có thể stale, thiếu plugin hoặc lấy object từ context không mong muốn.
+
+<Callout type="warn" title="Completion có thể gọi Docker CLI">
+  Khi gợi ý object động, completion có thể truy vấn context/daemon hiện tại. Trên remote context, nhấn Tab có thể tạo network request, chậm hoặc làm lộ tên resource trên màn hình/log terminal.
+</Callout>
+
+## Xác định shell và nguồn cài Docker
+
+```bash
+printf 'login shell: %s\n' "$SHELL"
+printf 'current shell: %s\n' "${0##*/}"
+command -v docker
+docker --version
+```
+
+Completion script thường được cài bởi Docker CLI package, Docker Desktop hoặc package completion của shell. Path khác theo distribution/package manager; không hard-code một path rồi tải file bất kỳ vào shell startup.
+
+Tìm file đã cài:
+
+```bash
+# Debian/Ubuntu package inventory
+dpkg -L docker-ce-cli 2>/dev/null | grep -E '/(bash-completion|zsh|fish)/' || true
+
+# RPM-based package inventory
+rpm -ql docker-ce-cli 2>/dev/null | grep -E '/(bash-completion|zsh|fish)/' || true
+
+# Các vị trí thường gặp, chỉ để quan sát
+find /usr/share /usr/local/share \
+  -maxdepth 4 \
+  \( -name docker -o -name _docker -o -name 'docker.fish' \) \
+  2>/dev/null
+```
+
+Trên macOS/Homebrew, xem prefix package thay vì đoán path:
+
+```bash
+brew --prefix docker 2>/dev/null || true
+brew --prefix bash-completion@2 2>/dev/null || true
+```
+
+## Bash
+
+### Prerequisite
+
+Bash cần framework `bash-completion` và Docker completion file nằm trong directory mà framework autoload.
+
+Kiểm tra:
+
+```bash
+bash --version
+command -v docker
+```
+
+Trong interactive Bash, nạp framework nếu distribution chưa tự nạp:
+
+```bash
+if [ -r /usr/share/bash-completion/bash_completion ]; then
+  . /usr/share/bash-completion/bash_completion
+fi
+```
+
+Trên package setup đúng, Docker completion được autoload khi gõ `docker` rồi Tab. Xác minh registration sau khi trigger:
+
+```bash
+complete -p docker 2>/dev/null || true
+```
+
+Nếu Docker package cung cấp file cụ thể và distro không autoload, source **file local đã xác minh từ package** trong `~/.bash_completion` hoặc `~/.bashrc`:
+
+```bash
+# Ví dụ path phổ biến; xác minh file tồn tại và package owner trước
+if [ -r /usr/share/bash-completion/completions/docker ]; then
+  . /usr/share/bash-completion/completions/docker
+fi
+```
+
+Mở shell mới rồi thử:
+
+```text
+docker cont<Tab>
+docker container l<Tab>
+docker --context <Tab>
+```
+
+Không dùng `curl URL | source` trong shell profile. Remote content thay đổi có thể chạy code với quyền user mỗi lần mở terminal.
+
+## Zsh
+
+Zsh tìm completion function trong `$fpath`; Docker function thường có tên `_docker`.
+
+Kiểm tra:
+
+```zsh
+print -l $fpath
+whence -v compinit
+```
+
+Khởi tạo completion trong `~/.zshrc` nếu framework chưa làm:
+
+```zsh
+autoload -Uz compinit
+compinit
+```
+
+Nếu `_docker` nằm trong custom directory, thêm directory **trước** `compinit`:
+
+```zsh
+fpath=("$HOME/.zsh/completions" $fpath)
+autoload -Uz compinit
+compinit
+```
+
+File phải là:
+
+```text
+$HOME/.zsh/completions/_docker
+```
+
+Xác minh:
+
+```zsh
+whence -v _docker
+```
+
+Oh My Zsh, prezto hoặc plugin manager có thể đã gọi `compinit`. Không gọi lặp nhiều lần nếu startup chậm; đặt Docker completion vào path mà framework đang quản lý và rebuild cache theo documentation của framework.
+
+Zsh có thể cảnh báo insecure directory. Sửa ownership/permission của completion directory thay vì bỏ security check toàn cục:
+
+```zsh
+compaudit
+```
+
+Review từng path được báo trước khi `chmod`; shared package directory cần sửa qua package/admin policy.
+
+## Fish
+
+Fish autoload completion từ các directory trong `$fish_complete_path`. File thường có tên `docker.fish`.
+
+Kiểm tra:
+
+```fish
+printf '%s\n' $fish_complete_path
+find /usr/share/fish /usr/local/share/fish ~/.config/fish \
+  -name 'docker.fish' 2>/dev/null
+```
+
+Nếu có file package ở standard path, mở Fish session mới là đủ. Với file user-managed đã xác minh:
+
+```text
+~/.config/fish/completions/docker.fish
+```
+
+Test:
+
+```text
+docker cont<Tab>
+```
+
+Không đặt Bash/Zsh script vào Fish completion directory; syntax không tương thích.
+
+## Completion của plugin
+
+`docker compose` và `docker buildx` là CLI plugin. Completion phụ thuộc:
+
+- plugin binary có trên CLI plugin search path;
+- core Docker completion có support delegation;
+- plugin version cung cấp metadata/completion phù hợp;
+- completion file không quá cũ so với CLI/plugin.
+
+Xác minh plugin trước:
+
+```bash
+docker compose version
+docker buildx version
+docker help
+```
+
+Nếu command chạy được nhưng completion thiếu, cập nhật CLI package/completion từ cùng trusted release channel. Đừng trộn một `_docker` rất mới với core CLI cũ mà không test.
+
+## Context và object động
+
+Test completion trên local lab context trước:
+
+```bash
+docker context show
+docker context ls
+```
+
+Nếu completion treo:
+
+1. kiểm tra context có remote/SSH endpoint không;
+2. chạy `docker --context <name> version` để đo connection;
+3. unset override bất ngờ;
+4. kiểm tra completion function có gọi list command nhiều lần;
+5. dùng shell profiling để phân biệt startup chậm và Tab chậm.
+
+Không chuyển context production chỉ để thử completion object name.
+
+## Chẩn đoán completion không hoạt động
+
+### Bash
+
+```bash
+shopt -q progcomp && echo 'programmable completion enabled'
+type _init_completion 2>/dev/null || true
+complete -p docker 2>/dev/null || true
+```
+
+Nếu `_init_completion` thiếu, framework `bash-completion` chưa được nạp. Nếu `complete -p docker` thiếu, Docker completion chưa register/autoload.
+
+### Zsh
+
+```zsh
+print -l $fpath
+whence -v _docker
+compaudit
+```
+
+Xóa/rebuild `.zcompdump` chỉ sau khi xác định cache stale và theo framework setup; xóa cache không sửa file/path sai.
+
+### Fish
+
+```fish
+printf '%s\n' $fish_complete_path
+complete -C 'docker cont'
+```
+
+`complete -C` giúp test candidate không cần tương tác Tab.
+
+## Completion cũ hoặc conflict
+
+Triệu chứng:
+
+- gợi ý legacy command nhưng thiếu management command mới;
+- option đã bỏ vẫn xuất hiện;
+- plugin command không complete;
+- error khi nhấn Tab;
+- cùng command register bởi nhiều framework.
+
+Thu inventory:
+
+```bash
+command -v docker
+docker --version
+type docker
+```
+
+Sau đó tìm mọi file `_docker`, `docker.fish` và Bash completion trong user/system path. Giữ một nguồn package ưu tiên, xóa symlink/file user cũ sau backup và mở shell sạch để test:
+
+```bash
+env -i HOME="$HOME" TERM="$TERM" PATH="$PATH" bash --noprofile --norc
+```
+
+Trong shell sạch, source framework và Docker completion từng bước để cô lập conflict.
+
+## Performance và security
+
+- Không eval/source output hoặc URL không pin/checksum.
+- Ưu tiên completion đi cùng Docker CLI package.
+- Giới hạn permission user completion directory.
+- Không để completion script in credential/environment khi debug.
+- Remote context có thể làm dynamic completion chậm; dùng context local khi thao tác phát triển thường ngày.
+- Profile shell trước khi đổ lỗi Docker: nhiều plugin manager cùng chạy `compinit`/scan filesystem thường gây startup chậm.
+
+## Nguồn đối chiếu
+
+- [Docker CLI source: contrib/completion](https://github.com/docker/cli/tree/master/contrib/completion)
+- [Bash programmable completion](https://www.gnu.org/software/bash/manual/html_node/Programmable-Completion.html)
+- [Zsh completion system](https://zsh.sourceforge.io/Doc/Release/Completion-System.html)
+- [Fish completions](https://fishshell.com/docs/current/completions.html)

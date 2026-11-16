@@ -1,0 +1,337 @@
+---
+title: "Docker Buildx Bake"
+description: "Mô hình hóa nhiều build target bằng docker-bake.hcl, group, inheritance, matrix, cache, platform và attestation thay cho CLI dài khó review."
+---
+
+Docker Buildx Bake là lớp cấu hình khai báo cho build workflow. Thay vì duy trì nhiều command dài với `--platform`, `--cache-*`, `--tag`, `--output`, bạn định nghĩa **target** và **group** trong HCL/JSON hoặc Compose rồi chạy `docker buildx bake`.
+
+Bake giải quyết hai vấn đề:
+
+- cấu hình build trở thành code có thể review/version;
+- các target độc lập trong cùng group có thể build đồng thời.
+
+Bake không thay Dockerfile: Dockerfile vẫn mô tả cách tạo một target filesystem/image; Bake mô tả cách gọi nhiều build và truyền input/output.
+
+## File và lookup order
+
+Bake hỗ trợ:
+
+- `docker-bake.hcl` / `docker-bake.override.hcl`;
+- `docker-bake.json` / `docker-bake.override.json`;
+- `compose.yaml`, `compose.yml`, `docker-compose.yml`, `docker-compose.yaml`.
+
+Nếu không dùng `-f`, Bake tìm các file chuẩn trong working directory và merge theo lookup order. Override behavior khác nhau giữa attribute: một số list bị thay thế, một số map được merge. Để CI dễ đoán, chỉ rõ file:
+
+```bash
+docker buildx bake --file docker-bake.hcl --print
+```
+
+`--print` là bước quan trọng để xem definition sau merge, variable và override trước khi build/push.
+
+## Target và group đầu tiên
+
+`docker-bake.hcl`:
+
+```hcl
+variable "REGISTRY" {
+  default = "registry.example.com/team"
+}
+
+variable "VERSION" {
+  default = "dev"
+}
+
+group "default" {
+  targets = ["frontend", "backend"]
+}
+
+target "frontend" {
+  context    = "./frontend"
+  dockerfile = "Dockerfile"
+  tags       = ["${REGISTRY}/frontend:${VERSION}"]
+}
+
+target "backend" {
+  context    = "./backend"
+  dockerfile = "Dockerfile"
+  tags       = ["${REGISTRY}/backend:${VERSION}"]
+}
+```
+
+Kiểm tra và build:
+
+```bash
+REGISTRY=registry.example.com/dev VERSION=local \
+  docker buildx bake --print
+
+docker buildx bake
+```
+
+Không có target argument thì Bake chạy group `default`. Chạy riêng:
+
+```bash
+docker buildx bake backend
+```
+
+## Các attribute target thường dùng
+
+| Attribute | Tương đương CLI | Vai trò |
+|---|---|---|
+| `context`, `dockerfile` | context, `-f` | Input chính |
+| `contexts` | `--build-context` | Named contexts |
+| `target` | `--target` | Dockerfile stage |
+| `args` | `--build-arg` | Input build không nhạy cảm |
+| `tags` | `--tag` | Tên image |
+| `platforms` | `--platform` | Target platforms |
+| `output` | `--output`/`--push` | Nơi xuất kết quả |
+| `cache-from`, `cache-to` | option cùng tên | External cache |
+| `secret`, `ssh` | option cùng tên | Credential mount |
+| `attest` | `--attest` | SBOM/provenance |
+| `inherits` | Không có trực tiếp | Tái sử dụng config target |
+| `matrix`, `name` | Matrix expansion | Sinh nhiều variant |
+| `call` | `--call` | `build`, `check`, `outline`... |
+
+## Inheritance để tách concern
+
+Dùng target tên bắt đầu `_` như template convention nội bộ:
+
+```hcl
+target "_common" {
+  context    = "."
+  dockerfile = "Dockerfile"
+  labels = {
+    "org.opencontainers.image.source" = "https://github.com/example/app"
+  }
+}
+
+target "_release" {
+  platforms = ["linux/amd64", "linux/arm64"]
+  attest = [
+    { type = "provenance", mode = "max" },
+    { type = "sbom" }
+  ]
+}
+
+target "app-local" {
+  inherits = ["_common"]
+  tags     = ["app:dev"]
+  output   = [{ type = "docker" }]
+}
+
+target "app-release" {
+  inherits = ["_common", "_release"]
+  tags     = ["registry.example.com/team/app:${VERSION}"]
+  output   = [{ type = "registry" }]
+}
+```
+
+Khi nhiều parent định nghĩa cùng attribute, target xuất hiện sau trong `inherits` có thể thắng theo merge rules. Luôn kiểm tra `--print`; không tạo inheritance chain sâu khó review.
+
+## Variable và validation
+
+```hcl
+variable "VERSION" {
+  default = "dev"
+  validation {
+    condition     = can(regex("^[0-9A-Za-z][0-9A-Za-z._-]*$", VERSION))
+    error_message = "VERSION chỉ được chứa ký tự an toàn cho tag."
+  }
+}
+```
+
+Caller có thể set variable qua environment hoặc `--set` tùy trường hợp:
+
+```bash
+VERSION=1.4.0 docker buildx bake app-release --print
+docker buildx bake app-release --set app-release.args.COMMIT_SHA="$GIT_SHA"
+```
+
+Không dùng Bake variable cho secret value rồi commit/render bằng `--print`. Dùng `secret` source từ env/file.
+
+## Override bằng `--set`
+
+`--set` hữu ích cho CI override có scope:
+
+```bash
+docker buildx bake app-release \
+  --set app-release.tags=registry.example.com/team/app:${GIT_SHA} \
+  --set app-release.cache-from=type=registry,ref=registry.example.com/team/app:cache-main
+```
+
+Wildcard target có thể được hỗ trợ cho pattern nhất định, nhưng override quá nhiều biến Bake trở lại thành CLI khó đọc. Cấu hình ổn định nên nằm trong file; `--set` chỉ dành cho dữ liệu runtime như tag SHA hoặc local output.
+
+## Matrix build
+
+Sinh target theo platform/flavor/version mà không copy block:
+
+```hcl
+target "app" {
+  name = "app-${flavor}"
+  matrix = {
+    flavor = ["slim", "debug"]
+  }
+  context = "."
+  target  = flavor
+  tags    = ["registry.example.com/team/app:${VERSION}-${flavor}"]
+}
+```
+
+```bash
+docker buildx bake app --print
+docker buildx bake app
+```
+
+Mỗi generated target phải có tên duy nhất. Matrix nhiều axis tạo tích Descartes; 3 OS × 4 architecture × 3 flavor = 36 build. Ước lượng cost/cache/storage trước.
+
+## Named context giữa targets
+
+Khi không thể hợp nhất nhiều Dockerfile, một target có thể làm context/base cho target khác:
+
+```hcl
+target "base" {
+  context    = "."
+  dockerfile = "base.Dockerfile"
+}
+
+target "app" {
+  context    = "."
+  dockerfile = "app.Dockerfile"
+  contexts = {
+    appbase = "target:base"
+  }
+}
+```
+
+```dockerfile
+FROM appbase
+COPY . /app
+```
+
+Ưu tiên multi-stage build trong một Dockerfile khi dependency graph tự nhiên. `target:` context hữu ích khi boundary Dockerfile/repo thực sự cần thiết.
+
+## Cache, output và attestation cho release
+
+```hcl
+variable "IMAGE" {
+  default = "registry.example.com/team/app"
+}
+
+variable "VERSION" {
+  default = "dev"
+}
+
+target "release" {
+  context    = "."
+  dockerfile = "Dockerfile"
+  target     = "runtime"
+  platforms  = ["linux/amd64", "linux/arm64"]
+  tags       = ["${IMAGE}:${VERSION}"]
+
+  cache-from = [
+    { type = "registry", ref = "${IMAGE}:buildcache-main" }
+  ]
+  cache-to = [
+    { type = "registry", ref = "${IMAGE}:buildcache-main", mode = "max" }
+  ]
+
+  attest = [
+    { type = "provenance", mode = "max", version = "v1" },
+    { type = "sbom" }
+  ]
+
+  output = [{ type = "registry" }]
+}
+```
+
+```bash
+VERSION=1.4.0 docker buildx bake release --print
+VERSION=1.4.0 docker buildx bake release
+```
+
+`output = [{ type = "registry" }]` tương đương intent push. Registry login và permissions vẫn phải được chuẩn bị ngoài Bake.
+
+## Secret và SSH
+
+```hcl
+variable "HOME" {
+  default = null
+}
+
+target "private-deps" {
+  context = "."
+  secret = [
+    { type = "file", id = "npmrc", src = "${HOME}/.npmrc" }
+  ]
+  ssh = [{ id = "default" }]
+}
+```
+
+Dockerfile phải consume mount:
+
+```dockerfile
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc,required=true npm ci
+RUN --mount=type=ssh,required=true git clone git@github.com:example/private.git /src/private
+```
+
+Không đặt token/key trực tiếp trong HCL. `--print` có thể được lưu log CI, vì vậy definition phải không chứa giá trị nhạy cảm.
+
+## Dùng Compose làm input
+
+Bake có thể đọc service build config trong Compose:
+
+```yaml
+services:
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    image: registry.example.com/team/api:dev
+```
+
+```bash
+docker buildx bake --file compose.yaml --print
+docker buildx bake --file compose.yaml api
+```
+
+Compose phù hợp khi build config đơn giản và đã tồn tại. HCL mạnh hơn cho inheritance, function, matrix và release cache/attestation. Có thể merge Compose + HCL override, nhưng cần kiểm tra merge result.
+
+## Build checks bằng Bake
+
+```hcl
+target "validate" {
+  context = "."
+  call    = "check"
+}
+```
+
+```bash
+docker buildx bake validate
+```
+
+Hoặc override call cho target tùy CLI/version. Tạo group CI rõ ràng:
+
+```hcl
+group "ci" {
+  targets = ["lint", "test", "image"]
+}
+```
+
+Đừng giả định target `test` chạy trước `image`; các target độc lập có thể chạy concurrent. Dependency/gate phải được biểu diễn qua stage/context graph hoặc pipeline job ordering.
+
+## Best practices
+
+- Chạy `docker buildx bake --print` trong review/CI trước push.
+- Tách local và release target để output không bị nhầm.
+- Dùng inheritance nông, target template nhỏ và tên có ý nghĩa.
+- Không lưu secret value trong variable/args/file Bake.
+- Validation variable dùng cho tag/platform/flavor từ caller.
+- Tránh matrix bùng nổ và theo dõi cache/storage.
+- Pin image/action/tool version; deploy theo digest do build trả về.
+- Ghi rõ group nào được phép push và chỉ chạy trong trusted event.
+
+## Nguồn chính thức
+
+- [Docker Buildx Bake](https://docs.docker.com/build/bake/)
+- [Bake file reference](https://docs.docker.com/build/bake/reference/)
+- [Bake targets](https://docs.docker.com/build/bake/targets/)
+- [`docker buildx bake`](https://docs.docker.com/reference/cli/docker/buildx/bake/)

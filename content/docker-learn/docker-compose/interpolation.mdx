@@ -1,0 +1,211 @@
+---
+title: "Variable interpolation"
+description: "Dùng ${VAR}, default/required/alternative expressions và $$ trong Compose; hiểu source precedence, thời điểm resolve và cách audit bằng docker compose config."
+---
+
+Interpolation thay placeholder trong Compose YAML **trước khi** model được chạy. Nó phù hợp để chọn image tag, host port, path hoặc chuyển giá trị vào `environment`; nó không phải template engine tùy ý và không tự tạo runtime secret.
+
+```yaml
+services:
+  api:
+    image: "${REGISTRY:-docker.io}/example/api:${IMAGE_TAG:?IMAGE_TAG is required}"
+    ports:
+      - "127.0.0.1:${HTTP_PORT:-8080}:8080"
+```
+
+## Cú pháp hỗ trợ
+
+Compose hỗ trợ `$VAR` và `${VAR}` cho unquoted/double-quoted values. Braced form rõ ràng hơn:
+
+| Expression | Kết quả |
+|---|---|
+| `${VAR}` | Value, hoặc empty nếu unset |
+| `${VAR:-default}` | `default` nếu unset **hoặc empty** |
+| `${VAR-default}` | `default` chỉ khi unset |
+| `${VAR:?message}` | Fail nếu unset **hoặc empty** |
+| `${VAR?message}` | Fail chỉ khi unset |
+| `${VAR:+replacement}` | `replacement` nếu set và non-empty |
+| `${VAR+replacement}` | `replacement` nếu set, kể cả empty |
+
+Khác biệt `:-` và `-` quan trọng khi CI khai báo biến nhưng value rỗng.
+
+```yaml
+services:
+  app:
+    image: "example/app:${TAG:-stable}"
+    environment:
+      REQUIRED_URL: "${API_URL:?Set API_URL before deploy}"
+      TRACE_MODE: "${DEBUG:+verbose}"
+```
+
+## Nguồn và precedence interpolation
+
+Từ cao xuống thấp trong trường hợp thông thường:
+
+1. environment của shell chạy `docker compose`;
+2. file truyền bằng `--env-file` (nhiều file được đọc theo thứ tự, file sau override);
+3. `.env` mặc định trong project directory khi không dùng `--env-file`.
+
+```bash
+docker compose --env-file .env \
+  --env-file .env.local \
+  config
+```
+
+Xem source effective:
+
+```bash
+docker compose config --environment
+docker compose config --variables
+```
+
+Nếu không set `--env-file`, Compose có edge case nạp hai `.env` khi `.env` đầu đặt `COMPOSE_FILE` sang project directory khác; file project thứ hai có precedence thấp hơn. Tránh phụ thuộc behavior phức tạp nếu pipeline cần dễ audit.
+
+## Interpolation khác container environment
+
+```dotenv
+# .env
+TAG=1.8.3
+APP_MODE=staging
+```
+
+```yaml
+services:
+  api:
+    image: "example/api:${TAG}"
+    environment:
+      APP_MODE: "${APP_MODE}"
+```
+
+`TAG` chỉ dùng để dựng image reference; nó không xuất hiện trong container. `APP_MODE` xuất hiện vì service `environment` chuyển value vào container.
+
+## Escape `$` bằng `$$`
+
+Khi muốn container shell tự expand, không để Compose expand:
+
+```yaml
+services:
+  demo:
+    image: alpine:3.23
+    command: ["sh", "-c", "echo container=$$HOSTNAME; sleep 300"]
+```
+
+Resolved model giữ `$HOSTNAME` cho process trong container. Nếu dùng `$HOSTNAME`, Compose có thể lấy hostname của máy chạy CLI hoặc thay empty.
+
+## Quote và `.env` syntax
+
+Interpolation áp dụng cho unquoted và double-quoted value. Single quote trong `.env` giữ literal:
+
+```dotenv
+DIRECT=${USER}
+EXPANDED="hello ${USER}"
+LITERAL='hello ${USER}'
+```
+
+Trong YAML, quote toàn expression khi value có `:`, `#`, boolean-looking text hoặc port mapping:
+
+```yaml
+environment:
+  ENABLED: "${ENABLED:-false}"
+ports:
+  - "${BIND_IP:-127.0.0.1}:${PORT:-8080}:80"
+```
+
+## Key interpolation
+
+Compose interpolation áp dụng cho YAML values, không phải mọi mapping key. Khi cần variable trong key của `labels` hoặc `environment`, dùng list `KEY=VALUE` để toàn entry là value:
+
+```yaml
+services:
+  app:
+    labels:
+      - "${LABEL_KEY}=enabled"
+```
+
+Tránh dynamic service/resource names: chúng làm merge, reference và troubleshooting khó dự đoán.
+
+## Interpolation và nhiều file
+
+Compose interpolate từng file trước khi merge theo Compose Specification. Variable có thể làm hai file tạo unique key khác nhau cho port/mount và dẫn tới merge bất ngờ. Luôn inspect kết quả cuối:
+
+```bash
+docker compose \
+  -f compose.yaml \
+  -f compose.production.yaml \
+  config > resolved.yaml
+```
+
+Không commit `resolved.yaml` nếu nó chứa value nhạy cảm.
+
+## Lab: default, required và escape
+
+Tạo `.env`:
+
+```dotenv
+IMAGE_TAG=3.23
+MESSAGE=from-dotenv
+```
+
+Tạo `compose.yaml`:
+
+```yaml
+name: compose-interpolation-lab
+
+services:
+  demo:
+    image: "alpine:${IMAGE_TAG:?IMAGE_TAG is required}"
+    command:
+      - sh
+      - -c
+      - 'echo model=$${MESSAGE}; echo host=$$HOSTNAME; sleep 300'
+    environment:
+      MESSAGE: "${MESSAGE:-fallback}"
+```
+
+Audit rồi chạy:
+
+```bash
+docker compose config --environment
+docker compose config
+docker compose up --detach
+docker compose logs demo
+```
+
+Override từ shell:
+
+```bash
+MESSAGE=from-shell docker compose up --detach --force-recreate
+docker compose logs demo
+```
+
+Kiểm tra required expression:
+
+```bash
+mv .env .env.saved
+docker compose config
+mv .env.saved .env
+```
+
+Expected: config fail vì `IMAGE_TAG` thiếu, thay vì tạo image reference sai.
+
+## Guardrails
+
+- Dùng `${VAR:?message}` cho image tag, external resource name và endpoint bắt buộc.
+- Dùng default an toàn; không default production credential.
+- Dùng `$$` cho biến phải nở trong container.
+- Chạy `config --quiet` và review `config` cho từng environment.
+- Không in `config --environment` vào public CI log nếu có dữ liệu nhạy cảm.
+- Không dùng interpolation thay schema validation của application.
+
+## Cleanup
+
+```bash
+docker compose down
+rm -f .env
+```
+
+## Nguồn chính thức
+
+- [Variable interpolation in Compose](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/)
+- [Interpolation in Compose Specification](https://github.com/compose-spec/compose-spec/blob/main/12-interpolation.md)
+- [`docker compose config`](https://docs.docker.com/reference/cli/docker/compose/config/)

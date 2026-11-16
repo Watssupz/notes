@@ -1,0 +1,187 @@
+---
+title: "Docker volumes"
+description: "Quản lý named và anonymous volumes, hiểu lifecycle, seed data, read-only mount, volume subpath và dọn dẹp an toàn."
+---
+
+Volume là persistent data store do Docker quản lý. Volume tồn tại độc lập với một container cụ thể và được mount vào filesystem của container như directory thông thường.
+
+```text
+container app-v1 ─┐
+                  ├──> named volume app-data
+container app-v2 ─┘
+```
+
+Volume phù hợp khi application cần giữ dữ liệu qua recreate container nhưng operator không cần thao tác hằng ngày qua một host path cố định.
+
+## Named và anonymous volume
+
+| Loại | Cách khai báo | Khả năng reuse |
+|---|---|---|
+| Named | `app-data:/data` | Dễ tham chiếu, backup và migrate |
+| Anonymous | `/data` hoặc bỏ `src` trong `--mount` | Docker sinh tên ngẫu nhiên; dễ bị orphan |
+
+Cả hai vẫn tồn tại sau khi container bị xóa, trừ anonymous volume gắn với container chạy bằng `--rm`. Named volume không bị `--rm` tự động xóa.
+
+<Callout type="warn" title="Volume không tự mất khi container bị xóa">
+  Đây là đặc tính persistence, không phải leak. Chỉ chạy `docker volume prune` sau khi đã xác minh volume nào không còn cần và có backup phù hợp.
+</Callout>
+
+## Lifecycle và command quản lý
+
+```bash
+docker volume create --label com.example.owner=storage-lab app-data
+docker volume ls
+docker volume inspect app-data
+```
+
+Mount vào container:
+
+```bash
+docker run --rm \
+  --mount type=volume,src=app-data,dst=/data \
+  alpine:3.22 sh -c 'date -u > /data/created-at'
+```
+
+Container đã bị xóa nhưng volume còn:
+
+```bash
+docker run --rm \
+  --mount type=volume,src=app-data,dst=/data,readonly \
+  alpine:3.22 cat /data/created-at
+```
+
+`docker volume inspect` có thể hiển thị `Mountpoint`, nhưng không sửa dữ liệu trực tiếp tại path đó. Dùng container helper hoặc tool của volume driver để giữ Docker metadata và permission boundary nhất quán.
+
+## Mount che target và cơ chế seed dữ liệu
+
+Nếu mount volume vào target đã có file trong image:
+
+- volume **không rỗng** che nội dung image;
+- volume **rỗng** được Docker copy nội dung target vào theo mặc định;
+- `volume-nocopy` tắt bước copy.
+
+Lab với nội dung mặc định của Nginx:
+
+```bash
+docker volume create nginx-html
+docker run --rm \
+  --mount type=volume,src=nginx-html,dst=/usr/share/nginx/html \
+  nginx:1.28-alpine \
+  sh -c 'test -f /usr/share/nginx/html/index.html && echo seeded'
+```
+
+Expected output:
+
+```text
+seeded
+```
+
+Cơ chế này chỉ chạy khi volume rỗng. Không dùng nó như migration mechanism: image mới không tự ghi đè volume đã có dữ liệu.
+
+## Read-only mount
+
+Một writer có thể mount read-write, còn consumer mount cùng volume read-only:
+
+```bash
+docker run --rm \
+  --mount type=volume,src=app-data,dst=/data \
+  alpine:3.22 sh -c 'printf published > /data/result'
+
+docker run --rm \
+  --mount type=volume,src=app-data,dst=/input,readonly \
+  alpine:3.22 cat /input/result
+```
+
+`readonly` giảm accidental writes từ container đó, nhưng không mã hóa dữ liệu và không ngăn container khác có mount read-write.
+
+Xác minh mount mode trên container đang tồn tại:
+
+```bash
+docker inspect CONTAINER \
+  --format '{{range .Mounts}}{{println .Type .Name .Destination .RW}}{{end}}'
+```
+
+## Mount một subdirectory
+
+`volume-subpath` chỉ expose một directory con. Directory phải tồn tại trước khi start container:
+
+```bash
+docker volume create shared-logs
+docker run --rm \
+  --mount type=volume,src=shared-logs,dst=/logs \
+  alpine:3.22 mkdir -p /logs/app-a /logs/app-b
+
+docker run --rm \
+  --mount type=volume,src=shared-logs,dst=/var/log/app,volume-subpath=app-a \
+  alpine:3.22 sh -c 'printf hello > /var/log/app/current.log'
+```
+
+Kiểm tra từ volume gốc:
+
+```bash
+docker run --rm \
+  --mount type=volume,src=shared-logs,dst=/logs,readonly \
+  alpine:3.22 find /logs -maxdepth 2 -type f -print
+```
+
+Subpath giúp thu hẹp filesystem view nhưng không phải security boundary mạnh nếu writer khác kiểm soát toàn bộ volume.
+
+## Chia sẻ volume không đồng nghĩa multi-writer an toàn
+
+Docker cho phép mount cùng volume vào nhiều container. Điều đó chỉ nói filesystem có thể truy cập, không đảm bảo application protocol hỗ trợ concurrent writes.
+
+- static assets: một writer và nhiều reader thường hợp lý;
+- database data directory: không mount cho hai database instance độc lập trừ khi database và storage được thiết kế rõ ràng cho mô hình đó;
+- SQLite: cần hiểu locking semantics của filesystem;
+- network filesystem: phải kiểm tra consistency, locking, latency và failure mode của backend.
+
+## Volume với Compose
+
+Compose khai báo named volume ở top level và tham chiếu trong service:
+
+```yaml
+services:
+  app:
+    image: example/app:1.0
+    volumes:
+      - type: volume
+        source: app-data
+        target: /var/lib/app
+
+volumes:
+  app-data:
+```
+
+Compose thường đặt project prefix vào tên volume thực tế. Dùng `docker compose config` và `docker volume ls` để xác minh thay vì đoán tên.
+
+Nếu volume do hệ thống khác quản lý, khai báo `external: true`; Compose sẽ không tự tạo nó và báo lỗi nếu volume chưa tồn tại.
+
+## Dọn dẹp an toàn
+
+Xem quan hệ trước khi xóa:
+
+```bash
+docker ps --all --filter volume=app-data
+docker volume inspect app-data
+docker system df -v
+```
+
+Xóa volume cụ thể:
+
+```bash
+docker volume rm app-data
+```
+
+`docker volume prune` xóa volume không được container tham chiếu theo điều kiện của Engine. “Unused” không có nghĩa là “không có dữ liệu kinh doanh”. Ưu tiên naming, labels, inventory và policy backup thay vì prune mù.
+
+## Cleanup bài thực hành
+
+```bash
+docker volume rm app-data nginx-html shared-logs
+```
+
+## Nguồn chính thức
+
+- [Docker volumes](https://docs.docker.com/engine/storage/volumes/)
+- [docker volume CLI](https://docs.docker.com/reference/cli/docker/volume/)
+- [Volumes trong Compose](https://docs.docker.com/reference/compose-file/volumes/)

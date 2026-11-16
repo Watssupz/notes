@@ -62,6 +62,14 @@ const interviewQues = defineDocs({
   },
   meta: { schema: metaSchema },
 });
+const dockerLearn = defineDocs({
+  dir: "content/docker-learn",
+  docs: {
+    schema: pageSchema,
+    postprocess: { includeProcessedMarkdown: true },
+  },
+  meta: { schema: metaSchema },
+});
 
 export const sources = {
   docs: loader({
@@ -97,6 +105,11 @@ export const sources = {
   "interview-question": loader({
     baseUrl: "/interview-question",
     source: interviewQues.toFumadocsSource(),
+    plugins: [lucideIconsPlugin()],
+  }),
+  "docker-learn": loader({
+    baseUrl: "/docker-learn",
+    source: dockerLearn.toFumadocsSource(),
     plugins: [lucideIconsPlugin()],
   }),
 };

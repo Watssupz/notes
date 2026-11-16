@@ -1,0 +1,363 @@
+---
+title: "Cài Docker Engine trên Linux"
+description: "Cài Docker Engine từ official APT hoặc DNF repository, xử lý package conflict, khởi động systemd service và xác minh installation theo từng layer."
+---
+
+Trang này cài **Docker Engine native** trên Linux bằng package repository chính thức của Docker. Quy trình tập trung vào Ubuntu/Debian và Fedora/CentOS Stream; distribution, release và architecture được Docker hỗ trợ thay đổi theo thời gian, vì vậy hãy đối chiếu support matrix chính thức ngay trước khi triển khai.
+
+Mục tiêu cuối cùng là có đủ Docker Engine, CLI, containerd, Buildx và Compose plugin; daemon chạy dưới `systemd`; một test container pull và exit thành công.
+
+## Chọn đúng installation source
+
+Một Linux distribution có thể cung cấp package như `docker.io`, còn Docker official repository cung cấp `docker-ce`, `docker-ce-cli` và `containerd.io`. Hai nguồn có maintainer, release cadence, dependency và support path khác nhau.
+
+| Phương thức | Khi phù hợp | Trade-off |
+|---|---|---|
+| Official APT/DNF repository | Host kết nối được package repository; cần update bằng package manager | Dễ nâng cấp và pin version; phải quản lý repository/key |
+| Tải `.deb`/`.rpm` thủ công | Air-gapped hoặc change process chuyển artifact nội bộ | Phải tải đủ dependency và tự quản lý mọi lần upgrade |
+| Convenience script | VM lab hoặc development host dùng một lần | Ít tùy biến, mặc định lấy stable mới nhất; không phù hợp production provisioning |
+| Distribution package | Chính sách tổ chức chỉ hỗ trợ package của distribution | Version/config có thể khác Docker official package; support thuộc distribution |
+
+Không dùng static binary như lựa chọn mặc định. Cách đó bỏ qua integration của package manager và yêu cầu bạn tự quản lý service, dependency, update và security patch.
+
+## Prerequisites và preflight
+
+Bạn cần quyền `sudo`, host Linux 64-bit thuộc release được hỗ trợ, network HTTPS tới Docker repository/registry và `systemd` cho command service trong bài.
+
+Thu inventory:
+
+```bash
+cat /etc/os-release
+uname -m
+uname -r
+df -h /
+df -i /
+```
+
+Đọc các field `ID`, `VERSION_ID`, `VERSION_CODENAME` trong `/etc/os-release`; không suy ra distribution chỉ từ giao diện hoặc tên cloud image. Với derivative như Linux Mint hay Kali, hướng dẫn upstream có thể cần codename của base Ubuntu/Debian tương ứng và không được Docker test chính thức.
+
+### Kiểm tra installation cũ trước khi thay đổi
+
+```bash
+command -v docker || true
+docker version 2>/dev/null || true
+systemctl status docker --no-pager 2>/dev/null || true
+```
+
+Trên Debian/Ubuntu, inventory package liên quan:
+
+```bash
+dpkg -l | grep -E 'docker|containerd|runc' || true
+```
+
+Trên Fedora/CentOS:
+
+```bash
+rpm -qa | grep -E 'docker|containerd|runc' || true
+```
+
+Nếu host đã có workload, dừng quy trình và đọc [Nâng cấp và gỡ cài đặt](/docs/cai-dat-va-moi-truong/upgrade-uninstall/). Gỡ package conflict không tự xóa `/var/lib/docker`, nhưng thay runtime package hoặc daemon version trên host đang chạy vẫn có thể gây downtime.
+
+<Callout type="warn" title="Firewall và published ports">
+  Docker tạo packet-filtering/NAT rules cho container networking. Trên host dùng `ufw`, `firewalld` hoặc policy riêng, đừng giả định port đã publish vẫn bị chặn bởi mọi rule cấp cao. Review Docker firewall guidance và `DOCKER-USER` chain trước production rollout.
+</Callout>
+
+## Cài trên Ubuntu
+
+Các command dưới đây dùng format `deb822` trong `/etc/apt/sources.list.d/docker.sources` như hướng dẫn Docker hiện hành.
+
+### 1. Loại package xung đột
+
+Docker liệt kê các package có thể xung đột gồm `docker.io`, Compose package của distribution, `podman-docker`, `containerd` và `runc`. Trên host mới, command có thể báo không có package nào cần remove.
+
+Xem selection trước:
+
+```bash
+dpkg --get-selections \
+  docker.io docker-compose docker-compose-v2 docker-doc \
+  podman-docker containerd runc 2>/dev/null || true
+```
+
+Sau khi xác nhận đây không phải production installation cần giữ, remove package được chọn:
+
+```bash
+sudo apt remove $(dpkg --get-selections \
+  docker.io docker-compose docker-compose-v2 docker-doc \
+  podman-docker containerd runc 2>/dev/null | cut -f1)
+```
+
+Nếu substitution trả rỗng, `apt` có thể báo thiếu argument; đó không phải lỗi host. Có thể bỏ qua bước remove khi inventory không có package conflict.
+
+### 2. Thêm GPG key và repository
+
+```bash
+sudo apt update
+sudo apt install ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+```
+
+Tạo source:
+
+```bash
+sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+
+sudo apt update
+```
+
+Xác minh package candidate đến từ Docker repository:
+
+```bash
+apt-cache policy docker-ce docker-ce-cli containerd.io
+```
+
+Đọc URL repository và candidate version; đừng chỉ thấy tên package rồi kết luận source đúng.
+
+### 3. Cài package
+
+Cài stable mới nhất đang có trong repository:
+
+```bash
+sudo apt install \
+  docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+```
+
+Production automation nên liệt kê version rồi pin giá trị đã test:
+
+```bash
+apt list --all-versions docker-ce
+```
+
+Sau đó thay `<VERSION_STRING>` bằng version đầy đủ từ output:
+
+```bash
+VERSION_STRING='<VERSION_STRING>'
+sudo apt install \
+  docker-ce="$VERSION_STRING" \
+  docker-ce-cli="$VERSION_STRING" \
+  containerd.io docker-buildx-plugin docker-compose-plugin
+```
+
+Không copy version minh họa từ tài liệu khác: repository metadata phụ thuộc OS codename, architecture và thời điểm.
+
+## Cài trên Debian
+
+Quy trình giống Ubuntu nhưng URL repository và codename thuộc Debian.
+
+```bash
+sudo apt update
+sudo apt install ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/debian/gpg \
+  -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+```
+
+```bash
+sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/debian
+Suites: $(. /etc/os-release && echo "$VERSION_CODENAME")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+
+sudo apt update
+sudo apt install \
+  docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+```
+
+Với Debian derivative hoặc testing, `$VERSION_CODENAME` có thể không tồn tại trong Docker repository. Chỉ thay bằng codename Debian base khi distribution documentation xác nhận mapping; không chọn ngẫu nhiên một codename để vượt lỗi `Release file`.
+
+## Cài trên Fedora
+
+Gỡ package Docker cũ chỉ sau khi inventory và backup:
+
+```bash
+sudo dnf remove \
+  docker docker-client docker-client-latest docker-common \
+  docker-latest docker-latest-logrotate docker-logrotate \
+  docker-selinux docker-engine-selinux docker-engine
+```
+
+Thêm repository bằng syntax DNF hiện hành:
+
+```bash
+sudo dnf config-manager addrepo \
+  --from-repofile https://download.docker.com/linux/fedora/docker-ce.repo
+```
+
+Cài package:
+
+```bash
+sudo dnf install \
+  docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+```
+
+Khi DNF hỏi chấp nhận key, đối chiếu fingerprint với trang cài Fedora chính thức tại thời điểm thực hiện. Không chấp nhận key mới chỉ vì prompt xuất hiện trong một quy trình tự động.
+
+## Cài trên CentOS Stream
+
+CentOS cần plugin quản lý repository:
+
+```bash
+sudo dnf -y install dnf-plugins-core
+sudo dnf config-manager --add-repo \
+  https://download.docker.com/linux/centos/docker-ce.repo
+```
+
+Sau đó:
+
+```bash
+sudo dnf install \
+  docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+```
+
+Với Fedora/CentOS, package được cài nhưng daemon có thể chưa start. Bật service ở bước tiếp theo.
+
+## Khởi động và xác minh service
+
+Trên host systemd:
+
+```bash
+sudo systemctl enable --now docker
+sudo systemctl status docker --no-pager
+sudo systemctl is-enabled docker
+sudo systemctl is-active docker
+```
+
+Hai command cuối cần trả `enabled` và `active` nếu policy là tự chạy khi boot. Ubuntu/Debian package có thể đã enable service; chạy lại `enable --now` là cách thể hiện rõ desired state.
+
+Kiểm tra cả client và server:
+
+```bash
+sudo docker version
+sudo docker info
+```
+
+`docker version` phải có phần Server. `docker info` cho biết storage driver/image store, cgroup, logging driver, security options và registry config thực tế.
+
+Kiểm tra plugin:
+
+```bash
+docker buildx version
+docker compose version
+```
+
+Các plugin là client-side nên thường không cần `sudo`; nếu `$HOME/.docker` từng được tạo bởi `sudo`, trang post-install sẽ sửa ownership.
+
+## Chạy smoke test
+
+```bash
+sudo docker run --rm hello-world
+```
+
+Command thực hiện bốn việc: CLI gọi daemon, daemon resolve/pull image qua registry, runtime tạo process, process in thông báo rồi exit. `--rm` xóa container sau khi kết thúc nhưng giữ image cache.
+
+Xác minh không còn test container running:
+
+```bash
+sudo docker container ls
+sudo docker image ls hello-world
+```
+
+Image còn lại là behavior bình thường. Nếu muốn xóa riêng image test:
+
+```bash
+sudo docker image rm hello-world
+```
+
+## Convenience script chỉ dành cho lab
+
+Nếu cần nhanh trên một VM disposable, tải script thành file và review/dry-run trước:
+
+```bash
+curl -fsSL https://get.docker.com -o get-docker.sh
+less get-docker.sh
+sudo sh ./get-docker.sh --dry-run
+```
+
+Chỉ sau khi hiểu package/repository script sẽ thay đổi mới chạy:
+
+```bash
+sudo sh ./get-docker.sh
+```
+
+Script yêu cầu root, ít tùy biến, mặc định cài stable mới nhất và không được thiết kế làm cơ chế upgrade installation hiện có. Với production, chuyển logic cần thiết thành provisioning code có version pin, checksum/repository policy và test.
+
+## Troubleshooting theo layer
+
+### APT/DNF không tìm thấy package
+
+Kiểm tra OS codename, architecture, source và repository metadata:
+
+```bash
+cat /etc/os-release
+uname -m
+```
+
+Debian-based:
+
+```bash
+cat /etc/apt/sources.list.d/docker.sources
+apt-cache policy docker-ce
+```
+
+RPM-based:
+
+```bash
+dnf repolist
+dnf list docker-ce --showduplicates
+```
+
+Lỗi `404` hoặc thiếu `Release` thường là codename/distribution chưa được repository hỗ trợ, không phải lý do để tắt signature verification.
+
+### Daemon không start
+
+Thu log trước khi sửa config hay reinstall:
+
+```bash
+sudo systemctl status docker --no-pager -l
+sudo journalctl -u docker --since '15 minutes ago' --no-pager
+sudo systemctl status containerd --no-pager -l
+```
+
+Các nhóm nguyên nhân thường gặp gồm `daemon.json` không hợp lệ, option trùng giữa systemd flags và JSON, storage/filesystem không hỗ trợ, iptables/firewall, cgroup hoặc containerd package conflict.
+
+### `permission denied` với Docker socket
+
+Installation vẫn có thể đúng; user hiện tại chưa có quyền socket. Tạm thời dùng `sudo` để hoàn tất verification, sau đó chọn có chủ đích giữa nhóm `docker` và [Rootless mode](/docs/cai-dat-va-moi-truong/rootless-mode/). Không chạy:
+
+```text
+chmod 666 /var/run/docker.sock
+```
+
+### Pull timeout hoặc lỗi certificate
+
+Nếu shell truy cập internet nhưng daemon không pull được, daemon có startup environment riêng. Cấu hình theo [Proxy và registry mirror](/docs/cai-dat-va-moi-truong/proxy-and-mirror/), bao gồm corporate CA nếu proxy thực hiện TLS inspection. Không dùng `insecure-registries` để che lỗi trust chain production.
+
+## Bước tiếp theo
+
+Chuyển sang [Thiết lập Linux sau cài đặt](/docs/cai-dat-va-moi-truong/linux-post-install/) để chọn access model, cấu hình startup/log rotation và tạo baseline. Sau đó chạy checklist đầy đủ tại [Xác minh môi trường](/docs/cai-dat-va-moi-truong/verify-environment/).
+
+## Nguồn chính thức để đối chiếu
+
+- [Install Docker Engine](https://docs.docker.com/engine/install/)
+- [Install Docker Engine on Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
+- [Install Docker Engine on Debian](https://docs.docker.com/engine/install/debian/)
+- [Install Docker Engine on Fedora](https://docs.docker.com/engine/install/fedora/)
+- [Install Docker Engine on CentOS](https://docs.docker.com/engine/install/centos/)

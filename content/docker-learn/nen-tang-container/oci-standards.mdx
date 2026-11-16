@@ -1,0 +1,354 @@
+---
+title: "OCI standards"
+description: "Cách OCI Image, Runtime và Distribution Specifications chuẩn hóa manifest, layers, runtime bundle, lifecycle và registry API mà không đồng nhất mọi container platform."
+---
+
+Open Container Initiative (OCI) duy trì các open specifications để container tools có common contracts. Nhờ đó, một image không nhất thiết bị khóa vào đúng CLI đã build nó, registry có thể phục vụ nhiều client và runtime có thể nhận một bundle theo format chung.
+
+OCI không phải container engine hoặc orchestrator. Specification mô tả **đường biên interoperability**; implementation vẫn phải tải content, unpack filesystem, tạo namespaces/cgroups, cấu hình network và quản lý workload.
+
+## Ba specification chính
+
+| Specification | Object/contract chính | Câu hỏi trả lời |
+|---|---|---|
+| Image Specification | Descriptor, manifest, image index, config, layers, image layout | Image content được mô tả và kiểm tra thế nào? |
+| Runtime Specification | Filesystem bundle, `config.json`, lifecycle operations/state | Runtime tạo và quản lý container từ bundle thế nào? |
+| Distribution Specification | Registry HTTP API cho manifests/blobs/tags/referrers | Client push, pull và discover content thế nào? |
+
+Luồng end-to-end:
+
+```text
+Build system
+    │ tạo OCI-compatible image content
+    ▼
+Registry (Distribution API)
+    │ manifest/index + config + layer blobs
+    ▼
+Engine / image manager
+    │ verify digest, select platform, unpack layers
+    ▼
+OCI runtime bundle
+    │ root filesystem + config.json
+    ▼
+OCI runtime
+    │ create → start → kill/delete
+    ▼
+Container process
+```
+
+Ba spec nối nhau nhưng không bắt buộc một tool expose toàn bộ object trực tiếp cho người dùng.
+
+## Content descriptor: viên gạch liên kết
+
+OCI descriptor tham chiếu content bằng các thuộc tính như:
+
+- `mediaType`: loại object/content;
+- `digest`: content identifier, thường dùng `sha256`;
+- `size`: kích thước byte;
+- optional annotations/platform/artifact metadata theo vị trí/schema.
+
+Khái niệm:
+
+```json
+{
+  "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+  "digest": "sha256:<hex>",
+  "size": 1234567
+}
+```
+
+Đây là ví dụ rút gọn, không phải descriptor lấy từ một image cụ thể. Client tải blob rồi kiểm tra bytes có khớp digest và size. Content addressing hỗ trợ integrity và de-duplication, nhưng **digest match không chứng minh publisher đáng tin**. Trust cần signature/attestation, identity, provenance và policy ngoài việc hash đúng.
+
+## OCI Image Specification
+
+### Image manifest
+
+Image manifest là JSON document tham chiếu:
+
+- một config descriptor;
+- ordered list layer descriptors;
+- media type/schema version và optional metadata.
+
+Cấu trúc tối giản minh họa:
+
+```json
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": {
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "digest": "sha256:<config>",
+    "size": 1000
+  },
+  "layers": [
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:<layer>",
+      "size": 2000
+    }
+  ]
+}
+```
+
+Manifest chỉ tham chiếu content; layer/config blobs được fetch riêng qua digest.
+
+### Image configuration
+
+Image config chứa metadata để chuyển image thành runtime environment, gồm:
+
+- architecture và OS;
+- root filesystem DiffIDs theo thứ tự;
+- command/entrypoint, environment, working directory, user;
+- history và một số runtime defaults.
+
+Runtime/platform vẫn có thể override config. Ví dụ `docker run IMAGE COMMAND` thay command, `--env` thêm/ghi đè environment, `--user` thay user. Image config là default contract, không phải deployment policy hoàn chỉnh.
+
+### Filesystem layers
+
+Layer là changeset tar. Whiteout biểu diễn deletion khi apply changeset. Layer order có ý nghĩa; cùng tập blob theo thứ tự khác có thể tạo filesystem khác.
+
+Image spec chuẩn hóa format, không bắt runtime giữ tar đã unpack theo một disk layout cụ thể. Snapshotter có thể dùng OverlayFS, native copies hoặc backend khác.
+
+### Image index và multi-platform image
+
+Image index tham chiếu nhiều manifests, thường kèm platform:
+
+```text
+example/app:1.0  (tag)
+       │
+       ▼
+OCI image index
+├── linux/amd64  → manifest A
+├── linux/arm64  → manifest B
+└── windows/amd64 → manifest C (nếu publisher cung cấp)
+```
+
+Client chọn manifest phù hợp OS/architecture/variant. Cùng tag không có nghĩa mọi platform dùng cùng layer hay binary.
+
+<Callout type="warn" title="Quan trọng">
+  Multi-platform index chỉ công bố variants. Nó không biến một Linux binary thành Windows binary và không bảo đảm behavior application giống nhau giữa architectures.
+</Callout>
+
+## OCI Runtime Specification
+
+### Filesystem bundle
+
+OCI runtime nhận bundle gồm tối thiểu:
+
+```text
+bundle/
+├── config.json
+└── rootfs/       # path/root filesystem theo config
+```
+
+`config.json` mô tả process, root filesystem, mounts, hostname và platform-specific settings như Linux namespaces, UID/GID mappings, cgroups path, capabilities, seccomp, devices và resource limits.
+
+Engine thường tạo bundle/config nội bộ. Người dùng Docker không cần tự viết `config.json` để chạy container bình thường.
+
+### Lifecycle
+
+Runtime Specification định nghĩa operations và state để implementation đồng thuận. Mental model đơn giản:
+
+```text
+create
+  │ chuẩn bị container, chưa chạy user process hoàn chỉnh
+  ▼
+created
+  │ start
+  ▼
+running
+  │ process exit hoặc kill
+  ▼
+stopped
+  │ delete
+  ▼
+removed khỏi runtime
+```
+
+OCI runtime có thể expose commands như `create`, `start`, `state`, `kill`, `delete`; high-level engine bọc các operation thành Docker API/CLI. Docker container state còn có product-level metadata/restart/health behavior ngoài state machine tối thiểu của OCI runtime.
+
+### Hooks
+
+Runtime spec định nghĩa lifecycle hooks ở các điểm nhất định. Hooks chạy với privilege/context nhạy cảm và có thể làm container startup phụ thuộc host scripts. Chúng hữu ích cho device/network/integration chuyên biệt nhưng cần timeout, idempotency, logging và security review.
+
+## OCI Distribution Specification
+
+Distribution Spec chuẩn hóa registry API cho content. Các object chính:
+
+- **registry:** service cung cấp API;
+- **repository:** scope chứa manifests, blobs và tags;
+- **blob:** binary content addressable bằng digest;
+- **manifest:** JSON document tham chiếu blobs/manifests;
+- **tag:** pointer dễ đọc tới manifest;
+- **referrer/subject relationship:** nối artifact như signature, SBOM hoặc attestation với subject content theo supported API/workflow.
+
+Pull thường gồm:
+
+1. resolve tag/digest thành manifest hoặc index;
+2. chọn platform manifest nếu cần;
+3. fetch config và missing layer blobs;
+4. verify digest;
+5. unpack/apply layers.
+
+Push thường upload missing blobs trước, manifest sau. Registry có thể de-duplicate blob cùng digest và hỗ trợ resumable/chunked transfer theo specification category/implementation.
+
+Authentication, authorization policy, retention, replication, garbage collection, availability và UI không được đồng nhất chỉ vì registry hỗ trợ OCI API. Hai OCI-compatible registries vẫn có operational behavior khác nhau.
+
+## Tag, digest và identity
+
+Tag là human-readable pointer có thể thay đổi:
+
+```text
+registry.example.com/team/app:1.4
+```
+
+Digest tham chiếu manifest content cụ thể:
+
+```text
+registry.example.com/team/app@sha256:<manifest-digest>
+```
+
+Deploy theo digest giúp chọn đúng manifest bytes nhưng không tự trả lời:
+
+- ai build/push content;
+- source commit nào;
+- dependency có vulnerability không;
+- signature có hợp lệ theo identity/policy không;
+- runtime configuration có an toàn không.
+
+Một release workflow tốt gắn digest với provenance, SBOM, signature/attestation và approval policy.
+
+## Docker và OCI media types
+
+Ecosystem còn có Docker media types/schema tương thích rộng. Registry/client hiện đại thường hỗ trợ cả Docker v2 schema 2 và OCI image media types. “Docker image” trong giao tiếp hằng ngày có thể là OCI-compatible artifact nhưng media type cụ thể cần được inspect, không suy từ file name hay CLI.
+
+Interoperability là thực tế có điều kiện:
+
+- client phải hiểu media type/compression;
+- registry phải lưu và trả content đúng;
+- runtime phải hỗ trợ target OS/architecture/features;
+- image config phải hợp lệ;
+- external deployment configuration vẫn phải được cung cấp.
+
+## Lab: quan sát multi-platform index
+
+Cần Docker Buildx plugin và network tới registry:
+
+```bash
+docker buildx imagetools inspect alpine:3.20
+```
+
+Output thường hiển thị top-level media type/digest và danh sách platform manifests. Hãy tìm:
+
+- digest của index/manifest list;
+- từng platform như `linux/amd64`, `linux/arm64`;
+- media type;
+- annotations nếu publisher cung cấp.
+
+Để lấy raw representation theo plugin version hỗ trợ:
+
+```bash
+docker buildx imagetools inspect --raw alpine:3.20
+```
+
+Output là JSON từ registry, có thể là image index hoặc manifest tùy reference/resolution. Không hard-code digest từ tài liệu vì tag có thể di chuyển.
+
+Sau khi pull một platform image:
+
+```bash
+docker pull alpine:3.20
+docker image inspect alpine:3.20 --format \
+  'Id={{.Id}} RepoDigests={{json .RepoDigests}} Os={{.Os}} Arch={{.Architecture}}'
+```
+
+`RepoDigests` cho biết repo digest mà local image gắn với theo Engine metadata. Image ID/config digest và manifest digest không nên bị coi là cùng identifier trong mọi context.
+
+## Lab nâng cao: nhìn OCI layout bằng BuildKit output
+
+BuildKit có thể export OCI image layout. Tạo Dockerfile:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM alpine:3.20
+RUN printf 'hello\n' >/message.txt
+CMD ["cat", "/message.txt"]
+```
+
+Export tar OCI layout:
+
+```bash
+docker buildx build --output type=oci,dest=app-oci.tar .
+tar -tf app-oci.tar | sort | head -30
+```
+
+Bạn sẽ thấy các thành phần như:
+
+```text
+blobs/sha256/...
+index.json
+oci-layout
+```
+
+Đây là OCI image layout, không phải OCI runtime bundle. Để inspect an toàn:
+
+```bash
+mkdir app-oci-layout
+tar -xf app-oci.tar -C app-oci-layout
+cat app-oci-layout/oci-layout
+cat app-oci-layout/index.json
+```
+
+Không đọc blob bằng filename rồi đoán type; đi từ descriptor trong `index.json` đến manifest, config và layers theo media type/digest.
+
+Dọn lab:
+
+```bash
+rm -rf app-oci.tar app-oci-layout Dockerfile
+```
+
+Chỉ xóa `Dockerfile` nếu bạn tạo nó trong directory lab riêng.
+
+## OCI bảo đảm và không bảo đảm gì?
+
+| OCI giúp chuẩn hóa | OCI không tự bảo đảm |
+|---|---|
+| Cấu trúc image content và descriptors | Image không có malware/vulnerability |
+| Runtime bundle/config/lifecycle contract | Mọi runtime có isolation strength giống nhau |
+| Registry protocol cho manifests/blobs | Registry HA, retention, auth policy giống nhau |
+| Platform metadata để chọn manifest | Binary chạy đúng trên mọi kernel/CPU feature |
+| Digest verification của content | Publisher identity và provenance đáng tin |
+
+Conformance với spec là điều kiện interoperability, không phải chứng nhận security/production readiness.
+
+## Compatibility checklist
+
+Khi image pull được nhưng không chạy, kiểm tra theo thứ tự:
+
+1. Reference resolve tới tag/digest nào?
+2. Top-level object là index hay manifest; media type gì?
+3. Có manifest cho node OS/architecture/variant không?
+4. Config command/user/environment có hợp lệ không?
+5. Layer compression/media type được runtime hỗ trợ không?
+6. Binary ABI, dynamic loader và CPU instruction requirements có phù hợp không?
+7. Runtime config cần kernel feature, device, mount hoặc syscall nào?
+8. Error đến từ distribution, unpack/snapshot hay process start?
+
+Thông báo `exec format error` thường gợi ý binary/architecture hoặc executable format, nhưng vẫn cần inspect platform và command thực tế.
+
+## Tự kiểm tra
+
+1. Image manifest, config và layer blobs liên kết bằng gì?
+2. Image index giải quyết bài toán multi-platform thế nào?
+3. OCI image layout khác runtime bundle ở đâu?
+4. Vì sao digest verification không chứng minh publisher identity?
+5. OCI Distribution Spec không thay thế các quyết định vận hành registry nào?
+
+Tiếp theo, [Container runtime](/docs/nen-tang-container/container-runtime/) đặt các contracts OCI vào stack Docker thực tế từ daemon đến process.
+
+## Nguồn đối chiếu
+
+- [OCI overview](https://opencontainers.org/about/overview/)
+- [OCI Image Specification](https://github.com/opencontainers/image-spec)
+- [OCI Runtime Specification](https://github.com/opencontainers/runtime-spec)
+- [OCI Distribution Specification](https://github.com/opencontainers/distribution-spec)
+- [Multi-platform images — Docker Docs](https://docs.docker.com/build/building/multi-platform/)

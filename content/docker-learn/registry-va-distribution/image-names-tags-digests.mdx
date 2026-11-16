@@ -1,0 +1,211 @@
+---
+title: "Image name, tag và digest"
+description: "Phân tích đầy đủ image reference, tag mutable, manifest digest, image ID và multi-platform index để pull, promote và deploy chính xác."
+---
+
+Image reference trả lời hai câu hỏi: tìm artifact ở repository nào và chọn version nào. Con người thường chọn bằng tag; hệ thống cần tính bất biến thường chọn bằng digest.
+
+```text
+[HOST[:PORT]/]NAMESPACE/REPOSITORY[:TAG][@DIGEST]
+```
+
+## Phân tích reference
+
+```text
+registry.example.com:5443/platform/payments/api:1.4.2
+```
+
+| Phần | Giá trị | Ý nghĩa |
+|---|---|---|
+| Host | `registry.example.com` | Registry endpoint |
+| Port | `5443` | Port tùy chọn |
+| Namespace | `platform/payments` | Phân vùng repository; có thể nhiều segment tùy registry |
+| Repository | `api` | Tên artifact logic |
+| Tag | `1.4.2` | Con trỏ dễ đọc |
+
+Các dạng rút gọn:
+
+| Input | Resolution thường gặp |
+|---|---|
+| `alpine` | `docker.io/library/alpine:latest` |
+| `team/api:dev` | `docker.io/team/api:dev` |
+| `localhost:5000/api:dev` | Registry local ở port `5000` |
+
+Trong automation, luôn ghi full registry/namespace để tránh push nhầm Docker Hub hoặc pull nhầm repository cùng tên.
+
+## Tag là con trỏ mutable
+
+```text
+api:stable ──> sha256:AAA
+```
+
+Publisher có thể push lại:
+
+```text
+api:stable ──> sha256:BBB
+```
+
+Client pull `api:stable` ở hai thời điểm có thể nhận content khác nhau. Tag version như `1.4.2` cũng mutable về mặt giao thức trừ khi registry áp policy immutable; tính “bất biến” thường là quy ước cần được enforce.
+
+`latest` không có logic đặc biệt ngoài việc là tag mặc định khi bỏ `:TAG`. Docker không so creation time để tìm image mới nhất.
+
+Chiến lược tag thường dùng:
+
+| Loại tag | Ví dụ | Policy |
+|---|---|---|
+| Exact release | `1.4.2` | Không overwrite |
+| Build/revision | `sha-a1b2c3d` | Unique, trace được source |
+| Moving channel | `stable`, `1.4` | Chỉ update sau gate |
+| Environment | `staging` | Cẩn thận vì che mất lịch sử nếu không lưu digest |
+
+## Digest là định danh content-addressed
+
+Digest có dạng:
+
+```text
+sha256:<64_HEX_CHARACTERS>
+```
+
+Reference bằng digest:
+
+```text
+registry.example.com/platform/api@sha256:<DIGEST>
+```
+
+Registry trả content; client tính hash và kiểm tra digest. Nếu bytes thay đổi, digest đổi. Digest giúp:
+
+- pin đúng artifact;
+- phát hiện corruption/tampering trong quá trình phân phối;
+- deduplicate blob;
+- audit và rollback chính xác.
+
+Digest không xác nhận publisher, approval, vulnerability state hoặc source repository. Cần signature/provenance/policy cho các câu hỏi đó.
+
+## Có nhiều loại digest
+
+Một output multi-platform có thể có nhiều digest:
+
+```text
+index digest sha256:INDEX
+  ├── linux/amd64 manifest sha256:AMD64
+  │     ├── config digest
+  │     └── layer digests
+  └── linux/arm64 manifest sha256:ARM64
+        ├── config digest
+        └── layer digests
+```
+
+- **Index digest**: pin cả tập platform và để runtime chọn platform.
+- **Manifest digest**: pin image của một platform cụ thể.
+- **Config digest/image ID**: định danh config object; local CLI thường hiển thị dưới dạng image ID.
+- **Layer digest**: định danh từng filesystem blob.
+
+Đừng copy một chuỗi `sha256` từ output mà không biết nó thuộc object nào.
+
+## Tag và digest cùng lúc
+
+Dockerfile có thể dùng cả hai:
+
+```dockerfile
+FROM alpine:3.23@sha256:<APPROVED_DIGEST>
+```
+
+Tag cho reviewer biết release line; digest quyết định content. Nếu tag sau đó trỏ digest khác, build vẫn yêu cầu digest đã pin. Automation update dependency phải thay digest và chạy lại test/scan.
+
+Runtime production thường dùng:
+
+```text
+registry.example.com/platform/api@sha256:<APPROVED_INDEX_DIGEST>
+```
+
+Có thể lưu tag `1.4.2` trong release metadata để con người đọc, nhưng effective deployment phải kiểm tra digest thực tế.
+
+## Inspect đúng nơi
+
+Inspect remote index/manifest:
+
+```bash
+docker buildx imagetools inspect \
+  registry.example.com/platform/api:1.4.2
+```
+
+Pull và xem repo digest local:
+
+```bash
+docker pull registry.example.com/platform/api:1.4.2
+
+docker image inspect registry.example.com/platform/api:1.4.2 \
+  --format '{{json .RepoDigests}}'
+```
+
+Xem local image ID:
+
+```bash
+docker image inspect registry.example.com/platform/api:1.4.2 \
+  --format '{{.Id}}'
+```
+
+Local image ID không thay thế remote index digest. Đặc biệt với multi-platform image, local Engine thường chỉ pull manifest phù hợp host.
+
+## Promotion không rebuild
+
+Build một lần:
+
+```bash
+IMAGE='registry.example.com/platform/api'
+VERSION='1.4.2'
+
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --tag "$IMAGE:$VERSION" \
+  --push .
+```
+
+Sau khi lấy `$DIGEST` và approval, tạo moving tag từ chính artifact:
+
+```bash
+docker buildx imagetools create \
+  --tag "$IMAGE:stable" \
+  "$IMAGE@$DIGEST"
+```
+
+Lệnh này thao tác manifest reference thay vì rebuild source. Kiểm tra compatibility của registry/tool version và inspect `stable` sau promotion.
+
+## Race condition với tag
+
+Workflow không an toàn:
+
+1. scanner kiểm tra `api:stable`;
+2. actor khác update `api:stable`;
+3. deployment pull `api:stable`.
+
+Artifact được deploy có thể khác artifact đã scan. Workflow an toàn resolve tag một lần, ghi digest, scan/approve/deploy cùng digest. Registry tag immutability giảm rủi ro overwrite nhưng không thay audit trail.
+
+## Chọn reference theo môi trường
+
+| Môi trường | Reference đề xuất | Lý do |
+|---|---|---|
+| Local thử nhanh | Tag rõ version/variant | Dễ dùng |
+| CI build output | Unique build/revision tag + digest | Traceability |
+| Staging approval | Digest của artifact vừa build | Không race theo tag |
+| Production | Approved digest | Reproducible và rollback chính xác |
+| Base image Dockerfile | Tag + digest, có update bot/process | Vừa đọc được vừa pin content |
+
+## Anti-pattern
+
+- Nghĩ `latest` luôn mới nhất.
+- Overwrite exact version tag để sửa nóng.
+- Dùng cùng tag cho cache BuildKit và runnable image.
+- So local image ID với remote index digest như cùng object.
+- Pin digest rồi không bao giờ cập nhật security fix.
+- Rebuild riêng cho staging và production dưới cùng version.
+- Xóa digest cũ trước khi hết rollback window.
+
+Phần [Tag và version image](/docs/images-va-dockerfile/image-tagging/) giải thích chiến lược release từ góc nhìn build; trang này tập trung vào resolution tại registry.
+
+## Nguồn chính thức
+
+- [`docker image tag`](https://docs.docker.com/reference/cli/docker/image/tag/)
+- [`docker image pull`](https://docs.docker.com/reference/cli/docker/image/pull/)
+- [`docker buildx imagetools inspect`](https://docs.docker.com/reference/cli/docker/buildx/imagetools/inspect/)
+- [OCI Image Specification](https://github.com/opencontainers/image-spec)

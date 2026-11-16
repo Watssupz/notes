@@ -1,0 +1,264 @@
+---
+title: "Docker Buildx"
+description: "Sử dụng Docker Buildx để chọn builder, kiểm tra Dockerfile, điều khiển cache, platform và xuất image hoặc artifact đúng nơi."
+---
+
+Docker Buildx là CLI mở rộng cho Docker Build, dùng BuildKit làm backend. `docker buildx build` có cú pháp gần `docker build`, nhưng bổ sung workflow quản lý nhiều builder, multi-platform, external cache, nhiều loại output, attestation và Bake.
+
+Buildx không tự build image. Nó chuẩn bị request, gửi build definition/context tới builder đã chọn và nhận metadata/output từ BuildKit.
+
+## Mental model: client, builder và output
+
+```text
+Docker CLI + Buildx
+       |
+       | build request
+       v
+selected builder (một hoặc nhiều node BuildKit)
+       |
+       +--> local image store   (--load)
+       +--> registry            (--push)
+       +--> local artifact      (--output type=local)
+       +--> OCI/Docker archive  (--output type=oci|docker)
+       +--> cache only
+```
+
+Ba câu hỏi cần trả lời cho mọi command:
+
+1. Build đang chạy trên **builder nào**?
+2. Build nhắm **platform nào**?
+3. Kết quả được **export đi đâu**?
+
+Nếu không trả lời được câu 3, lỗi “build thành công nhưng không thấy image” rất dễ xảy ra.
+
+## Kiểm tra Buildx và builder
+
+```bash
+docker buildx version
+docker buildx ls
+docker buildx inspect --bootstrap
+```
+
+Các command quản lý chính:
+
+| Command | Mục đích |
+|---|---|
+| `docker buildx ls` | Liệt kê builder, node, trạng thái và platform |
+| `docker buildx create` | Tạo custom builder |
+| `docker buildx use NAME` | Chọn builder cho Buildx |
+| `docker buildx inspect --bootstrap` | Khởi động/kiểm tra builder hiện tại |
+| `docker buildx du` | Xem disk usage của cache |
+| `docker buildx prune` | Xóa cache theo policy/filter |
+| `docker buildx history ls` | Xem build record nếu builder/version hỗ trợ |
+| `docker buildx imagetools inspect IMAGE` | Kiểm tra manifest/index trên registry |
+
+Có thể chọn builder cho một command mà không đổi global selection:
+
+```bash
+docker buildx build --builder ci-builder .
+```
+
+Hoặc dùng biến môi trường:
+
+```bash
+BUILDX_BUILDER=ci-builder docker buildx build .
+```
+
+`docker buildx use` ảnh hưởng selected builder của Buildx. `docker build` vẫn ưu tiên default builder để tương thích, trừ khi truyền `--builder` hoặc `BUILDX_BUILDER`. Với custom builder, dùng `docker buildx build` giúp intent rõ hơn.
+
+## Build local đúng cách
+
+Với builder dùng `docker` driver, image đơn platform thường được nạp vào local image store mặc định. Với `docker-container`, `kubernetes` hoặc `remote`, hãy chỉ định output:
+
+```bash
+# Build và nạp image đơn platform để docker run local
+docker buildx build --load --tag app:dev .
+
+# Build rồi push thẳng tới registry
+docker buildx build --push --tag registry.example.com/team/app:1.4.0 .
+
+# Xuất artifact từ final stage ra thư mục
+docker buildx build --output type=local,dest=./out .
+```
+
+`--load` là shorthand cho `--output=type=docker` và phù hợp image đơn platform. Multi-platform image thường được `--push` tới registry hỗ trợ OCI index/manifest list.
+
+<Callout type="warn" title="Quan trọng">
+  Tag không phải output. `--tag app:dev` chỉ đặt tên; với custom driver, vẫn cần `--load`, `--push` hoặc `--output`.
+</Callout>
+
+## Nhóm option quan trọng
+
+| Nhóm | Option thường dùng | Câu hỏi cần trả lời |
+|---|---|---|
+| Input | `-f`, context cuối command, `--build-context` | Builder đọc nguồn nào? |
+| Target | `--target`, `--platform` | Build stage/platform nào? |
+| Parameter | `--build-arg`, `--label`, `--annotation` | Metadata và input không nhạy cảm nào thay đổi? |
+| Credential | `--secret`, `--ssh` | Credential được mount tạm thời ra sao? |
+| Cache | `--cache-from`, `--cache-to`, `--no-cache-filter` | Cache import/export ở đâu? |
+| Output | `--load`, `--push`, `--output` | Kết quả cuối đi đâu? |
+| Quan sát | `--progress=plain`, `--metadata-file` | Chẩn đoán và lưu digest thế nào? |
+| Supply chain | `--sbom`, `--provenance`, `--attest` | Metadata nào gắn với image? |
+
+Không dùng `--build-arg` để truyền secret. Giá trị build arg có thể xuất hiện trong metadata/provenance hoặc log; dùng [Secret và SSH mounts](/docs/buildkit/secret-and-ssh-mounts/).
+
+## Kiểm tra Dockerfile mà chưa build
+
+Dockerfile frontend hỗ trợ các subrequest hữu ích:
+
+```bash
+# Chạy build checks, không thực thi build
+docker buildx build --check .
+
+# Liệt kê stage/target
+docker buildx build --call=targets .
+
+# Liệt kê ARG mà target dùng
+docker buildx build --call=outline --target runtime .
+```
+
+Comment đứng ngay trước `FROM` hoặc `ARG` có thể trở thành description:
+
+```dockerfile
+# GO_VERSION chọn phiên bản Go cho toolchain
+ARG GO_VERSION=1.25
+
+# runtime tạo image được deploy
+FROM alpine:3.23 AS runtime
+```
+
+Đưa `--check` vào CI như lint gate. Nó phát hiện một số lỗi cấu hình/platform nhưng không thay unit test, vulnerability scan hoặc việc chạy image.
+
+## Named build contexts
+
+Một build có thể nhận nhiều nguồn mà không mở rộng default context:
+
+```bash
+docker buildx build \
+  --build-context assets=./generated-assets \
+  --build-context base=docker-image://alpine:3.23 \
+  --load -t app:dev .
+```
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM base
+COPY --from=assets . /usr/share/app/assets/
+```
+
+Named context có thể là local directory, Git URL, HTTP URL, container image hoặc OCI layout tùy option. Remote source cần được pin/review theo threat model; tên context có thể override stage/source cùng tên.
+
+## Chọn output theo use case
+
+### Image local để test
+
+```bash
+docker buildx build \
+  --platform linux/amd64 \
+  --load \
+  --tag app:test .
+docker run --rm app:test
+```
+
+### Multi-platform release
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --tag registry.example.com/team/app:1.4.0 \
+  --tag registry.example.com/team/app:stable \
+  --provenance=mode=max \
+  --sbom=true \
+  --push .
+```
+
+Xác minh registry thay vì chỉ nhìn local store:
+
+```bash
+docker buildx imagetools inspect registry.example.com/team/app:1.4.0
+```
+
+### Binary artifact
+
+Final stage dùng `scratch` để chứa file cần export:
+
+```dockerfile
+FROM golang:1.25 AS build
+WORKDIR /src
+COPY . .
+ARG TARGETOS TARGETARCH
+RUN GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -o /out/server ./cmd/server
+
+FROM scratch AS artifact
+COPY --from=build /out/server /
+```
+
+```bash
+docker buildx build \
+  --target artifact \
+  --output type=local,dest=./dist .
+```
+
+File local output thuộc kết quả filesystem của target, không phải filesystem đầy đủ của container đang chạy.
+
+## Cache có chủ đích
+
+```bash
+docker buildx build \
+  --cache-from type=registry,ref=registry.example.com/team/app:buildcache-main \
+  --cache-to type=registry,ref=registry.example.com/team/app:buildcache-main,mode=max \
+  --push -t registry.example.com/team/app:1.4.0 .
+```
+
+Khi cần rebuild một stage cụ thể nhưng vẫn dùng cache phần khác:
+
+```bash
+docker buildx build --no-cache-filter deps --load -t app:dev .
+```
+
+`--no-cache` không tự kéo base image mới. Thêm `--pull` nếu mục tiêu là resolve lại image tag:
+
+```bash
+docker buildx build --pull --no-cache --load -t app:dev .
+```
+
+## Lưu digest và metadata cho pipeline
+
+```bash
+mkdir -p .build
+
+docker buildx build \
+  --push \
+  --tag registry.example.com/team/app:1.4.0 \
+  --metadata-file .build/metadata.json .
+
+jq -r '."containerimage.digest"' .build/metadata.json
+```
+
+Pipeline nên truyền digest sang bước deploy thay vì đoán digest từ tag mutable. Không log toàn bộ metadata nếu policy coi source URL, build args hoặc VCS details là nhạy cảm.
+
+## Debug output
+
+```bash
+docker buildx build --progress=plain --load -t app:debug .
+```
+
+`plain` giúp thấy output thật của từng `RUN`, step đầu tiên cache miss và lỗi network/package manager. Với automation cần parse event, có thể dùng `--progress=rawjson`; không parse giao diện TTY.
+
+## Best practices
+
+- Pin Dockerfile syntax (`# syntax=docker/dockerfile:1`) và version Docker/Buildx trong CI image.
+- Ghi rõ builder, platform, output và cache cho release workflow.
+- Dùng `--check` trước build nặng.
+- Dùng `--metadata-file` và deploy theo digest.
+- Không thêm `--allow security.insecure` hoặc `network.host` nếu chưa có threat review.
+- Dùng `--load` cho local single-platform; dùng `--push` cho multi-platform release.
+- Kiểm tra output trên đúng hệ thống đích: local store, registry hoặc filesystem.
+- Dùng Bake khi command có quá nhiều target/options lặp lại.
+
+## Nguồn chính thức
+
+- [`docker buildx`](https://docs.docker.com/reference/cli/docker/buildx/)
+- [`docker buildx build`](https://docs.docker.com/reference/cli/docker/buildx/build/)
+- [Builders](https://docs.docker.com/build/builders/)
+- [Exporters](https://docs.docker.com/build/exporters/)

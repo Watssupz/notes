@@ -1,0 +1,213 @@
+---
+title: "Mount syntax"
+description: "Đọc và viết chính xác `--mount`, `-v`, `--tmpfs` và Compose long syntax; tránh nhầm source, target, option và path resolution."
+---
+
+Docker cung cấp nhiều cú pháp mount vì lịch sử và phạm vi feature khác nhau. Chúng có thể cho cùng kết quả ở case đơn giản, nhưng không parse và fail giống nhau.
+
+<Callout type="info" title="Khuyến nghị">
+  Dùng `--mount` trong CLI và long syntax trong Compose cho automation: intent rõ, option có tên và lỗi source bind mount bị thiếu được phát hiện sớm hơn.
+</Callout>
+
+## Mental model chung
+
+Mọi mount trả lời bốn câu hỏi:
+
+```text
+type        volume | bind | tmpfs
+source      volume name | host path | không có
+ destination path tuyệt đối trong container
+options     readonly, size, subpath, propagation, driver options...
+```
+
+Trong output `docker inspect`, destination thường xuất hiện là `Destination`; trong CLI, `destination`, `dst` và `target` là alias.
+
+## `--mount`: key-value rõ ràng
+
+```bash
+docker run --mount type=TYPE,src=SOURCE,dst=TARGET,OPTION IMAGE
+```
+
+Không chèn khoảng trắng sau dấu phẩy. Thứ tự key không quan trọng.
+
+### Volume
+
+```bash
+docker run --rm \
+  --mount type=volume,src=syntax-data,dst=/data,readonly \
+  alpine:3.22 ls /data
+```
+
+Nếu named volume chưa tồn tại, Docker tạo nó. Bỏ `src` để tạo anonymous volume.
+
+Option quan trọng:
+
+- `readonly` hoặc `ro`;
+- `volume-nocopy`;
+- `volume-subpath=logs` — subdirectory phải tồn tại;
+- `volume-driver=DRIVER`;
+- lặp `volume-opt=KEY=VALUE` cho driver option.
+
+### Bind
+
+```bash
+docker run --rm \
+  --mount type=bind,src="$(pwd)",dst=/workspace,readonly \
+  alpine:3.22 ls /workspace
+```
+
+Source bind mặc định phải tồn tại. `bind-create-src` cho phép tạo directory một cách explicit. Các option nâng cao gồm `bind-propagation` và `bind-recursive`.
+
+### tmpfs
+
+```bash
+docker run --rm \
+  --mount type=tmpfs,dst=/scratch,tmpfs-size=16777216,tmpfs-mode=0700 \
+  alpine:3.22 df -h /scratch
+```
+
+Tmpfs không có source.
+
+## `-v` hoặc `--volume`: positional fields
+
+```text
+-v SOURCE:TARGET:OPTIONS
+```
+
+Ý nghĩa `SOURCE` phụ thuộc giá trị:
+
+- `app-data` → named volume;
+- `/srv/app` hoặc path-like value → bind mount;
+- bỏ trống source, ví dụ `-v /data` → anonymous volume.
+
+Ví dụ:
+
+```bash
+docker run --rm -v app-data:/data:ro alpine:3.22 ls /data
+docker run --rm -v "$(pwd)":/workspace:ro alpine:3.22 ls /workspace
+```
+
+`-v` ngắn nhưng dễ nhầm colon trong Windows path hoặc driver option. Với bind source không tồn tại, nó tự tạo directory; typo file config có thể trở thành directory và làm application báo lỗi khó hiểu.
+
+`z` và `Z` cho SELinux bind relabel hiện thuộc cú pháp `-v`, không phải `--mount`.
+
+## `--tmpfs`: option kiểu Linux mount
+
+```bash
+docker run --rm \
+  --tmpfs /scratch:rw,noexec,nosuid,nodev,size=16m,mode=0700 \
+  alpine:3.22 mount
+```
+
+`--tmpfs` hỗ trợ nhiều option hơn `--mount type=tmpfs`, nhưng không dùng được cho Swarm service. Không chuyển option giữa hai syntax theo phỏng đoán; tên và đơn vị có thể khác.
+
+## Bảng chọn nhanh
+
+| Nhu cầu | Syntax nên dùng |
+|---|---|
+| CLI production dễ audit | `--mount` |
+| Volume đơn giản, tương tác nhanh | `-v name:/path` |
+| SELinux `z`/`Z` trên bind mount | `-v host:target:Z` |
+| tmpfs cần `noexec`, `uid`, `gid` | `--tmpfs` |
+| Swarm service | `--mount` |
+| Compose cần review rõ | Long syntax |
+| Volume driver options | `--mount` |
+| Volume subdirectory | `--mount` |
+
+## Compose short và long syntax
+
+Short syntax:
+
+```yaml
+services:
+  app:
+    image: example/app:1.0
+    volumes:
+      - app-data:/var/lib/app
+      - ./config:/etc/app:ro
+
+volumes:
+  app-data:
+```
+
+Long syntax:
+
+```yaml
+services:
+  app:
+    image: example/app:1.0
+    volumes:
+      - type: volume
+        source: app-data
+        target: /var/lib/app
+        volume:
+          nocopy: true
+      - type: bind
+        source: ./config
+        target: /etc/app
+        read_only: true
+        bind:
+          create_host_path: false
+
+volumes:
+  app-data:
+```
+
+Relative bind path trong Compose được resolve theo project directory. Xem model sau khi merge file và interpolate biến:
+
+```bash
+docker compose config
+```
+
+Đừng chỉ review YAML nguồn khi deployment dùng nhiều `-f`, profile hoặc environment variable.
+
+## Quoting driver options có dấu phẩy
+
+`--mount` tự dùng dấu phẩy để tách field. Nếu một `volume-opt` chứa danh sách dấu phẩy, quote toàn expression theo shell và quote field nội bộ theo yêu cầu của CLI. Ví dụ NFS:
+
+```bash
+docker service create \
+  --name nfs-example \
+  --mount 'type=volume,src=nfs-data,dst=/data,volume-driver=local,volume-opt=type=nfs,volume-opt=device=:/export,"volume-opt=o=addr=10.0.0.10,rw,nfsvers=4"' \
+  nginx:1.28-alpine
+```
+
+Đây chỉ là syntax example; nó yêu cầu NFS server và network thực sự hoạt động. `local` driver chuyển option cho Linux mount, không tự cung cấp HA hay retry semantics.
+
+## Xác minh cấu hình cuối cùng
+
+Sau khi create container, inspect contract mà daemon lưu:
+
+```bash
+docker inspect CONTAINER \
+  --format '{{range .Mounts}}{{printf "type=%s source=%s destination=%s rw=%v propagation=%s\n" .Type .Source .Destination .RW .Propagation}}{{end}}'
+```
+
+Trong incident, capture cả container configuration và current mount view:
+
+```bash
+docker inspect CONTAINER > container-inspect.json
+docker exec CONTAINER cat /proc/self/mountinfo
+```
+
+`inspect` cho intent của Docker; `/proc/self/mountinfo` cho view mà process đang thấy. Container tối giản có thể không có `mount` hoặc `findmnt`, nhưng `/proc` thường vẫn hữu ích.
+
+## Lỗi parse thường gặp
+
+| Triệu chứng | Kiểm tra |
+|---|---|
+| “invalid mount config” | Thiếu type/source/target, target không tuyệt đối |
+| Host file thành directory | `-v` đã tự tạo source bị typo |
+| File image biến mất | Mount che target không rỗng |
+| Remote container không thấy local file | Source nằm trên daemon host khác |
+| Volume mới có file bất ngờ | Default copy từ image target |
+| `volume-subpath` thất bại | Subdirectory chưa tồn tại |
+| Option driver bị tách sai | Quoting dấu phẩy |
+| Permission denied | UID/GID, mode, userns hoặc SELinux label |
+
+## Nguồn chính thức
+
+- [Docker volumes syntax](https://docs.docker.com/engine/storage/volumes/#syntax)
+- [Bind mount syntax](https://docs.docker.com/engine/storage/bind-mounts/#syntax)
+- [tmpfs syntax](https://docs.docker.com/engine/storage/tmpfs/#syntax)
+- [Compose services volumes](https://docs.docker.com/reference/compose-file/services/#volumes)

@@ -1,0 +1,260 @@
+---
+title: "Multi-stage builds"
+description: "Tách dependency, test, compile và runtime thành nhiều stage để tạo image nhỏ hơn, an toàn hơn và có target rõ cho development, CI hoặc production."
+---
+
+Multi-stage build dùng nhiều `FROM` trong một Dockerfile. Mỗi `FROM` bắt đầu stage riêng; stage sau chỉ copy artifact cần thiết từ stage trước. Compiler, source, package cache và credential mount có thể bị loại khỏi final runtime image mà không cần script build ngoài để lắp ghép filesystem thủ công.
+
+```text
+source -> deps -> test -> build -> runtime image
+                         |
+                         +-> debug image
+```
+
+Lợi ích chính không chỉ là giảm MB. Final image có ít executable/dependency hơn, runtime contract rõ hơn và supply-chain inventory gần với thứ thực sự deploy.
+
+## Ví dụ Go từ build tới runtime
+
+Cấu trúc:
+
+```text
+.
+├── cmd/server/main.go
+├── go.mod
+├── go.sum
+└── Dockerfile
+```
+
+Dockerfile:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+
+FROM golang:1.25 AS build
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+COPY . .
+ARG TARGETOS TARGETARCH
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
+    go build -trimpath -o /out/server ./cmd/server
+
+FROM build AS test
+RUN go test ./...
+
+FROM scratch AS runtime
+COPY --from=build /out/server /server
+USER 10001:10001
+ENTRYPOINT ["/server"]
+```
+
+Các boundary:
+
+- `build` có Go toolchain và source;
+- `test` tái sử dụng build environment nhưng không thuộc final runtime ancestry;
+- `runtime` bắt đầu từ `scratch`, chỉ nhận binary;
+- cache mounts tăng tốc nhưng không đi vào output layer.
+
+`CGO_ENABLED=0` chỉ phù hợp nếu ứng dụng/dependency hỗ trợ static pure-Go path. Nếu cần cgo, dùng runtime base có đúng dynamic libraries hoặc copy đầy đủ dependency đã kiểm chứng; không chuyển sang scratch bằng thử-sai.
+
+## Đặt tên stage, không dùng số
+
+```dockerfile
+COPY --from=build /out/server /server
+```
+
+ổn định hơn:
+
+```dockerfile
+COPY --from=0 /out/server /server
+```
+
+Khi chèn/reorder stage, index thay đổi nhưng tên giữ contract. Tên nên mô tả vai trò: `deps`, `lint`, `test`, `build`, `runtime`, `debug`.
+
+## Build một target cụ thể
+
+```bash
+# Chạy tới test target
+docker build --target test --tag app:test-stage .
+
+# Tạo production target cuối
+docker build --target runtime --tag app:prod .
+```
+
+BuildKit chỉ build stage target phụ thuộc. Tuy nhiên, nếu target `runtime` copy từ `build` nhưng không phụ thuộc `test`, production build có thể thành công dù test stage chưa chạy. CI phải gọi `--target test` như một gate hoặc thiết kế dependency graph buộc validation cần thiết.
+
+Không tạo dependency giả chỉ để ép thứ tự nếu pipeline có thể biểu diễn test gate rõ ràng. Build artifact deploy phải trace được về cùng source/input đã test.
+
+## Reusable base và stage branching
+
+```dockerfile
+FROM node:24-alpine AS base
+WORKDIR /app
+
+FROM base AS deps
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+
+FROM deps AS test
+COPY . .
+RUN npm test
+
+FROM deps AS build
+COPY . .
+RUN npm run build
+
+FROM node:24-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=deps /app/package.json /app/package-lock.json ./
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+USER node
+CMD ["node", "dist/server.js"]
+```
+
+Ví dụ này chỉ đúng nếu `node_modules` tạo trong `deps` chứa production-compatible dependency và không bao gồm dev dependency không cần. Thường nên có stage `prod-deps` chạy `npm ci --omit=dev`, hoặc prune theo package-manager contract rồi kiểm tra runtime. Native addon phải build cho cùng platform/libc với final base.
+
+Stage branching cho phép test/build độc lập hoặc song song nếu không phụ thuộc nhau, nhưng copy source nhiều branch có thể tăng work. Đo thời gian/cache thay vì tối ưu theo cảm giác.
+
+## Copy artifact tối thiểu
+
+Không làm:
+
+```dockerfile
+COPY --from=build / /
+```
+
+Cách này kéo toolchain, package cache, secret remnants và config build vào runtime, xóa ranh giới multi-stage. Copy allowlist:
+
+```dockerfile
+COPY --from=build /out/server /usr/local/bin/server
+COPY --from=build /out/migrations /usr/share/app/migrations
+```
+
+Sau copy, đặt ownership/permission ở final stage:
+
+```dockerfile
+COPY --from=build --chown=10001:10001 --chmod=755 \
+  /out/server /usr/local/bin/server
+```
+
+Final base phải có directory/user cần thiết hoặc dùng numeric ownership.
+
+## Artifact từ external image
+
+```dockerfile
+FROM alpine:3.23
+COPY --from=busybox:1.37.0-uclibc /bin/busybox /usr/local/bin/busybox
+```
+
+External image hoạt động như source stage. Nó là dependency cần trust, digest pin, scanning và license review. Binary phải tương thích final libc/architecture.
+
+Named context cũng có thể thay source:
+
+```bash
+docker build --build-context assets=./generated-assets .
+```
+
+```dockerfile
+COPY --from=assets . /usr/share/app/assets/
+```
+
+## Development, debug và production targets
+
+```dockerfile
+FROM runtime AS production
+
+FROM runtime AS debug
+USER root
+COPY --from=busybox:1.37.0-uclibc /bin/busybox /bin/busybox
+USER 10001:10001
+```
+
+Production pipeline build `production`; incident workflow có thể build/pull `debug` theo policy. Không deploy nhầm target:
+
+- tag target khác nhau rõ (`app:1.4.2` và `app:1.4.2-debug`);
+- label target/flavor;
+- CI allowlist production target;
+- scan cả target được phân phối.
+
+Kubernetes ephemeral debug container thường tốt hơn nhét tool vào application image, tùy platform.
+
+## Secret chỉ xuất hiện trong build stage vẫn cần cẩn thận
+
+Multi-stage không tự biến `COPY secret` thành an toàn. Intermediate layer/cache có thể giữ secret và remote cache/export có thể phân phối nó. Luôn dùng secret mount:
+
+```dockerfile
+FROM node:24-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc,required=true \
+    npm ci
+```
+
+Builder chạy untrusted Dockerfile có thể đọc/exfiltrate mount. Chỉ cấp secret cho stage/operation cần thiết và không chạy pull request không tin cậy với production credential.
+
+## Final image không có shell
+
+`scratch`/distroless runtime cần verification ở stage trước:
+
+```dockerfile
+FROM build AS verify
+RUN test -x /out/server
+RUN /out/server --version
+
+FROM scratch AS runtime
+COPY --from=build /out/server /server
+ENTRYPOINT ["/server"]
+```
+
+Nếu `runtime` không phụ thuộc `verify`, CI phải build verify target riêng. Sau export, chạy container smoke test trên target platform. Với multi-platform image, test từng architecture bằng native runner hoặc emulation có giới hạn được hiểu rõ.
+
+## Đo kết quả
+
+```bash
+docker build --target runtime --tag app:multi-stage .
+docker image inspect app:multi-stage --format 'size={{.Size}} user={{.Config.User}}'
+docker image history app:multi-stage
+docker run --rm app:multi-stage --version
+```
+
+So sánh với single-stage bằng cùng artifact/functionality. Image nhỏ hơn nhưng thiếu CA, timezone hoặc dynamic library là regression, không phải tối ưu.
+
+Scan final image và tạo SBOM/attestation qua pipeline. Builder stage có vulnerability không chạy production nhưng vẫn thuộc build trust boundary; tùy threat model, scan toolchain/dependency source riêng.
+
+## Cache giữa stages
+
+Một stage thay đổi chỉ invalidate các stage phụ thuộc. Đặt manifest dependency trước source, dùng cache mount cho package manager và external cache cho CI. Đừng copy artifact qua host (`docker cp`) giữa các build; `COPY --from` cho builder nhìn thấy dependency graph và cache đúng.
+
+Nếu cache miss:
+
+```bash
+docker build --progress=plain --target runtime .
+docker buildx du
+```
+
+Xác định step đầu tiên miss và source/context/arg ảnh hưởng nó. Đọc [Image layers và cache](/docs/images-va-dockerfile/layers-and-cache/).
+
+## Anti-pattern
+
+- Stage final vẫn dùng SDK/compiler image dù chỉ cần runtime.
+- `COPY --from=build / /` thay vì allowlist artifact.
+- Test stage tồn tại nhưng CI không bao giờ build.
+- Dùng `scratch` với dynamic binary/certificate requirement chưa kiểm tra.
+- Secret được `COPY` vào builder rồi xóa.
+- Native dependency build trên glibc nhưng runtime dùng musl.
+- Debug target được tag/push như production target.
+- Copy `node_modules`/venv giữa stage có platform hoặc path khác không tương thích.
+
+## Nguồn chính thức
+
+- [Multi-stage builds](https://docs.docker.com/build/building/multi-stage/)
+- [Dockerfile best practices: multi-stage builds](https://docs.docker.com/build/building/best-practices/#use-multi-stage-builds)
+- [`COPY --from`](https://docs.docker.com/reference/dockerfile/#copy---from)
+- [Build secrets](https://docs.docker.com/build/building/secrets/)

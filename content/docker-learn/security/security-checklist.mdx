@@ -1,0 +1,257 @@
+---
+title: "Docker security checklist"
+description: "Checklist kiểm tra Docker host, daemon, image supply chain, runtime config, secret, monitoring và incident response kèm evidence trước production."
+---
+
+Checklist này là gate review, không phải chứng nhận compliance. Mỗi item cần **evidence**, **owner** và **exception có ngày hết hạn**. “Đã cấu hình trong YAML” chưa đủ nếu override hoặc daemon thực tế chạy khác.
+
+<Callout type="warn" title="Ưu tiên critical control">
+  Docker socket/API, privileged container, host mount/namespace và credential release có blast radius lớn nhất. Xử lý các mục này trước khi tối ưu rule chi tiết.
+</Callout>
+
+## 1. Host và Docker Engine
+
+- [ ] Distro, kernel, Docker Engine, containerd/runc còn support và được vá theo SLA.
+- [ ] Host chỉ chạy dịch vụ quản trị/quan sát cần thiết; workload khác trust zone được tách node/VM.
+- [ ] NTP/time sync hoạt động để log, certificate và token đáng tin.
+- [ ] Disk, inode, memory, PID và log có limit/alert.
+- [ ] AppArmor hoặc SELinux enforcing theo distro policy.
+- [ ] Backup/restore cho volume và daemon config đã được thử.
+- [ ] Rootless hoặc `userns-remap` được đánh giá cho workload phù hợp.
+- [ ] Host baseline và rebuild procedure tồn tại; không phụ thuộc sửa tay.
+
+Evidence nhanh:
+
+```bash
+uname -a
+docker version
+docker info
+systemctl cat docker
+sudo cat /etc/docker/daemon.json 2>/dev/null || true
+```
+
+Không đăng output đầy đủ công khai: `docker info`/config có thể lộ registry, proxy, path hoặc topology.
+
+## 2. Daemon và control plane
+
+- [ ] Chỉ admin/automation được phê duyệt truy cập Unix socket.
+- [ ] Group `docker` được inventory và review định kỳ.
+- [ ] Không container application nào mount Docker/containerd socket.
+- [ ] Remote API dùng SSH hoặc mutual TLS; port `2375` không expose.
+- [ ] Certificate/key có owner, expiry, rotation và revocation.
+- [ ] Authorization/audit ghi caller identity và action nhạy cảm.
+- [ ] CI runner có socket là dedicated, ephemeral và không chạy untrusted PR.
+- [ ] Thay đổi daemon config có review, canary và rollback.
+
+```bash
+sudo stat -c '%A %U:%G %n' /var/run/docker.sock
+getent group docker
+
+docker ps -q | while read -r id; do
+  docker inspect "$id" --format '{{.Name}} {{range .Mounts}}{{.Source}}:{{.Destination}} {{end}}'
+done | grep -E 'docker\.sock|containerd\.sock' || true
+```
+
+## 3. Source, build và registry
+
+- [ ] Release workflow/source có protected review và least-privilege identity.
+- [ ] Untrusted PR không nhận production/build signing secret.
+- [ ] Base image, dependency và downloaded artifact được pin/verify.
+- [ ] Secret build dùng BuildKit secret/SSH mount, không dùng `ARG`/`ENV`/`COPY`.
+- [ ] Builder/cache tách theo trust zone; runner được reset.
+- [ ] Image có SBOM và provenance cho mọi platform.
+- [ ] Scan chạy trên exact digest và có rescan liên tục.
+- [ ] Signature verification ràng buộc approved key/OIDC identity.
+- [ ] Registry token scope hẹp; deploy credential read-only.
+- [ ] Retention/mirror/promotion giữ image, signature và attestation.
+- [ ] Staging và production dùng cùng digest, không rebuild.
+
+```bash
+docker buildx imagetools inspect REGISTRY/REPOSITORY@sha256:REAL_DIGEST
+docker scout cves REGISTRY/REPOSITORY@sha256:REAL_DIGEST
+```
+
+Tool/signature command phụ thuộc trust stack. Lưu policy result cùng digest, scanner DB/tool version và thời gian.
+
+## 4. Image
+
+- [ ] Runtime stage dùng base image approved, còn update channel.
+- [ ] Multi-stage build loại compiler/package manager/source khỏi final nếu không cần.
+- [ ] Dockerfile có `USER` non-root với UID/GID rõ.
+- [ ] Không có SSH daemon, shell/debug tool hoặc package thừa nếu service không cần.
+- [ ] Entrypoint nhận signal và không cần privilege để init.
+- [ ] Image không chứa secret, private key, credential file hoặc sensitive build arg.
+- [ ] OCI label/source/version hỗ trợ traceability nhưng không chứa secret.
+- [ ] Healthcheck không in credential và có timeout phù hợp.
+
+```bash
+docker image inspect IMAGE@sha256:REAL_DIGEST \
+  --format 'user={{.Config.User}} entrypoint={{json .Config.Entrypoint}} cmd={{json .Config.Cmd}}'
+
+docker history --no-trunc IMAGE@sha256:REAL_DIGEST
+```
+
+`history` không chứng minh layer không có secret. Dùng canary marker test, secret scanner và review build context/cache.
+
+## 5. Runtime least privilege
+
+Baseline đề xuất cho service thông thường:
+
+- [ ] `user` non-root.
+- [ ] `cap_drop: [ALL]`, chỉ add capability được chứng minh.
+- [ ] `no-new-privileges:true`.
+- [ ] Docker default hoặc custom seccomp profile được test; không `unconfined`.
+- [ ] AppArmor/SELinux profile/label enforcing.
+- [ ] `read_only: true`; writable path là tmpfs/volume cụ thể.
+- [ ] Không `privileged`, host PID/network/IPC/user namespace nếu không có exception.
+- [ ] Không device hoặc bind mount host nhạy cảm.
+- [ ] CPU, memory, PID và log/resource limit phù hợp.
+- [ ] Restart/healthcheck tránh crash loop tạo DoS.
+
+Audit containers đang chạy:
+
+```bash
+docker ps -q | while read -r id; do
+  docker inspect "$id" --format \
+'{{.Name}} user={{.Config.User}} privileged={{.HostConfig.Privileged}} readonly={{.HostConfig.ReadonlyRootfs}} pid={{.HostConfig.PidMode}} network={{.HostConfig.NetworkMode}} caps+={{json .HostConfig.CapAdd}} caps-={{json .HostConfig.CapDrop}} security={{json .HostConfig.SecurityOpt}}'
+done
+```
+
+Output rỗng ở `user=` thường nghĩa image default, có thể là root; inspect image `Config.User` và verify process thực tế.
+
+## 6. Mount và dữ liệu
+
+- [ ] Persistent data nằm trong volume/external service có backup/restore.
+- [ ] Bind mount dùng absolute dedicated path và `readonly` nếu app không ghi.
+- [ ] Không mount `/`, `/etc`, `/proc`, `/sys`, `/dev`, home credential hoặc Docker data root.
+- [ ] SELinux relabel `:Z`/`:z` chỉ dùng trên path riêng đã review.
+- [ ] Volume ownership tương thích non-root/user namespace; không `chmod 777`.
+- [ ] tmpfs có `size`, `noexec`, `nosuid` khi phù hợp.
+- [ ] Data deletion/cleanup có confirmation và retention.
+
+```bash
+docker inspect CONTAINER --format '{{json .Mounts}}'
+docker inspect CONTAINER --format '{{json .HostConfig.Tmpfs}}'
+```
+
+## 7. Network
+
+- [ ] Service chỉ attach network cần thiết; database/backend không publish host port.
+- [ ] Published port bind đúng interface; public exposure có firewall/proxy/TLS.
+- [ ] Ingress authentication/authorization và rate limit phù hợp.
+- [ ] Egress được giới hạn theo threat model; metadata/internal control plane bị chặn nếu không cần.
+- [ ] DNS, proxy và service credential dùng identity rõ.
+- [ ] Host network chỉ là exception có lý do.
+- [ ] Network flow/DNS logs đủ correlation tới workload.
+
+```bash
+docker port CONTAINER
+docker inspect CONTAINER --format '{{json .NetworkSettings.Networks}}'
+docker network ls
+```
+
+## 8. Secrets và identity
+
+- [ ] Mỗi workload có identity/credential riêng, scope và audience tối thiểu.
+- [ ] Ưu tiên token ngắn hạn; static secret có owner và expiry.
+- [ ] Secret không nằm trong image, Compose source committed, environment dump hay log.
+- [ ] File secret chỉ grant đúng service và permission đã xác minh.
+- [ ] Rotation không downtime và revocation được diễn tập.
+- [ ] Downstream audit phát hiện usage bất thường hoặc credential cũ.
+- [ ] Incident runbook inventory nơi cần xóa secret: Git, layer, cache, registry, CI log, artifact.
+
+Không `docker inspect`/`env` rồi copy output chứa value vào ticket. Redact trước khi chia sẻ.
+
+## 9. Observability và runtime detection
+
+- [ ] Log application, Docker event, host/LSM audit, network và identity audit được tập trung.
+- [ ] Alert có container ID, image digest, host, process/user và owner.
+- [ ] Rule cho socket mount, privileged, host namespace, capability rộng và `exec` bất thường.
+- [ ] Baseline process/file/network được version cùng service.
+- [ ] Telemetry outage, queue backlog và dropped event cũng có alert.
+- [ ] Exception detector có scope, owner, expiry.
+- [ ] Retention hỗ trợ forensic và compliance.
+- [ ] Detector được test end-to-end bằng fixture an toàn.
+
+## 10. Incident response
+
+- [ ] Có tiêu chí isolate container, host và environment.
+- [ ] Có quyền/kênh revoke Docker, registry, CI, cloud và app credential ngoài đường bị compromise.
+- [ ] Forensic checklist thu container inspect, digest, process, mount, network, event và host logs.
+- [ ] Nếu socket/privileged bị lạm dụng, runbook giả định host compromise và rebuild node.
+- [ ] Có clean builder/host baseline để recover.
+- [ ] Artifact/digest bị nghi có thể quarantine trên mọi registry/environment.
+- [ ] Tabletop exercise được chạy định kỳ.
+- [ ] Post-incident cập nhật threat model, policy và regression test.
+
+## Compose hardening mẫu
+
+```yaml
+services:
+  api:
+    image: registry.example.com/team/api@sha256:REPLACE_WITH_APPROVED_DIGEST
+    user: "10001:10001"
+    read_only: true
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+      - /run:rw,noexec,nosuid,size=16m
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.50
+    networks:
+      - backend
+    secrets:
+      - api_token
+
+secrets:
+  api_token:
+    file: ./secrets/api-token.txt
+
+networks:
+  backend:
+    internal: true
+```
+
+Mẫu này không chạy nguyên trạng: phải thay digest, cung cấp secret an toàn, thêm command/port/volume cần thiết và xác minh field theo Docker Compose version. `internal: true` chặn đường external theo network model nhưng không thay firewall/host policy cho mọi scenario.
+
+Validate:
+
+```bash
+docker compose config --quiet
+docker compose config > rendered-compose.yaml
+docker compose up --detach
+cid="$(docker compose ps -q api)"
+docker inspect "$cid"
+```
+
+Không commit `rendered-compose.yaml` nếu interpolation đã đưa secret/config nhạy cảm vào output.
+
+## Quản lý exception
+
+Mỗi exception phải ghi:
+
+| Trường | Yêu cầu |
+|---|---|
+| Control bị bỏ | Ví dụ `SYS_PTRACE`, writable root, host network |
+| Scope | Digest/service/environment/node |
+| Lý do | Requirement kỹ thuật cụ thể |
+| Risk | Abuse case và blast radius |
+| Compensating control | Isolation, monitoring, dedicated node |
+| Owner/approver | Người chịu trách nhiệm và reviewer độc lập |
+| Expiry | Ngày tự động review/deny |
+| Removal plan | Điều kiện và ticket để đóng |
+
+Exception không expiry sẽ trở thành default không được review.
+
+## Nguồn tham khảo
+
+- [Docker Engine security](https://docs.docker.com/engine/security/)
+- [CIS Docker Benchmark](https://www.cisecurity.org/benchmark/docker)
+- [NIST SP 800-190](https://csrc.nist.gov/publications/detail/sp/800-190/final)
+- [OWASP Docker Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html)
+- [Docker security overview](/docs/security/)

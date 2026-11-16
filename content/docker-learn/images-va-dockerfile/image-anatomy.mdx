@@ -1,0 +1,192 @@
+---
+title: "Cấu trúc Docker image"
+description: "Phân tích filesystem layers, image config, OCI manifest, multi-platform index và các loại digest để đọc đúng docker image inspect và registry reference."
+---
+
+Một Docker image không phải một file tar đơn lẻ hay snapshot đầy đủ của máy ảo. Ở mức phân phối, image là một graph các object content-addressed: filesystem layer blobs, configuration JSON và manifest nối chúng lại. Registry có thể thêm một image index để cùng một tên hỗ trợ nhiều platform.
+
+Hiểu cấu trúc này giúp trả lời bốn câu hỏi vận hành: content nào thực sự chạy, vì sao nhiều tag dùng chung dung lượng, digest nào cần pin và vì sao image local có thể hiện khác reference trên registry.
+
+## Bốn thành phần cần phân biệt
+
+| Thành phần | Chứa gì | Tính chất |
+|---|---|---|
+| Filesystem layer | Tập thay đổi file: thêm, sửa, xóa | Blob bất biến, có thể dùng chung |
+| Image config | Default command, env, user, workdir, labels và danh sách rootfs diff IDs | JSON content-addressed |
+| Image manifest | Media type, digest config và danh sách layer blob theo thứ tự | Mô tả một image cho một platform |
+| Image index/manifest list | Danh sách manifest con cùng platform metadata | Cho phép một reference hỗ trợ nhiều platform |
+
+Một tag registry có thể trỏ thẳng tới image manifest hoặc tới index. Khi pull image multi-platform, client/runtime chọn manifest phù hợp `os/architecture[/variant]`, rồi tải config và các layer còn thiếu.
+
+```text
+registry.example/team/api:1.4
+        |
+        v
+OCI image index
+  +-- linux/amd64 manifest -- config + layers
+  +-- linux/arm64 manifest -- config + layers
+  +-- windows/amd64 manifest -- config + layers
+```
+
+Tag không nằm bên trong layer. Nó là tham chiếu ở repository; đổi tag không viết lại filesystem blob.
+
+## Filesystem layers và unified view
+
+Mỗi filesystem layer biểu diễn chênh lệch so với layer dưới, không phải toàn bộ root filesystem. Runtime xếp các layer read-only theo thứ tự để tạo một view thống nhất. Khi container chạy, Docker thêm writable layer riêng ở trên cùng.
+
+Ví dụ logic:
+
+```text
+Layer 1: /bin, /lib, /etc từ base image
+Layer 2: thêm /usr/bin/my-server
+Layer 3: thêm /app/config-default.yaml
+Container writable layer: /tmp/cache, file sửa lúc chạy
+```
+
+Nếu layer trên xóa một file từ layer dưới, định dạng layer biểu diễn deletion bằng whiteout. Blob dưới vẫn bất biến và vẫn chiếm chỗ; vì vậy `RUN rm` ở instruction sau không làm layer trước nhỏ lại.
+
+Các container từ cùng image dùng chung layer read-only, nhưng writable layer không phải nơi lưu dữ liệu bền vững. Dữ liệu cần tồn tại qua recreate phải đặt trong volume, bind mount hoặc external service.
+
+## Image config không phải filesystem
+
+Các instruction như `ENV`, `CMD`, `ENTRYPOINT`, `USER`, `WORKDIR`, `EXPOSE`, `VOLUME`, `HEALTHCHECK` và `LABEL` chủ yếu cập nhật image configuration. Chúng có thể hiện là dòng `0B` trong `docker image history` vì không thêm file payload đáng kể.
+
+Đọc config local:
+
+```bash
+docker image pull alpine:3.23
+docker image inspect alpine:3.23 \
+  --format 'id={{.Id}} user={{json .Config.User}} workdir={{json .Config.WorkingDir}} cmd={{json .Config.Cmd}} entrypoint={{json .Config.Entrypoint}}'
+```
+
+`docker image inspect` trả cấu trúc của Engine local, không phải raw OCI manifest từ registry. Tên field và object bao ngoài phục vụ Engine API; đừng dùng output này như byte-for-byte registry artifact.
+
+## Image ID, layer digest và manifest digest
+
+Từ “digest” thường bị dùng cho nhiều object khác nhau:
+
+- **Image ID local** trong `.Id` thường có dạng `sha256:...` và nhận diện image configuration content.
+- **Compressed layer digest** trong manifest nhận diện blob được truyền qua registry.
+- **Diff ID** trong image config nhận diện nội dung layer sau khi giải nén.
+- **Manifest digest** trong reference `name@sha256:...` nhận diện manifest hoặc index được repository phân phối.
+
+Các giá trị đều content-addressed nhưng không thể thay thế lẫn nhau. `docker image inspect --format '{{json .RepoDigests}}'` hiển thị repository digest đã biết sau pull/push; image chỉ build local có thể chưa có `RepoDigests`.
+
+```bash
+docker image inspect alpine:3.23 \
+  --format 'image-id={{.Id}} repo-digests={{json .RepoDigests}} rootfs={{json .RootFS.Layers}}'
+```
+
+Không suy ra rằng `.Id` phải bằng digest sau dấu `@`. Chúng có thể băm hai object JSON khác nhau.
+
+## Tag, repository và content sharing
+
+Một image có thể có nhiều tag local:
+
+```bash
+docker image tag alpine:3.23 local/alpine:test
+docker image ls --no-trunc alpine local/alpine
+```
+
+Hai dòng có thể cùng image ID. Lệnh tag chỉ tạo reference mới; layer không bị nhân đôi. Xóa một tag bằng `docker image rm local/alpine:test` không xóa content nếu tag/container khác vẫn tham chiếu nó.
+
+Docker có thể dùng chung blob giữa nhiều image có base giống nhau. Tổng kích thước cộng các dòng trong `docker image ls` vì thế không phản ánh chính xác disk tăng thêm. Dùng:
+
+```bash
+docker system df -v
+```
+
+Phân biệt `SIZE`, shared size, unique size và reclaimable theo output/version hiện tại. Với containerd image store hoặc builder riêng, build cache và image store cũng không nhất thiết là cùng một pool có lifecycle giống nhau.
+
+## Manifest một platform và index nhiều platform
+
+Kiểm tra remote metadata mà không cần chạy image:
+
+```bash
+docker buildx imagetools inspect alpine:3.23
+```
+
+Với multi-platform reference, output thường liệt kê nhiều manifest và platform. Output cụ thể thay đổi khi publisher cập nhật tag, nên hãy đọc structure thay vì hard-code digest từ ví dụ.
+
+Chỉ định platform khi pull để điều tra:
+
+```bash
+docker image pull --platform linux/amd64 alpine:3.23
+docker image inspect alpine:3.23 --format '{{.Os}}/{{.Architecture}}'
+```
+
+Trên image store không hỗ trợ giữ nhiều biến thể dưới cùng tag local, lần pull platform khác có thể thay local reference. Dùng `buildx imagetools inspect` cho registry index và naming rõ ràng cho thử nghiệm đa platform.
+
+## `history` không phải danh sách blob chính xác
+
+```bash
+docker image history --no-trunc alpine:3.23
+```
+
+`docker image history` hữu ích để đọc command metadata và kích thước logic của các thay đổi, nhưng không phải forensic view hoàn chỉnh:
+
+- dòng history có thể là metadata-only;
+- một instruction có thể không ánh xạ đơn giản thành một blob theo cách người đọc kỳ vọng;
+- BuildKit có thể tối ưu/export artifact khác legacy mental model;
+- secret từng lọt vào command, config hay layer vẫn có thể xuất hiện trong metadata/cache dù file cuối không còn.
+
+Dùng scanner/SBOM và OCI tooling chuyên dụng khi cần inventory supply chain; không dựa riêng vào `history` để kết luận image sạch secret hay vulnerability.
+
+## Image local, archive và registry artifact
+
+`docker image save` xuất image theo archive format Docker hỗ trợ để chuyển qua `docker image load`:
+
+```bash
+docker image save alpine:3.23 --output alpine-image.tar
+docker image load --input alpine-image.tar
+```
+
+Archive này không nên được hiểu là một executable image file độc lập. `docker export` lại xuất filesystem của **container** và bỏ phần lớn image history/config, nên không thay cho `docker image save` trong backup/transfer image.
+
+| Mục tiêu | Command phù hợp |
+|---|---|
+| Chuyển image cùng metadata/tag | `docker image save` / `docker image load` |
+| Xuất view filesystem container | `docker container export` |
+| Phân phối, deduplicate và policy | `docker push` / `docker pull` qua registry |
+
+Archive không thay thế source, Dockerfile, lockfile, provenance và quy trình rebuild. Một artifact có thể restore để chạy nhưng vẫn không cho biết cách vá dependency rồi build lại.
+
+## Kiểm tra một image trước khi dùng
+
+Thu ít nhất các signal sau:
+
+```bash
+IMAGE='alpine:3.23'
+
+docker image inspect "$IMAGE"
+docker image history --no-trunc "$IMAGE"
+docker buildx imagetools inspect "$IMAGE"
+```
+
+Đánh giá:
+
+1. Registry/repository có phải nguồn tin cậy không?
+2. Tag đang resolve tới manifest/index digest nào?
+3. Platform có đúng target không?
+4. `USER`, `ENTRYPOINT`, `CMD`, `ENV`, `WORKDIR`, labels và healthcheck có đúng contract không?
+5. Image có base/dependency cần scan hoặc SBOM không?
+6. Deployment pin tag, digest hay cả hai; ai chịu trách nhiệm cập nhật?
+
+## Những hiểu lầm thường gặp
+
+- **“Image nhỏ vì dòng cuối đã xóa file lớn.”** Sai nếu file lớn được thêm ở layer trước.
+- **“Cùng tag nghĩa là cùng image.”** Sai; tag mutable có thể chuyển sang manifest khác.
+- **“Image ID là registry digest.”** Không phải contract chung; xác định object nào được băm.
+- **“Pull image multi-platform tải mọi architecture.”** Thông thường client chọn platform phù hợp; index chỉ mô tả các lựa chọn.
+- **“Xóa container sẽ xóa image.”** Hai lifecycle tách biệt; image còn cho tới khi không còn reference/use và được xóa/prune.
+- **“Image chứa kernel.”** Linux container image thường dùng kernel host.
+
+Tiếp theo, đọc [Image layers và cache](/docs/images-va-dockerfile/layers-and-cache/) để nối cấu trúc content-addressed với tốc độ build và cache invalidation.
+
+## Nguồn chính thức
+
+- [OCI Image Specification](https://github.com/opencontainers/image-spec)
+- [Understanding image layers](https://docs.docker.com/get-started/docker-concepts/building-images/understanding-image-layers/)
+- [`docker image inspect`](https://docs.docker.com/reference/cli/docker/image/inspect/)
+- [`docker buildx imagetools inspect`](https://docs.docker.com/reference/cli/docker/buildx/imagetools/inspect/)
+- [`docker image save`](https://docs.docker.com/reference/cli/docker/image/save/)

@@ -1,0 +1,249 @@
+---
+title: "Immutable containers"
+description: "Áp dụng nguyên tắc immutable container: thay thế thay vì sửa tại chỗ, tách state ra volume/service, rollout bằng image digest, giảm drift từ exec/commit và dùng read-only filesystem khi phù hợp."
+---
+
+Immutable container nghĩa là bạn coi container đang chạy như một instance có thể thay thế, không phải một máy chủ nhỏ để SSH vào sửa dần. Khi cần đổi code, dependency, config quan trọng hoặc startup command, bạn build/pull image mới và tạo container mới từ desired state, thay vì `exec` vào container cũ để chỉnh file.
+
+Nguyên tắc này giải quyết ba vấn đề vận hành:
+
+- **Reproducibility:** cùng image + config tạo ra cùng behavior quan sát được.
+- **Rollback:** quay lại image/config trước đó thay vì đoán các thay đổi thủ công.
+- **Drift control:** production không âm thầm khác Dockerfile, Compose file hoặc pipeline.
+
+Immutable không có nghĩa container không được ghi bất kỳ byte nào. Runtime vẫn có thể ghi cache tạm, socket, PID file hoặc log buffer. Điều quan trọng là state cần bền vững phải nằm ngoài writable layer của container và mọi thay đổi dài hạn phải đi qua build/deploy pipeline.
+
+## Mutable và immutable khác nhau thế nào?
+
+| Tình huống | Mutable container | Immutable container |
+|---|---|---|
+| Cài package để debug | `docker exec apk add curl` trong container production | Dùng debug toolbox/container riêng hoặc build image debug có kiểm soát |
+| Sửa config | Edit file trong writable layer | Thay config source, secret/config object, env hoặc image rồi recreate |
+| Deploy version mới | `docker restart` hoặc sửa file trong container | Pull/build image mới, tạo replacement, chuyển traffic |
+| Dữ liệu application | Ghi vào root filesystem | Ghi vào volume, bind mount, database hoặc object storage |
+| Post-incident | `docker commit` container đã sửa | Ghi nhận diff để học bài học, sửa Dockerfile/source và rebuild |
+
+`docker commit` có thể hữu ích cho forensic snapshot trong lab, nhưng không nên là đường release. Nó thiếu context source, review, dependency provenance và quy trình scan/signing bình thường.
+
+## Ranh giới state
+
+Một container có ít nhất ba nhóm dữ liệu:
+
+| Nhóm | Ví dụ | Cách quản lý |
+|---|---|---|
+| Immutable artifact | binary, dependency, static asset, default config | Build vào image và version bằng tag/digest |
+| Runtime config | env, command args, mounted config, secret | Quản lý bằng deployment declaration, secret/config store |
+| Persistent state | database files, uploaded files, queue data | Đưa ra volume/bind mount/external service, backup/restore riêng |
+| Ephemeral state | cache tạm, PID file, Unix socket, temp file | Cho phép ghi ở tmpfs hoặc writable path có cleanup rõ |
+
+Sai lầm phổ biến là để uploaded file, SQLite database hoặc generated config quan trọng nằm trong writable layer rồi nghĩ `docker restart` là đủ an toàn. Writable layer chỉ sống cùng container object; `docker rm`, recreate hoặc prune có thể làm mất nó.
+
+## Rollout theo hướng immutable
+
+Một rollout tối thiểu trên Docker Engine độc lập gồm các bước:
+
+1. Build hoặc pull image mới.
+2. Xác minh image ID/digest.
+3. Tạo container mới với config mong muốn.
+4. Chạy smoke check/healthcheck.
+5. Chuyển traffic hoặc đổi name/network alias theo chiến lược của bạn.
+6. Giữ container cũ đủ lâu để rollback hoặc điều tra.
+7. Cleanup container cũ sau khi evidence/rollback window kết thúc.
+
+Ví dụ không có load balancer, dùng name khác để kiểm thử trước:
+
+```bash
+docker image pull registry.example.com/api:2026-07-21
+
+docker container run --detach \
+  --name api-next \
+  --label com.example.service=api \
+  --label com.example.version=2026-07-21 \
+  --env APP_ENV=production \
+  registry.example.com/api:2026-07-21
+```
+
+Xác minh image ID và state:
+
+```bash
+docker image inspect registry.example.com/api:2026-07-21 --format 'image-id={{.Id}}'
+docker container inspect api-next \
+  --format 'container={{.Id}} image-id={{.Image}} status={{.State.Status}} health={{with .State.Health}}{{.Status}}{{else}}none{{end}}'
+```
+
+Nếu cần rollback, stop/remove `api-next` và giữ `api` cũ. Nếu rollout thành công, chuyển traffic theo cơ chế thực tế của bạn rồi cleanup có kiểm soát.
+
+<Callout type="warn" title="Restart không phải rollout">
+  `docker restart api` chạy lại cùng container object, cùng image ID và config đã chốt. Nó không nhận image tag mới, environment mới hoặc mount mới. Dùng recreate/replacement cho deploy thay đổi.
+</Callout>
+
+## Dùng image digest để giảm bất ngờ
+
+Tag như `latest` hoặc `stable` là tên có thể trỏ sang image khác theo thời gian. Container đã tạo giữ image ID cũ, còn command tạo container mới có thể lấy image mới nếu pull policy cho phép. Để deployment reproducible hơn, ghi nhận digest:
+
+```bash
+docker image inspect registry.example.com/api:2026-07-21 \
+  --format '{{index .RepoDigests 0}}'
+```
+
+Trong pipeline hoặc manifest, ưu tiên tham chiếu image bằng tag version rõ ràng kèm digest khi quy trình hỗ trợ:
+
+```text
+registry.example.com/api:2026-07-21@sha256:...
+```
+
+Digest không thay thế vulnerability scanning hoặc provenance, nhưng giúp bạn biết chính xác artifact nào đã chạy.
+
+## Tách dữ liệu ra khỏi writable layer
+
+Với state cần bền vững, dùng volume hoặc external service:
+
+```bash
+docker volume create api-data
+
+docker container run --detach \
+  --name api \
+  --mount type=volume,source=api-data,target=/var/lib/api \
+  registry.example.com/api:2026-07-21
+```
+
+Sau recreate container, volume vẫn còn nếu bạn mount lại đúng source. Nhưng volume không tự tạo backup, schema migration an toàn hoặc consistency guarantee. Với database, đọc [Lưu trữ database trong Docker](/docs/storage/database-storage/) để thiết kế backup/restore và shutdown phù hợp.
+
+Dùng `docker container diff` để phát hiện container drift:
+
+```bash
+docker container diff api
+```
+
+Output cho biết file nào trong writable layer đã thêm/sửa/xóa. Đây là công cụ điều tra, không phải cơ chế đồng bộ state về Dockerfile.
+
+## Giảm drift từ `exec`
+
+`docker exec` nên là break-glass/debug path có kiểm soát. Trước khi exec vào production:
+
+1. Xác định mục tiêu chỉ đọc hay thay đổi state.
+2. Ghi container ID, operator, thời gian, command dự kiến.
+3. Ưu tiên command read-only: `id`, `env` đã redact, `ls`, `cat` config không chứa secret, request local health endpoint.
+4. Không cài package hoặc sửa file nếu có debug container/toolbox đáp ứng được.
+5. Sau incident, recreate container từ image sạch và chuyển mọi fix vào source/Dockerfile/pipeline.
+
+Nếu bắt buộc thay đổi file để mitigation, coi container đó là drifted. Gắn nhãn/ticket và lên kế hoạch thay thế càng sớm càng tốt.
+
+## Read-only root filesystem
+
+`--read-only` mount root filesystem của container ở chế độ read-only. Đây là guardrail mạnh để phát hiện application ghi nhầm vào image layer và giảm tác động nếu process bị compromise.
+
+```bash
+docker container run --detach \
+  --name api \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --mount type=volume,source=api-data,target=/var/lib/api \
+  registry.example.com/api:2026-07-21
+```
+
+Bạn phải cung cấp writable path cho nhu cầu hợp lệ như `/tmp`, runtime socket, cache hoặc data directory. Nếu application giả định ghi được vào `/var/log`, `/run` hoặc home directory, nó có thể fail khi bật `--read-only`. Rollout theo canary và đọc logs/healthcheck trước khi áp rộng.
+
+Không biến read-only root thành quy tắc tuyệt đối. Một số workload legacy cần ghi nhiều path; khi đó ưu tiên sửa application/image dần, dùng tmpfs/volume cụ thể và quan sát `docker diff` để biết path nào còn drift.
+
+## Lab: thấy writable layer mất sau recreate
+
+Tạo container và ghi file vào writable layer:
+
+```bash
+docker container run --detach \
+  --name lifecycle-immutable-demo \
+  --label com.example.lab=immutable-containers \
+  alpine:3.22 \
+  sh -c 'echo runtime-state >/runtime.txt; exec sleep 300'
+```
+
+Xác minh file tồn tại:
+
+```bash
+docker container exec lifecycle-immutable-demo cat /runtime.txt
+docker container diff lifecycle-immutable-demo
+```
+
+Stop/start cùng container vẫn giữ file:
+
+```bash
+docker container stop lifecycle-immutable-demo
+docker container start lifecycle-immutable-demo
+docker container exec lifecycle-immutable-demo cat /runtime.txt
+```
+
+Xóa và tạo container mới cùng image:
+
+```bash
+docker container rm --force lifecycle-immutable-demo
+
+docker container run --detach \
+  --name lifecycle-immutable-demo \
+  --label com.example.lab=immutable-containers \
+  alpine:3.22 \
+  sleep 300
+
+docker container exec lifecycle-immutable-demo test -f /runtime.txt
+```
+
+Expected: lệnh `test` trả non-zero vì file trong writable layer cũ đã mất. Đây là lý do dữ liệu quan trọng phải nằm ngoài container object.
+
+Cleanup:
+
+```bash
+docker container rm --force lifecycle-immutable-demo
+```
+
+## Checklist vận hành immutable container
+
+- Image được build từ source review được, không từ `docker commit` thủ công.
+- Runtime config nằm trong declaration/pipeline, không sửa file trực tiếp trong container.
+- Dữ liệu bền vững nằm trong volume/bind mount/external service có backup.
+- Container có label `service`, `version`, `owner` hoặc metadata tương đương để cleanup/trace.
+- Rollout tạo replacement và có cách rollback rõ.
+- `docker restart` chỉ dùng để restart process, không dùng để deploy thay đổi.
+- Break-glass `exec` được ghi nhận và container drifted được recreate sau incident.
+- `--read-only`/tmpfs được đánh giá cho workload phù hợp.
+
+## Troubleshooting
+
+### Container mới mất file sau recreate
+
+Kiểm tra file có nằm trong writable layer hay volume:
+
+```bash
+docker container inspect CONTAINER --format '{{json .Mounts}}'
+docker container diff CONTAINER
+```
+
+Nếu file quan trọng chỉ xuất hiện trong `diff`, sửa image hoặc mount path bền vững rồi phục hồi từ backup nếu có.
+
+### Restart vẫn chạy version cũ
+
+So sánh image ID của container với tag hiện tại:
+
+```bash
+docker container inspect api --format 'container-image-id={{.Image}} ref={{.Config.Image}}'
+docker image inspect registry.example.com/api:stable --format 'tag-image-id={{.Id}}'
+```
+
+Nếu khác nhau, recreate container từ image mong muốn. Nếu giống nhau nhưng behavior khác mong đợi, kiểm tra config/runtime state.
+
+### Bật `--read-only` làm app lỗi
+
+Đọc log lỗi permission/path, rồi cấp writable path cụ thể:
+
+```bash
+docker container logs --tail 200 api
+docker container inspect api --format '{{json .Mounts}}'
+```
+
+Dùng `tmpfs` cho file tạm không cần bền vững, volume cho state cần giữ, và sửa application để không ghi vào path thuộc image.
+
+## Nguồn chính thức
+
+- [docker container run](https://docs.docker.com/reference/cli/docker/container/run/)
+- [docker container diff](https://docs.docker.com/reference/cli/docker/container/diff/)
+- [docker image inspect](https://docs.docker.com/reference/cli/docker/image/inspect/)
+- [Docker storage](/docs/storage/)

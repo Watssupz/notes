@@ -1,0 +1,177 @@
+---
+title: "Docker Hub"
+description: "Sử dụng Docker Hub đúng cách với namespace, repository, trusted content, access token, giới hạn pull và policy phát hành image."
+---
+
+Docker Hub là managed registry mặc định của Docker CLI. Khi chạy `docker pull alpine` mà không ghi registry host, Docker resolve reference tương đương `docker.io/library/alpine:latest`.
+
+Hub phù hợp để dùng Docker Official Images, phân phối public image và lưu private image theo entitlement của tài khoản. Đây vẫn là external dependency: production cần quản lý credential, rate limit, availability, retention và provenance như với mọi registry khác.
+
+## Namespace và repository
+
+| Reference | Namespace | Repository | Tag |
+|---|---|---|---|
+| `alpine:3.23` | `library` | `alpine` | `3.23` |
+| `exampleorg/payments-api:1.4.2` | `exampleorg` | `payments-api` | `1.4.2` |
+| `docker.io/exampleuser/demo:dev` | `exampleuser` | `demo` | `dev` |
+
+Namespace có thể thuộc user hoặc organization. Repository có visibility public/private và chứa nhiều tag. Phân quyền, số private repository, token dành cho organization và tính năng policy phụ thuộc plan hiện hành; kiểm tra tài liệu/console thay vì hard-code giả định vào runbook.
+
+## Chọn image đáng tin cậy
+
+Docker Hub phân biệt một số nhóm **trusted content**:
+
+| Nhóm | Ý nghĩa thực tế |
+|---|---|
+| Docker Official Images | Repository được tuyển chọn cho base image và phần mềm phổ biến |
+| Docker Hardened Images | Image/chart tối giản, có security metadata theo sản phẩm Docker |
+| Verified Publisher | Publisher thương mại đã được Docker xác minh |
+| Docker-Sponsored OSS | Dự án mã nguồn mở được chương trình của Docker hỗ trợ |
+
+Badge giúp sàng lọc publisher nhưng không thay thế review kỹ thuật. Trước khi dùng base image:
+
+- đọc mô tả tag và Dockerfile nguồn nếu được công bố;
+- chọn đúng variant, libc và distribution release;
+- kiểm tra update cadence và security policy;
+- scan artifact trong pipeline của bạn;
+- pin digest khi cần reproducibility;
+- có quy trình cập nhật digest để nhận security fix.
+
+<Callout type="warn" title="Badge không phải approval tự động">
+  Publisher được xác minh không có nghĩa mọi tag phù hợp threat model của bạn. Policy production vẫn phải kiểm tra digest, vulnerability, license, provenance và cấu hình runtime.
+</Callout>
+
+## Tag trên Docker Hub
+
+Nhiều tag có thể trỏ cùng manifest. Ví dụ tag theo version, codename và variant có thể là alias của cùng content. `latest` chỉ là tag mặc định do publisher chọn, không phải Docker tự tìm image mới nhất.
+
+Inspect remote tag:
+
+```bash
+docker buildx imagetools inspect docker.io/library/alpine:3.23
+```
+
+Pull và xem repo digest local biết:
+
+```bash
+docker pull docker.io/library/alpine:3.23
+docker image inspect docker.io/library/alpine:3.23 \
+  --format '{{json .RepoDigests}}'
+```
+
+Trong automation, dùng full reference và ghi lại digest. Xem giải thích chi tiết tại [Image name, tag và digest](/docs/registry-va-distribution/image-names-tags-digests/).
+
+## Authentication và access token
+
+`docker login` không tham số dùng device-code flow cho Docker Hub trong Docker CLI hiện hành. Khi cần username rõ ràng hoặc chạy CI, dùng token thay password account:
+
+```bash
+printf '%s' "$DOCKERHUB_TOKEN" | \
+  docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+```
+
+- Dùng Personal Access Token (PAT) cho automation cá nhân có phạm vi phù hợp.
+- Với automation cấp organization, ưu tiên token/service identity không gắn lifecycle vào một nhân viên nếu plan hỗ trợ.
+- Đặt expiration, scope tối thiểu và quy trình rotate/revoke.
+- Không ghi token vào command argument, image layer, log hoặc repository.
+- Sau job trên runner dùng chung, chạy `docker logout` và xóa workspace secret theo cơ chế CI.
+
+Credential local nên nằm trong OS keychain qua credential store/helper, không chỉ base64 trong `~/.docker/config.json`.
+
+## Pull limits và fair use
+
+Docker Hub áp dụng pull usage limit theo loại tài khoản và có abuse rate limit riêng. Giá trị có thể thay đổi theo chính sách dịch vụ, vì vậy runbook production nên trỏ tới trang usage hiện hành thay vì đóng đinh một con số lâu dài.
+
+Dấu hiệu thường gặp:
+
+```text
+429 Too Many Requests
+```
+
+Phân biệt:
+
+- **pull rate limit**: thông báo thường giải thích giới hạn pull và dẫn tới tài liệu;
+- **abuse limit**: response `429` ngắn hơn và có thể áp dụng cho nhiều loại request.
+
+Giảm rủi ro bằng cách:
+
+1. authenticate mọi production pull bằng identity phù hợp;
+2. tránh node ephemeral pull lại cùng tag không cần thiết;
+3. dùng registry mirror/pull-through cache khi đúng use case;
+4. mirror các base image đã approve vào private registry;
+5. theo dõi `429`, latency và egress;
+6. không giả định mirror loại bỏ fair-use policy upstream.
+
+## Publish một image
+
+Giả sử đã tạo repository `exampleorg/hello` và đăng nhập:
+
+```bash
+cat > Dockerfile <<'EOF'
+FROM alpine:3.23
+CMD ["echo", "hello from Docker Hub"]
+EOF
+
+docker build --tag exampleorg/hello:0.1.0 .
+docker push exampleorg/hello:0.1.0
+```
+
+Thay `exampleorg` bằng namespace bạn kiểm soát. Ghi digest từ output push, rồi inspect remote artifact:
+
+```bash
+docker buildx imagetools inspect exampleorg/hello:0.1.0
+```
+
+Xóa image local và pull lại để kiểm tra đường phân phối thực:
+
+```bash
+docker image rm exampleorg/hello:0.1.0
+docker pull exampleorg/hello:0.1.0
+docker run --rm exampleorg/hello:0.1.0
+```
+
+Expected output:
+
+```text
+hello from Docker Hub
+```
+
+Cleanup local:
+
+```bash
+docker image rm exampleorg/hello:0.1.0
+rm Dockerfile
+```
+
+Xóa local image không xóa tag trên Hub. Chỉ xóa remote tag qua Hub/API nếu repository này thực sự là lab và retention policy cho phép.
+
+## Policy repository nên có
+
+- Exact release tag như `1.4.2` không được overwrite.
+- Moving tag như `stable` chỉ cập nhật sau approval.
+- Push permission chỉ dành cho trusted CI/release role.
+- Pull credential tách khỏi push/delete credential.
+- Tag/digest đang được deploy hoặc còn trong rollback window không bị retention xóa.
+- Mỗi release lưu source revision, SBOM, provenance và kết quả scan.
+- Webhook/integration không được nhận secret rộng hơn nhu cầu.
+
+## Khi không nên pull thẳng từ Hub ở production
+
+Mirror artifact sang registry nội bộ khi cần:
+
+- air-gapped hoặc kiểm soát egress;
+- deployment chỉ được phép truy cập private network;
+- approval theo digest trước khi artifact vào môi trường;
+- retention độc lập với upstream tag;
+- RTO/SLA không chấp nhận phụ thuộc trực tiếp external registry;
+- policy IAM/audit thống nhất với cloud platform.
+
+Mirror phải giữ đúng digest/metadata intended và không rebuild image dưới cùng tag. Một bản sao nội bộ không tự làm image an toàn hơn; nó chỉ tạo điểm kiểm soát và availability khác.
+
+## Nguồn chính thức
+
+- [Docker Hub](https://docs.docker.com/docker-hub/)
+- [Trusted content](https://docs.docker.com/docker-hub/image-library/trusted-content/)
+- [Tags on Docker Hub](https://docs.docker.com/docker-hub/repos/manage/hub-images/tags/)
+- [Personal access tokens](https://docs.docker.com/security/for-developers/access-tokens/)
+- [Docker Hub usage and limits](https://docs.docker.com/docker-hub/usage/)

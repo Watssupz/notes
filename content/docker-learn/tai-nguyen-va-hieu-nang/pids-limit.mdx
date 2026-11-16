@@ -1,0 +1,214 @@
+---
+title: "PID limits"
+description: "Giới hạn số process và thread trong container bằng PIDs cgroup, phân biệt với PID namespace và RLIMIT_NPROC, quan sát pids.events và sizing an toàn."
+---
+
+`--pids-limit` giới hạn số **tasks** trong cgroup của container. Control này giảm blast radius của fork bomb, process leak hoặc thread explosion, nhưng limit quá thấp cũng làm web server, JVM, database và test runner không tạo được worker hợp lệ.
+
+PID namespace và PIDs cgroup giải quyết hai việc khác nhau:
+
+- **PID namespace** giới hạn process tree mà container nhìn thấy và cung cấp PID 1 riêng;
+- **PIDs cgroup** giới hạn số task mà nhóm process được tạo.
+
+Container có PID namespace riêng vẫn có thể làm cạn PID/task capacity của host nếu không có limit phù hợp.
+
+## Task, process và thread
+
+Linux kernel account thread như task. Cột `PIDS` của `docker stats` có thể lớn hơn số dòng `ps` mặc định vì application tạo nhiều threads/lightweight processes.
+
+```bash
+docker stats --no-stream CONTAINER
+docker top CONTAINER -eo pid,ppid,nlwp,comm
+```
+
+`NLWP` là số lightweight processes/threads của mỗi process trên Linux. Tool và option có thể khác theo host.
+
+<Callout type="info" title="PIDS không chỉ là process nhìn thấy trong ps">
+  Một JVM có một process nhưng hàng chục hoặc hàng trăm threads vẫn tiêu thụ PIDs cgroup budget. Sizing theo process count từ `ps` mà bỏ threads dễ tạo lỗi production.
+</Callout>
+
+## Đặt và xác minh limit
+
+```bash
+docker run --detach \
+  --name pids-baseline \
+  --pids-limit 128 \
+  alpine:3.23 sleep 600
+```
+
+Inspect:
+
+```bash
+docker inspect pids-baseline --format 'PidsLimit={{.HostConfig.PidsLimit}}'
+```
+
+Trên cgroup v2:
+
+```bash
+docker exec pids-baseline sh -c '
+  echo "current=$(cat /sys/fs/cgroup/pids.current)"
+  echo "max=$(cat /sys/fs/cgroup/pids.max)"
+  echo "events:"; cat /sys/fs/cgroup/pids.events
+'
+```
+
+Cleanup:
+
+```bash
+docker rm --force pids-baseline
+```
+
+`--pids-limit -1` nghĩa là không đặt limit ở container level, nhưng ancestor cgroup và host vẫn có boundary.
+
+## Lab chạm limit có kiểm soát
+
+Lab dùng vòng lặp có upper bound `100`, không phải fork bomb vô hạn. Python giữ child `sleep` sống để số task tăng, bắt lỗi rồi cleanup:
+
+```bash
+docker run --name pids-pressure --pids-limit 32 \
+  python:3.13-alpine python -c '
+import subprocess
+children = []
+try:
+    for i in range(100):
+        children.append(subprocess.Popen(["sleep", "30"]))
+        print("started", i + 1, flush=True)
+except OSError as error:
+    print(type(error).__name__, error, flush=True)
+finally:
+    for child in children:
+        child.terminate()
+    for child in children:
+        child.wait()
+'
+```
+
+Expected: creation fail trước 100 child, thường với lỗi tương tự `Resource temporarily unavailable`. Số child chính xác không phải `32` vì parent process và task/runtime khác cũng dùng budget.
+
+Container đã dừng; xem log/state:
+
+```bash
+docker logs pids-pressure
+docker inspect pids-pressure --format \
+  'status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}'
+```
+
+Cleanup:
+
+```bash
+docker rm pids-pressure
+```
+
+## Đọc `pids.events`
+
+Trên cgroup v2, `pids.events` thường có counter `max`, tăng khi một lần tạo task bị từ chối do chạm limit. Counter tích lũy cần được scrape khi cgroup còn tồn tại.
+
+```text
+max 4
+```
+
+Đọc delta theo cửa sổ thời gian. Nếu `pids.current` thường xuyên gần `pids.max` nhưng `max` chưa tăng, vẫn cần alert headroom trước khi request tiếp theo thất bại.
+
+Sau khi container bị xóa, cgroup có thể biến mất. Production collector phải thu metric liên tục thay vì chờ incident rồi mới đọc.
+
+## PIDs cgroup và `ulimit nproc`
+
+| Cơ chế | Scope | Account theo | Dùng cho |
+|---|---|---|---|
+| `--pids-limit` | Cgroup/hierarchy | Tasks trong cgroup | Boundary container đáng tin cậy hơn |
+| `--ulimit nproc` | Process rlimit, theo real user ID semantics | Process của user | Hạn chế theo user, có caveat chia sẻ UID |
+| Host `pid_max`/systemd TasksMax | Host/ancestor | Toàn hệ thống hoặc service slice | Boundary cấp host/service |
+
+Docker docs cảnh báo `nproc` giới hạn theo user, không theo container. Nhiều container dùng cùng UID phía host có thể ảnh hưởng nhau. Không dùng `--ulimit nproc` như thay thế hoàn toàn `--pids-limit`.
+
+Đọc chi tiết tại [ulimits](/docs/tai-nguyen-va-hieu-nang/ulimits/).
+
+## `--init` và zombie process
+
+PIDs limit không tự reap zombie. Nếu PID 1 không xử lý child exit, zombie có thể tích tụ và chiếm task/process-table resources. Dùng entrypoint đúng signal/reaping hoặc Docker init:
+
+```bash
+docker run --detach \
+  --name pids-init \
+  --init \
+  --pids-limit 128 \
+  IMAGE
+```
+
+`--init` cũng dùng một task trong budget. Đây không phải lý do bỏ limit; hãy tính overhead khi sizing.
+
+Đọc [Process trong container](/docs/container-lifecycle/processes-and-top/) để hiểu PID 1 và reaping.
+
+## Compose
+
+```yaml
+services:
+  api:
+    image: example/api:1.4.2
+    init: true
+    pids_limit: 256
+```
+
+Validate effective value:
+
+```bash
+docker compose config
+docker compose up --detach
+docker compose ps --quiet api | xargs docker inspect --format \
+  'PidsLimit={{.HostConfig.PidsLimit}} Init={{.HostConfig.Init}}'
+```
+
+Nếu dùng orchestrator hoặc `deploy.resources`, kiểm tra schema và effective runtime vì field/support có thể khác standalone Compose.
+
+## Sizing PID limit
+
+1. Đo process/thread count ở startup, steady state và peak concurrency.
+2. Tính worker pool, GC/runtime threads, healthcheck/exec và child subprocess hợp lệ.
+3. Test retry storm, rolling reload và graceful shutdown overlap.
+4. Đặt headroom nhưng vẫn thấp hơn mức có thể làm host cạn task.
+5. Alert `pids.current / pids.max` và `pids.events:max` delta.
+6. Theo dõi host PID/task capacity và parent cgroup.
+
+Với runtime tạo thread theo CPU count, CPU visibility và quota có thể ảnh hưởng số thread mặc định. Cấu hình thread pool explicit khi cần predictable budget.
+
+## Troubleshooting lỗi tạo process/thread
+
+Triệu chứng thường gặp:
+
+- `fork: Resource temporarily unavailable`;
+- `pthread_create failed`;
+- `can't start new thread`;
+- worker không spawn;
+- healthcheck/`docker exec` thất bại vì không tạo được process mới.
+
+Thu evidence:
+
+```bash
+docker stats --no-stream CONTAINER
+docker inspect CONTAINER --format 'PidsLimit={{.HostConfig.PidsLimit}}'
+docker top CONTAINER -eo pid,ppid,nlwp,stat,comm
+docker exec CONTAINER sh -c '
+  cat /sys/fs/cgroup/pids.current 2>/dev/null
+  cat /sys/fs/cgroup/pids.max 2>/dev/null
+  cat /sys/fs/cgroup/pids.events 2>/dev/null
+  ulimit -u 2>/dev/null || true
+'
+```
+
+Nếu `docker exec` cũng không khởi tạo được do limit, đọc cgroup từ host bằng PID 1/container ID hoặc dùng monitoring đã có. Không restart/xóa trước khi capture process/thread evidence nếu incident policy cho phép.
+
+## Anti-pattern
+
+- Đặt limit bằng số process, bỏ qua threads.
+- Dùng `nproc` rồi gọi đó là container-wide PID limit.
+- Đặt `--pids-limit -1` cho workload không tin cậy.
+- Tăng limit ngay khi lỗi mà không tìm thread/process leak.
+- Không dùng init/reaping đúng, để zombie tích tụ.
+- Chỉ theo dõi current count mà không thu failed-allocation event.
+
+## Nguồn chính thức
+
+- [`docker container run --pids-limit`](https://docs.docker.com/reference/cli/docker/container/run/)
+- [`docker container stats` và cột PIDS](https://docs.docker.com/reference/cli/docker/container/stats/)
+- [Cgroup v2 PIDs controller](https://docs.kernel.org/admin-guide/cgroup-v2.html#pid)
+- [PID namespaces](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html)

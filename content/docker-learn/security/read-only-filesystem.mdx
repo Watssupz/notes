@@ -1,0 +1,186 @@
+---
+title: "Read-only filesystem"
+description: "Chạy container với root filesystem chỉ đọc, cấp writable path tối thiểu qua tmpfs hoặc volume và kiểm tra drift trước production."
+---
+
+`--read-only` mount root filesystem của container ở chế độ chỉ đọc. Process không thể ghi vào writable layer thông thường, giúp giảm persistence sau compromise và làm lộ sớm application đang ghi state sai vị trí.
+
+Read-only root không có nghĩa toàn container không ghi được. Application thường vẫn cần `/tmp`, `/run`, cache, socket hoặc data directory; hãy cấp từng path bằng tmpfs hoặc volume.
+
+```text
+Image/root filesystem   read-only
+/tmp, /run              tmpfs, ephemeral
+/var/lib/app            volume, persistent
+/config, /run/secrets   read-only mounts
+```
+
+## Chọn loại writable path
+
+| Dữ liệu | Cơ chế | Ví dụ option |
+|---|---|---|
+| Temp/cache không cần giữ | tmpfs | `--tmpfs /tmp:rw,noexec,nosuid,size=64m` |
+| PID/socket runtime | tmpfs | `--tmpfs /run:rw,noexec,nosuid,size=16m` |
+| Data cần persist | Named volume | `--mount type=volume,src=app-data,dst=/var/lib/app` |
+| Config host cấp | Read-only bind | `--mount type=bind,src=...,dst=/etc/app,readonly` |
+| Secret | Secret file/mount | `/run/secrets/...` |
+
+`noexec` giảm khả năng thực thi trực tiếp từ mount nhưng interpreter vẫn có thể đọc script; `nosuid` không thay `no-new-privileges`. Size limit cho tmpfs tránh dùng hết memory host.
+
+## Lab: kiểm tra read-only root
+
+```bash
+docker run --detach \
+  --name readonly-demo \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+  --cap-drop ALL \
+  --security-opt no-new-privileges=true \
+  alpine:3.23 sleep 300
+```
+
+Ghi root phải fail:
+
+```bash
+docker exec readonly-demo sh -c 'touch /should-fail'
+```
+
+Ghi tmpfs phải thành công:
+
+```bash
+docker exec readonly-demo sh -c 'echo ok >/tmp/result && cat /tmp/result'
+docker inspect readonly-demo --format 'readonly={{.HostConfig.ReadonlyRootfs}} tmpfs={{json .HostConfig.Tmpfs}}'
+```
+
+Cleanup:
+
+```bash
+docker rm --force readonly-demo
+```
+
+## Tìm path application đang ghi
+
+Trước khi bật read-only, chạy workload đại diện rồi xem writable layer:
+
+```bash
+docker diff CONTAINER
+```
+
+Prefix:
+
+- `A`: path được thêm;
+- `C`: path thay đổi;
+- `D`: path bị xóa.
+
+Phân loại từng path:
+
+1. file thuộc image nhưng app sửa: chuyển thay đổi vào build/config;
+2. temp/cache: tmpfs có size/option;
+3. persistent business data: volume hoặc external service;
+4. log: stdout/stderr hoặc logging pipeline;
+5. secret/token generated: secret manager/credential lifecycle phù hợp.
+
+`docker diff` chỉ thấy writable layer, không phải thay đổi trong mounted volume. Kết hợp application docs, syscall/file telemetry và mount inventory.
+
+## Compose baseline
+
+```yaml
+services:
+  api:
+    image: registry.example.com/team/api@sha256:REPLACE_WITH_DIGEST
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+      - /run:rw,noexec,nosuid,size=16m
+    volumes:
+      - app-data:/var/lib/app
+
+volumes:
+  app-data:
+```
+
+Xác minh rendered model và container:
+
+```bash
+docker compose config
+docker compose up --detach
+cid="$(docker compose ps -q api)"
+docker inspect "$cid" --format 'readonly={{.HostConfig.ReadonlyRootfs}}'
+```
+
+Không dùng volume cho mọi path app muốn ghi vì sẽ che file có sẵn trong image và biến drift thành state bền vững khó quản lý.
+
+## Log, certificate và package manager
+
+- Application nên log ra stdout/stderr; ghi `/var/log` đòi writable path và rotation riêng.
+- TLS certificate/runtime config nên được mount read-only; rotation có thể cần atomic replacement phía host/platform và app reload.
+- Package install khi container start trái với immutable workflow và sẽ fail trên read-only root. Cài dependency khi build image.
+- Debug bằng `apt install`/`apk add` trong production sẽ fail; dùng debug toolbox/image riêng.
+
+## Read-only bind mount
+
+Config host:
+
+```bash
+docker run --rm \
+  --mount type=bind,src="$PWD/config",dst=/etc/example,readonly \
+  IMAGE COMMAND
+```
+
+`readonly` ngăn ghi qua mount đó nhưng không bảo vệ source khỏi host user/daemon khác. Với SELinux, label vẫn phải đúng; với secret, file host vẫn cần permission và lifecycle an toàn.
+
+## Những gì control này không ngăn
+
+- ghi vào volume/tmpfs được cấp;
+- gửi dữ liệu ra network;
+- sửa database/object storage bằng credential hợp lệ;
+- khai thác kernel/runtime;
+- đọc file/secret đã mount;
+- sử dụng Docker socket nếu bị cấp;
+- persistence ngoài filesystem như cron/API/cloud resource nếu workload có quyền.
+
+Kết hợp non-root, capability drop, seccomp, LSM, egress control và short-lived identity.
+
+## Rollout an toàn
+
+1. Quan sát file write trong test dưới traffic đại diện.
+2. Phân loại state và sửa image/application.
+3. Bật read-only ở integration test.
+4. Test startup, healthcheck, reload, rotation, backup, shutdown và error path.
+5. Canary một phần workload; alert `EROFS`/permission errors.
+6. Xác minh volume/tmpfs không tăng không giới hạn.
+7. Enforce trong deployment policy và kiểm tra override.
+
+## Troubleshooting
+
+### `Read-only file system`
+
+```bash
+docker logs --tail 200 CONTAINER
+docker inspect CONTAINER --format '{{json .Mounts}}'
+docker inspect CONTAINER --format '{{json .HostConfig.Tmpfs}}'
+```
+
+Không tắt `read_only` ngay. Xác định path là temp, persistent hay artifact/config rồi cấp cơ chế đúng.
+
+### Application non-root không ghi được volume
+
+Kiểm tra UID/GID và ownership:
+
+```bash
+docker exec CONTAINER id
+docker exec CONTAINER stat -c '%u:%g %a %n' /var/lib/app
+```
+
+Sửa ownership khi build/provision volume, không chuyển app về root hoặc `chmod 777`.
+
+## Nguồn chính thức
+
+- [`docker container run --read-only`](https://docs.docker.com/reference/cli/docker/container/run/#read-only)
+- [Compose `read_only`](https://docs.docker.com/reference/compose-file/services/#read_only)
+- [Immutable containers](/docs/container-lifecycle/immutable-containers/)
+- [Storage và dữ liệu](/docs/storage/)

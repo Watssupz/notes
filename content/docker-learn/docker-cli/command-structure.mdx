@@ -1,0 +1,279 @@
+---
+title: "Cấu trúc Docker command"
+description: "Đọc chính xác cú pháp docker OBJECT COMMAND, phân biệt global option, command option, positional argument và command chạy trong container để viết lệnh dễ kiểm tra và tự động hóa."
+---
+
+Một Docker command thường có cấu trúc:
+
+```text
+docker [GLOBAL OPTIONS] OBJECT OPERATION [COMMAND OPTIONS] [ARGUMENTS]
+```
+
+Ví dụ:
+
+```bash
+docker --context staging container run --detach --name web nginx:alpine
+```
+
+| Thành phần | Giá trị | Vai trò |
+|---|---|---|
+| Executable | `docker` | Chạy Docker CLI |
+| Global option | `--context staging` | Chọn daemon cho toàn command |
+| Object | `container` | Nhóm resource cần quản lý |
+| Operation | `run` | Hành động trên object |
+| Command option | `--detach --name web` | Điều chỉnh behavior của `container run` |
+| Positional argument | `nginx:alpine` | Image dùng để tạo container |
+
+Cú pháp thực tế của từng command là contract chính xác nhất. Đọc contract ngay trên client đang dùng:
+
+```bash
+docker --help
+docker container --help
+docker container run --help
+```
+
+## Management command và alias
+
+Hai command sau thường tương đương:
+
+```bash
+docker container ls
+docker ps
+```
+
+Dạng object-oriented giúp code review dễ hơn vì object hiện rõ:
+
+```bash
+docker image rm app:old
+docker container rm app-old
+docker network inspect frontend
+```
+
+Alias top-level không sai, nhưng không phải operation nào cũng có alias. Script nên chọn một style nhất quán; tài liệu này ưu tiên `docker <object> <operation>` khi câu lệnh không quá dài.
+
+## Global option phải đứng trước subcommand
+
+Global option cấu hình chính CLI, ví dụ `--context`, `--host`, `--config`, `--debug` và TLS flags:
+
+```bash
+docker --context production container ls
+docker --config "$HOME/.docker-ci" image ls
+```
+
+Command option thuộc operation cụ thể:
+
+```bash
+docker container ls --all --filter 'status=exited'
+docker image pull --platform linux/amd64 alpine:latest
+```
+
+Không suy luận option của command này dùng được cho command khác. Kiểm tra help ở đúng cấp:
+
+```bash
+docker container ls --help
+docker image ls --help
+```
+
+Nếu đặt global option sau subcommand, parser có thể báo `unknown flag` vì subcommand không sở hữu option đó.
+
+## Short flag, long flag và Boolean
+
+Một số short flag có thể ghép:
+
+```bash
+docker container run -it --rm alpine sh
+```
+
+`-it` tương đương `-i -t`: giữ STDIN mở và cấp pseudo-TTY. Chỉ ghép short flag khi mỗi flag thực sự hỗ trợ dạng ngắn.
+
+Boolean flag xuất hiện không kèm value thường đặt giá trị thành `true`:
+
+```bash
+docker container run --detach nginx:alpine
+```
+
+Muốn đặt `false` cho option có default `true`, truyền tường minh theo help, ví dụ:
+
+```bash
+docker image build --rm=false .
+```
+
+Không dùng `--flag false` theo thói quen từ tool khác nếu help/documentation yêu cầu `--flag=false`; token `false` có thể bị hiểu là positional argument.
+
+## Option lặp lại và value phức hợp
+
+Một số option nhận nhiều value bằng cách lặp flag:
+
+```bash
+docker container run --rm \
+  --env APP_ENV=dev \
+  --env LOG_LEVEL=debug \
+  --publish 127.0.0.1:8080:80 \
+  nginx:alpine
+```
+
+Một số value có syntax riêng như `--mount`, `--publish`, `--add-host`. Đừng tách hoặc quote tùy ý:
+
+```bash
+docker container run --rm \
+  --mount 'type=bind,src=/srv/app,dst=/app,readonly' \
+  alpine:latest ls -la /app
+```
+
+Với path chứa space hoặc shell metacharacter, quote ở shell để toàn value đến CLI như một argument. Docker không thể khôi phục token đã bị shell tách trước đó.
+
+## Boundary quan trọng của `docker run`
+
+Cú pháp rút gọn:
+
+```text
+docker container run [OPTIONS] IMAGE [COMMAND] [ARG...]
+```
+
+Mọi token trước `IMAGE` được Docker CLI parse như option của `run`; token sau `IMAGE` là command và argument trong container.
+
+```bash
+docker container run --rm alpine:latest echo --help
+```
+
+Ở đây `--rm` thuộc Docker, còn `--help` được truyền cho `echo` trong image. Ví dụ ngược lại:
+
+```bash
+docker container run --help
+```
+
+`--help` thuộc Docker CLI vì chưa có `IMAGE`.
+
+<Callout type="warn" title="Đặt option Docker trước image">
+  `docker run nginx:alpine --name web` không đặt tên container. Sau image, `--name web` trở thành argument của process trong container và có thể làm application báo lỗi.
+</Callout>
+
+`docker exec` có boundary tương tự:
+
+```text
+docker container exec [OPTIONS] CONTAINER COMMAND [ARG...]
+```
+
+```bash
+docker container exec --user 0 web id --user
+```
+
+`--user 0` thuộc Docker; `id --user` chạy trong container.
+
+## Shell expansion xảy ra trước Docker
+
+Shell xử lý variable, glob, quote, pipe và redirect trước khi khởi chạy CLI:
+
+```bash
+name='cli demo'
+docker container run --rm alpine:latest printf '%s\n' "$name"
+```
+
+Quote giữ `cli demo` thành một argument. Không quote sẽ thành hai argument.
+
+Redirect sau đây ghi file trên host chạy CLI, không phải trong container:
+
+```bash
+docker container logs web > web.log
+```
+
+Muốn redirect bên trong container, cần shell trong container:
+
+```bash
+docker container run --rm alpine:latest \
+  sh -c 'printf "%s\n" hello > /tmp/message && cat /tmp/message'
+```
+
+Chỉ dùng `sh -c` khi cần shell feature. Với input không tin cậy, ghép string vào `sh -c` có nguy cơ command injection; ưu tiên truyền argument trực tiếp.
+
+## `--` để kết thúc option parsing
+
+Nhiều Unix CLI dùng `--` để đánh dấu hết option. Mức hỗ trợ phụ thuộc command và parser cụ thể, nên đọc `--help` trước khi dựa vào behavior này. Cách chắc chắn hơn với Docker object là dùng ID đầy đủ hoặc tránh tên bắt đầu bằng `-`.
+
+Ví dụ xóa container theo ID lấy từ exact filter:
+
+```bash
+id=$(docker container ls --all \
+  --filter 'name=^/cli-lab$' \
+  --format '{{.ID}}')
+
+[ -n "$id" ] && docker container rm "$id"
+```
+
+Filter `name` và regular expression phải được xác minh theo reference của command; không áp syntax filter này cho mọi object.
+
+## Help, version và capability detection
+
+Không detect feature bằng cách parse marketing version nếu có thể kiểm tra command trực tiếp:
+
+```bash
+docker buildx version
+docker compose version
+docker container run --help | grep -- '--health-start-interval'
+```
+
+Để xem Client/Server và API:
+
+```bash
+docker version
+docker version --format '{{json .}}'
+```
+
+Một client mới có thể kết nối daemon cũ qua API negotiation, nhưng feature mới vẫn không khả dụng nếu server không hỗ trợ. Plugin như Compose và Buildx có version/lifecycle riêng với core CLI.
+
+## Exit code, stdout và stderr
+
+Script cần xử lý ba channel:
+
+- **exit status** cho biết command thành công hay thất bại;
+- **stdout** chứa dữ liệu chính, phù hợp redirect/pipe;
+- **stderr** chứa warning, progress hoặc diagnostic tùy command.
+
+Ví dụ guard:
+
+```bash
+if ! output=$(docker --context "$TARGET_CONTEXT" container ls \
+  --format '{{.ID}}\t{{.Names}}'); then
+  echo 'Không thể liệt kê container' >&2
+  exit 1
+fi
+
+if [ -z "$output" ]; then
+  echo 'Không có container nào khớp' >&2
+fi
+```
+
+Với `docker container run`, khi container chạy foreground, exit code của CLI thường phản ánh kết quả tạo/chạy và exit status của process theo contract của command. Các mã đặc biệt và signal cần được đọc cùng trang [Exit codes](/docs/container-lifecycle/exit-codes/), không hard-code từ suy đoán.
+
+## Pattern command dễ review
+
+Với command dài, mỗi option một dòng và đặt argument chính ở cuối:
+
+```bash
+docker --context "$TARGET_CONTEXT" container run \
+  --detach \
+  --name web \
+  --label com.example.owner=platform \
+  --publish 127.0.0.1:8080:80 \
+  --read-only \
+  nginx:alpine
+```
+
+Cấu trúc này làm rõ target, object, side effect và image. Trước khi chạy, review published address, mount, privilege/capability, secret, restart policy và cleanup plan.
+
+## Lỗi thường gặp
+
+| Triệu chứng | Nguyên nhân thường gặp | Cách kiểm tra |
+|---|---|---|
+| `unknown flag` | Option đặt sai cấp hoặc client quá cũ | Đọc `--help` ở đúng subcommand và `docker version` |
+| Application báo unknown option | Docker option đặt sau `IMAGE`/`COMMAND` | Xác định lại boundary positional argument |
+| Path bị tách | Thiếu shell quoting | Dùng `printf '<%s>\n'` để kiểm tra argument ở lab |
+| Command chạy nhầm daemon | Dựa vào active context hoặc env còn sót | `docker context show`; kiểm tra `DOCKER_HOST`, `DOCKER_CONTEXT` |
+| Script parse sai output | Parse cột table mặc định | Dùng `--format` hoặc JSON |
+| Empty result vẫn được coi là thành công | Chỉ kiểm tra exit code | Kiểm tra cả output/cardinality |
+
+## Nguồn chính thức
+
+- [Docker CLI base command](https://docs.docker.com/reference/cli/docker/)
+- [docker container run](https://docs.docker.com/reference/cli/docker/container/run/)
+- [Docker CLI filter](https://docs.docker.com/engine/cli/filter/)

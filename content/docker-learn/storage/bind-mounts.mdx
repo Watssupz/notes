@@ -1,0 +1,180 @@
+---
+title: "Bind mounts"
+description: "Dùng host path trong container một cách có chủ đích, hiểu host coupling, read-only mode, path resolution, SELinux và mount propagation."
+---
+
+Bind mount ánh xạ trực tiếp một file hoặc directory trên Docker daemon host vào container. Docker không sở hữu lifecycle của host path đó; host process và container process có thể cùng tác động lên một dữ liệu.
+
+```text
+Host: /srv/app/config ───────> Container: /etc/app
+        operator/tool                  application
+```
+
+## Khi nào bind mount là lựa chọn đúng?
+
+- mount source code vào development container;
+- đưa config do host quản lý vào container;
+- xuất artifact từ container về một host path rõ ràng;
+- cho container đọc socket hoặc device đặc thù, sau khi đánh giá security boundary.
+
+Nếu dữ liệu chỉ do container dùng và cần persistence, [named volume](/docs/storage/volumes/) thường portable và dễ quản lý hơn.
+
+## Ba constraint cần nhớ
+
+### Source thuộc daemon host
+
+Bind source được resolve trên máy chạy Docker daemon, không phải máy chạy CLI. Với remote context, `/home/me/project` phải tồn tại trên remote host. Docker Desktop chạy daemon trong Linux VM và cung cấp cơ chế file sharing để bridge path từ host native.
+
+Kiểm tra context trước khi chẩn đoán sai host:
+
+```bash
+docker context show
+docker context inspect "$(docker context show)"
+```
+
+### Container phụ thuộc cấu trúc host
+
+Recreate container trên host khác sẽ thất bại hoặc đọc sai dữ liệu nếu path, permission hay nội dung không giống nhau. Hãy coi host path là một phần của deployment contract.
+
+### Mặc định là read-write
+
+Process trong container có thể sửa hoặc xóa file host. Config, source và certificate chỉ cần đọc nên mount `readonly`.
+
+<Callout type="warn" title="Bind mount mở rộng impact lên host">
+  Không mount các directory rộng như `/`, `/etc`, `/usr` hoặc Docker socket nếu workload không thực sự cần. `readonly` giảm quyền ghi nhưng không giảm dữ liệu container có thể đọc.
+</Callout>
+
+## `--mount` và `-v` xử lý source khác nhau
+
+Cú pháp rõ ràng:
+
+```bash
+docker run --mount type=bind,src=/absolute/host/path,dst=/container/path IMAGE
+```
+
+Cú pháp ngắn:
+
+```bash
+docker run -v /absolute/host/path:/container/path IMAGE
+```
+
+Khác biệt quan trọng khi source không tồn tại:
+
+- `--mount` mặc định báo lỗi;
+- `-v` tự tạo một **directory**, kể cả khi operator định mount file;
+- `--mount ... ,bind-create-src` yêu cầu rõ việc tạo source directory.
+
+Vì vậy `--mount` fail-fast an toàn hơn cho production scripts.
+
+## Lab: chia sẻ file và xác minh read-only
+
+```bash
+mkdir -p /tmp/bind-lab
+printf 'version=1\n' > /tmp/bind-lab/app.conf
+```
+
+Mount read-only:
+
+```bash
+docker run --name bind-reader \
+  --mount type=bind,src=/tmp/bind-lab,dst=/config,readonly \
+  alpine:3.22 sh -c '
+    cat /config/app.conf
+    ! printf changed > /config/app.conf
+  '
+```
+
+Expected: đọc được `version=1`; thao tác ghi báo `Read-only file system` và command tổng thể thành công nhờ `!`.
+
+Xác minh cấu hình mà daemon đã áp dụng:
+
+```bash
+docker inspect bind-reader \
+  --format '{{range .Mounts}}{{println .Type .Source .Destination .RW .Propagation}}{{end}}'
+```
+
+Expected fields gồm `bind`, hai path, `false` và thường là `rprivate`.
+
+## Mount che dữ liệu trong image
+
+Bind mount vào directory không rỗng che toàn bộ nội dung image tại target. Không thể unmount riêng từ lifecycle Docker thông thường để hiện file cũ; phải recreate container không có mount.
+
+Ví dụ mount directory rỗng vào web root làm default page biến mất:
+
+```bash
+mkdir -p /tmp/empty-webroot
+docker run --rm \
+  --mount type=bind,src=/tmp/empty-webroot,dst=/usr/share/nginx/html,readonly \
+  nginx:1.28-alpine \
+  sh -c 'test ! -e /usr/share/nginx/html/index.html && echo obscured'
+```
+
+Nếu application báo “missing file” ngay sau khi thêm mount, kiểm tra hiện tượng này trước khi sửa image.
+
+## Relative path và quoting
+
+Trên Linux/macOS shell, quote path để xử lý dấu cách:
+
+```bash
+docker run --rm \
+  --mount type=bind,src="$(pwd)",dst=/workspace,readonly \
+  alpine:3.22 ls /workspace
+```
+
+Relative source có thể phụ thuộc CLI/Compose và working directory. Trong automation, nên resolve thành absolute path hoặc dùng Compose project directory một cách rõ ràng.
+
+Windows path có colon và conversion rule riêng theo shell. Dùng `--mount` hoặc Compose long syntax để giảm ambiguity, rồi xác minh bằng `docker inspect`.
+
+## Permission, UID/GID và SELinux
+
+Bind mount giữ ownership và mode của host filesystem. Username trong container không quyết định quyền; kernel so numeric UID/GID sau khi tính user namespace mapping.
+
+Trên host dùng SELinux, label sai có thể gây `Permission denied` dù Unix mode có vẻ đúng. Với `-v`:
+
+- `:z` relabel cho nhiều container chia sẻ;
+- `:Z` relabel private cho một container.
+
+Các option này thay đổi label trên **host path**. Không áp dụng `:Z` lên system directory. Đọc [Permission và ownership](/docs/storage/permissions-and-ownership/) trước khi dùng.
+
+## Recursive mounts và propagation
+
+Bind source có submount sẽ include các submount theo mặc định. `bind-recursive` trên `--mount` điều khiển hành vi này; recursive read-only yêu cầu Linux kernel 5.12 trở lên.
+
+Mount propagation mặc định là `rprivate`. `shared`, `slave` và các biến thể recursive chỉ cần cho workload quản lý mount tree, ví dụ một số storage/system agent. Propagation:
+
+- chỉ cấu hình được cho bind mount trên Linux;
+- yêu cầu host mount point hỗ trợ;
+- không hoạt động trên Docker Desktop theo Docker documentation;
+- không nên đổi nếu chưa có use case và test cụ thể.
+
+## Bind mount trong Compose
+
+Long syntax làm intent rõ ràng:
+
+```yaml
+services:
+  app:
+    image: example/app:1.0
+    volumes:
+      - type: bind
+        source: ./config
+        target: /etc/app
+        read_only: true
+        bind:
+          create_host_path: false
+```
+
+`create_host_path: false` tránh Compose tự tạo directory khi source bị typo. Chạy `docker compose config` để xem path/config đã resolve.
+
+## Cleanup bài thực hành
+
+```bash
+docker rm bind-reader
+rm -rf /tmp/bind-lab /tmp/empty-webroot
+```
+
+## Nguồn chính thức
+
+- [Docker bind mounts](https://docs.docker.com/engine/storage/bind-mounts/)
+- [Bind mounts trong Compose](https://docs.docker.com/reference/compose-file/services/#volumes)
+- [Docker contexts](https://docs.docker.com/engine/manage-resources/contexts/)

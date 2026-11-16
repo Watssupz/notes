@@ -1,0 +1,236 @@
+---
+title: "FROM và base image"
+description: "Chọn base image theo trust, compatibility, kích thước và update policy; dùng tag, digest, scratch, ARG, stage name và platform đúng cách."
+---
+
+`FROM` bắt đầu một build stage và xác định filesystem/config ban đầu cho các instruction tiếp theo. Lựa chọn base image ảnh hưởng trực tiếp tới compatibility, số dependency, CVE surface, thời gian pull, cách debug và trách nhiệm cập nhật.
+
+```dockerfile
+FROM [--platform=<platform>] <image>[:<tag>] [AS <stage>]
+FROM [--platform=<platform>] <image>[@<digest>] [AS <stage>]
+```
+
+Dockerfile có thể có nhiều `FROM`; mỗi dòng tạo stage mới. `ARG` là instruction duy nhất có thể khai báo trước `FROM` để tham gia image reference.
+
+## Base image cung cấp gì
+
+Base image thường mang theo:
+
+- filesystem user space: libc, certificate, timezone data, shell/package manager nếu có;
+- user/group database và filesystem ownership;
+- default `ENV`, `WORKDIR`, `USER`, `CMD`, `ENTRYPOINT`, labels, exposed ports;
+- layers mà image con dùng lại;
+- platform metadata.
+
+Image con có thể override config nhưng vẫn kế thừa filesystem và metadata còn hiệu lực. Vì vậy, đọc Dockerfile của image con thôi chưa đủ; inspect final image và đọc tài liệu của publisher.
+
+## Chọn base theo bốn tiêu chí
+
+### Trust và provenance
+
+Ưu tiên nguồn có maintainer, release process, vulnerability response và documentation rõ ràng. Docker Official Images, Verified Publisher hoặc image do tổ chức tự xây từ pipeline kiểm soát được là điểm bắt đầu; badge không thay thế scanning, signature/provenance verification và policy nội bộ.
+
+Ghi đầy đủ registry khi tránh ambiguity:
+
+```dockerfile
+FROM docker.io/library/alpine:3.23
+```
+
+Với private mirror/registry, xác định ai sync content và reference có giữ cùng digest hay bị rebuild.
+
+### Runtime compatibility
+
+“Nhỏ nhất” không phải luôn “phù hợp nhất”. Kiểm tra:
+
+- `linux/amd64`, `linux/arm64`, Windows build và target host;
+- glibc so với musl cho native module/binary;
+- CA certificate, timezone, locale và DNS behavior;
+- shell/package manager mà entrypoint hoặc operational tooling cần;
+- UID/GID, filesystem path và dynamic library của artifact;
+- FIPS/vendor support nếu workload có yêu cầu compliance.
+
+Alpine nhỏ nhưng dùng musl; một binary hoặc native package chỉ test trên glibc có thể không chạy đúng. Debian/Ubuntu slim lớn hơn nhưng thường tương thích hệ sinh thái rộng hơn. Distroless/scratch giảm attack surface và tool thừa nhưng đòi hỏi artifact tự đủ dependency và chiến lược debug riêng.
+
+### Kích thước và attack surface
+
+Base nhỏ giảm bandwidth, startup pull time và số package cần scan, nhưng tổng size chỉ là một signal. Loại bỏ certificate hoặc runtime library cần thiết gây outage; thêm shell/debugger vào production chỉ để xử lý sự cố lại tăng attack surface. Có thể duy trì `debug` stage/image riêng thay vì đưa tool vào final image.
+
+### Lifecycle và update policy
+
+Chọn release line còn được upstream hỗ trợ. Định nghĩa rõ:
+
+- khi nào rebuild để nhận security fix;
+- tag nào được phép, digest nào được pin;
+- scanner/policy nào gate release;
+- ai review base update và rollback bằng digest nào.
+
+Image bất biến không có nghĩa dependency tự an toàn mãi; phải rebuild và redeploy.
+
+## Tag và digest giải quyết mục tiêu khác nhau
+
+Tag dễ đọc nhưng mutable:
+
+```dockerfile
+FROM alpine:3.23
+```
+
+Digest pin content:
+
+```dockerfile
+FROM alpine:3.23@sha256:<MANIFEST_OR_INDEX_DIGEST>
+```
+
+Giữ cả tag và digest giúp người đọc biết release line mong muốn trong khi builder lấy đúng content. Thay `<MANIFEST_OR_INDEX_DIGEST>` bằng digest lấy từ trusted registry/verification workflow; không copy digest minh họa đã cũ.
+
+Trade-off:
+
+| Chọn | Lợi ích | Trách nhiệm |
+|---|---|---|
+| Tag mutable | Tự nhận content mới khi pull/rebuild | Build khác theo thời gian; cần test regression |
+| Digest pin | Reproducible và audit rõ | Không tự nhận security fix; cần automation cập nhật |
+| Tag + digest | Dễ đọc và cố định content | Phải kiểm tra digest còn tương ứng tag/policy |
+
+`docker build --pull` yêu cầu builder kiểm tra base mới theo reference; `--no-cache` không thay thế `--pull`.
+
+## Dùng `ARG` trong `FROM`
+
+```dockerfile
+# syntax=docker/dockerfile:1
+ARG ALPINE_VERSION=3.23
+FROM alpine:${ALPINE_VERSION} AS runtime
+
+ARG ALPINE_VERSION
+RUN printf '%s\n' "$ALPINE_VERSION" > /base-version
+```
+
+`ARG` đầu nằm global và dùng được trong `FROM`. Muốn dùng sau `FROM`, khai báo lại trong stage. Build override:
+
+```bash
+docker build --build-arg ALPINE_VERSION=3.23 --tag app:test .
+```
+
+Không cho người dùng tùy ý truyền toàn bộ registry/image reference trong pipeline có trust boundary yếu. Base image là code execution trong build và nguồn runtime filesystem; validate allowlist/digest.
+
+## Đặt tên stage
+
+```dockerfile
+FROM golang:1.25 AS build
+# ... compile ...
+
+FROM alpine:3.23 AS runtime
+COPY --from=build /out/server /usr/local/bin/server
+```
+
+Tên stage ổn định hơn số `--from=0` khi reorder Dockerfile. Dùng lowercase, mô tả vai trò như `deps`, `test`, `build`, `runtime`, `debug`; stage name là identifier nội bộ, không phải image tag.
+
+Một stage có thể dựa trên stage trước:
+
+```dockerfile
+FROM alpine:3.23 AS base
+RUN apk add --no-cache ca-certificates
+
+FROM base AS runtime
+COPY app /usr/local/bin/app
+
+FROM base AS debug
+RUN apk add --no-cache curl strace
+COPY app /usr/local/bin/app
+```
+
+Build target cụ thể:
+
+```bash
+docker build --target runtime --tag app:prod .
+docker build --target debug --tag app:debug .
+```
+
+BuildKit chỉ cần build dependency graph của target; stage không liên quan có thể được bỏ qua.
+
+## `scratch`: filesystem rỗng có chủ đích
+
+`scratch` là tên đặc biệt biểu diễn base trống:
+
+```dockerfile
+FROM scratch
+COPY server /server
+ENTRYPOINT ["/server"]
+```
+
+Cách này chỉ chạy khi binary và runtime data tự đủ. Binary dynamic-link cần loader/library; HTTPS thường cần CA bundle; ứng dụng có thể cần `/etc/passwd`, timezone hoặc temp directory. `scratch` cũng không có shell nên:
+
+- shell-form command không chạy;
+- `docker exec ... sh` không dùng được;
+- healthcheck dùng shell/tool không tồn tại;
+- debug phải dùng external tooling hoặc debug image.
+
+Xác minh binary trước khi chọn:
+
+```bash
+file ./server
+ldd ./server || true
+```
+
+`ldd` output phụ thuộc platform và có rủi ro khi chạy trên binary không tin cậy; trong CI nên dùng tool phân tích binary phù hợp thay vì execute artifact lạ.
+
+## `--platform` và multi-platform build
+
+```dockerfile
+FROM --platform=$BUILDPLATFORM golang:1.25 AS build
+ARG TARGETOS TARGETARCH
+RUN GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -o /out/server ./cmd/server
+
+FROM alpine:3.23
+COPY --from=build /out/server /usr/local/bin/server
+```
+
+BuildKit cung cấp automatic platform args trong global scope; khai báo `ARG TARGETOS TARGETARCH` trong stage để dùng với `RUN`. Pattern này chạy compiler trên build platform và cross-compile artifact cho target.
+
+Không hard-code `FROM --platform=linux/amd64` trong mọi stage nếu mục tiêu là image đa platform: nó có thể ép final image sai platform hoặc cần emulation. Chỉ định build outputs ở CLI:
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --tag registry.example/team/app:1.0.0 \
+  --push \
+  .
+```
+
+Cross-compilation, emulation và native multi-node có trade-off khác nhau; đọc [Multi-platform builds](/docs/buildkit/multi-platform-builds/).
+
+## Inspect base và final image
+
+Trước khi chấp nhận base:
+
+```bash
+BASE='alpine:3.23'
+docker buildx imagetools inspect "$BASE"
+docker image pull "$BASE"
+docker image inspect "$BASE"
+docker image history --no-trunc "$BASE"
+```
+
+Sau build:
+
+```bash
+docker image inspect app:test \
+  --format 'platform={{.Os}}/{{.Architecture}} user={{.Config.User}} entrypoint={{json .Config.Entrypoint}} cmd={{json .Config.Cmd}}'
+```
+
+Chạy smoke test dưới user/runtime mode dự kiến và scan final image. Không chỉ scan builder stage; production deploy final artifact nhưng base runtime có dependency riêng.
+
+## Anti-pattern cần tránh
+
+- Dùng `latest` vì tưởng nó luôn mới nhất.
+- Pin digest nhưng không có bot/process cập nhật.
+- Chọn Alpine/scratch chỉ theo số MB, bỏ qua libc/certificate/debug.
+- Cài compiler trong final stage vì chưa tách multi-stage.
+- Override `USER root` của trusted base mà không review security impact.
+- Dùng base không rõ publisher hoặc đã hết support.
+- Giả định cùng tag trên mirror luôn là cùng digest upstream.
+
+## Nguồn chính thức
+
+- [`FROM` reference](https://docs.docker.com/reference/dockerfile/#from)
+- [Dockerfile best practices: choose the right base image](https://docs.docker.com/build/building/best-practices/#choose-the-right-base-image)
+- [Multi-stage builds](https://docs.docker.com/build/building/multi-stage/)
+- [Multi-platform builds](https://docs.docker.com/build/building/multi-platform/)

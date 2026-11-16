@@ -1,0 +1,188 @@
+---
+title: "Bảo vệ Docker daemon và socket"
+description: "Bảo vệ Docker daemon API như quyền quản trị host: kiểm soát Unix socket, remote access qua SSH hoặc mTLS, authorization và audit."
+---
+
+Docker client điều khiển daemon qua API. Trên rootful Engine, actor có quyền tạo container thường có thể bind mount `/`, truy cập device hoặc chạy privileged container; vì vậy quyền ghi vào Docker socket gần tương đương quyền `root` trên host.
+
+```text
+Docker CLI / Compose / SDK
+            │ API
+            ▼
+ /var/run/docker.sock ──> dockerd ──> containerd/runc ──> host kernel
+```
+
+<Callout type="error" title="Socket là control plane">
+  Không mount `/var/run/docker.sock` vào container chỉ để container “chạy Docker”. Nếu workload bị compromise, attacker nhận quyền điều khiển daemon và thường có thể chiếm host.
+</Callout>
+
+## Kiểm tra local socket
+
+Trên rootful Linux Engine:
+
+```bash
+sudo stat -c '%A %U:%G %n' /var/run/docker.sock
+getent group docker
+```
+
+Socket thường thuộc `root:docker`. Thành viên group `docker` có authority rất lớn:
+
+```bash
+id
+getent group docker
+```
+
+Không thêm user vào group chỉ để tránh gõ `sudo`. Chọn một trong các cách:
+
+- chỉ admin được phê duyệt dùng `sudo docker ...`;
+- dùng rootless mode cho môi trường developer phù hợp;
+- cấp remote context qua SSH với account và policy riêng;
+- dùng automation service có allowlist operation thay vì chuyển tiếp raw Docker API.
+
+Review membership định kỳ và xóa account cũ:
+
+```bash
+sudo gpasswd --delete USER docker
+```
+
+Command thay đổi quyền user; xác nhận user và kế hoạch session/logout trước khi chạy.
+
+## Vì sao socket proxy chưa phải sandbox
+
+Một proxy có thể allowlist endpoint như read-only inventory, nhưng phải hiểu mọi API route, method, query và version. Ví dụ cho phép tạo container nhưng chặn endpoint `exec` vẫn có thể đủ để actor mount host path khi create.
+
+Nếu buộc phải dùng proxy:
+
+1. default deny theo method + path + API version;
+2. validate request body, mount, device, capability, namespace và security option;
+3. chạy proxy ngoài workload không tin cậy;
+4. dùng identity riêng và log request/decision;
+5. test bypass khi Engine nâng API version;
+6. không coi proxy đơn giản chỉ lọc URL là ranh giới multi-tenant.
+
+## Remote access qua SSH
+
+SSH thường đơn giản hơn tự vận hành CA cho số lượng admin nhỏ. Tạo Docker context:
+
+```bash
+docker context create production \
+  --description 'Production Engine qua SSH' \
+  --docker host=ssh://docker-operator@host1.example.com
+
+docker --context production info
+docker context use default
+```
+
+Account `docker-operator` trên remote host vẫn phải có quyền truy cập socket. SSH chỉ bảo vệ transport và identity; nó không làm Docker API ít quyền hơn. Áp dụng:
+
+- key ngắn hạn hoặc hardware-backed nếu có;
+- disable password login;
+- bastion/VPN và network allowlist;
+- account riêng theo người, không share key;
+- host SSH audit và command/session policy phù hợp.
+
+Tránh để `DOCKER_HOST` trỏ production vô tình trong shell:
+
+```bash
+printf 'context=%s host=%s\n' "$(docker context show)" "${DOCKER_HOST:-unset}"
+```
+
+## Remote access qua mutual TLS
+
+Khi cần API TCP cho automation, dùng TLS verification hai chiều trên port `2376`, firewall/VPN và authorization bổ sung. Cấu hình daemon minh họa:
+
+```json
+{
+  "hosts": ["unix:///var/run/docker.sock", "tcp://0.0.0.0:2376"],
+  "tlsverify": true,
+  "tlscacert": "/etc/docker/tls/ca.pem",
+  "tlscert": "/etc/docker/tls/server-cert.pem",
+  "tlskey": "/etc/docker/tls/server-key.pem"
+}
+```
+
+<Callout type="warn" title="Cẩn thận với systemd">
+  Trên nhiều distro, `dockerd` đã nhận `-H` từ systemd unit. Khai báo thêm `hosts` trong `daemon.json` có thể conflict và làm daemon không khởi động. Kiểm tra `systemctl cat docker` và thử trên node canary trước khi restart.
+</Callout>
+
+Client:
+
+```bash
+export DOCKER_HOST=tcp://host1.example.com:2376
+export DOCKER_TLS_VERIFY=1
+export DOCKER_CERT_PATH="$HOME/.docker/production-tls"
+docker version
+```
+
+Certificate client có thể điều khiển daemon; bảo vệ private key như root credential. Có inventory, expiry alert, rotation, revocation và không copy cùng một key cho nhiều actor.
+
+Không expose `tcp://0.0.0.0:2375`. Firewall không thay authentication vì route có thể mở nhầm hoặc container trên host có thể tiếp cận endpoint.
+
+## Authentication khác authorization
+
+mTLS xác nhận certificate được CA tin cậy, nhưng mọi client trusted có thể vẫn nhận cùng API authority. Docker authorization plugin có thể quyết định request theo user/certificate, method và resource.
+
+Policy nên chặn hoặc yêu cầu approval cho:
+
+- privileged container, device và host namespace;
+- bind mount path nhạy cảm;
+- thêm capability rộng;
+- load image tar không tin cậy;
+- tạo plugin hoặc thay daemon config;
+- đọc secret/config ngoài scope;
+- xóa volume, image hoặc container production.
+
+Authorization plugin nằm trên critical path. Test behavior fail-open/fail-closed, latency, HA và upgrade compatibility.
+
+## Socket trong CI
+
+Mount socket vào CI runner cho phép job điều khiển host runner và đọc artifact của job khác. Đặc biệt nguy hiểm khi runner nhận pull request từ fork.
+
+Ưu tiên:
+
+- ephemeral isolated runner;
+- remote BuildKit builder với identity và entitlement giới hạn;
+- rootless builder phù hợp;
+- tách runner trusted release khỏi untrusted PR;
+- không cấp production registry/cloud credential cho job untrusted.
+
+Nếu dùng socket trên dedicated runner, coi runner là disposable privileged infrastructure, không multi-tenant và rebuild sau job có độ tin cậy thấp.
+
+## Audit và phát hiện
+
+Thu thập ít nhất:
+
+- SSH/mTLS identity truy cập daemon;
+- Docker events;
+- thay đổi container có mount, capability, privileged, host namespace;
+- group membership và certificate lifecycle;
+- daemon config/startup flags;
+- host audit cho socket nếu hệ thống hỗ trợ.
+
+Theo dõi event trong lab:
+
+```bash
+docker events \
+  --filter type=container \
+  --format '{{.Time}} {{.Action}} {{json .Actor.Attributes}}'
+```
+
+Event stream không thay thế durable audit log và có thể thiếu identity phía caller nếu kiến trúc không ghi ở gateway/SSH layer.
+
+## Response khi nghi socket bị lộ
+
+1. Cô lập host khỏi control-plane network nhưng giữ kênh forensic đã phê duyệt.
+2. Revoke certificate/key/token và xóa user/group access liên quan.
+3. Thu thập daemon config, event, container inspect, mount, image digest và host audit.
+4. Giả định mọi container, secret và credential trên host đã bị truy cập.
+5. Rotate credential downstream theo blast radius.
+6. Rebuild host từ baseline tin cậy; không chỉ stop container lạ rồi tiếp tục dùng node.
+7. Sửa đường cấp quyền và thêm detector trước khi đưa node trở lại.
+
+## Nguồn chính thức
+
+- [Protect the Docker daemon socket](https://docs.docker.com/engine/security/protect-access/)
+- [Docker daemon attack surface](https://docs.docker.com/engine/security/#docker-daemon-attack-surface)
+- [Authorization plugins](https://docs.docker.com/engine/extend/plugins_authorization/)
+- [Docker contexts](/docs/docker-cli/contexts/)
+- [Rootless mode](/docs/security/rootless-security/)

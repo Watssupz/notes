@@ -1,0 +1,16 @@
+{
+  "title": "Docker Swarm",
+  "pages": [
+    "index",
+    "swarm-architecture",
+    "initialize-and-join",
+    "services-and-tasks",
+    "stack-deploy",
+    "overlay-networking",
+    "configs-and-secrets",
+    "rolling-updates",
+    "high-availability",
+    "swarm-security",
+    "swarm-troubleshooting"
+  ]
+}

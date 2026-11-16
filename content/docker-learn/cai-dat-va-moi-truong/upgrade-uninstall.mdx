@@ -1,0 +1,421 @@
+---
+title: "Nâng cấp và gỡ cài đặt Docker"
+description: "Lập kế hoạch upgrade, canary, xác minh và rollback Docker Engine; phân biệt remove package, giữ dữ liệu và purge hoàn toàn trên Linux hoặc Docker Desktop."
+---
+
+Nâng cấp Docker là thay đổi nhiều layer: Engine API, `dockerd`, containerd, runtime, Buildx/Compose plugin và đôi khi storage/image-store behavior. Gỡ package lại là thao tác khác với xóa image, volume và daemon state. Nếu không tách hai việc này, bạn có thể vừa tưởng đã cleanup sạch vừa vô tình giữ secret, hoặc ngược lại xóa dữ liệu không thể khôi phục.
+
+Trang này ưu tiên Docker Engine cài bằng official APT/DNF repository. Docker Desktop có update/uninstall và backup path riêng theo platform/version.
+
+## Ba mức thay đổi cần phân biệt
+
+| Mục tiêu | Package/application | Daemon data | Application data |
+|---|---|---|---|
+| Upgrade in place | Update package | Giữ và có thể migrate metadata | Phải giữ, backup trước |
+| Remove để reinstall/troubleshoot | Gỡ package | Thường giữ `/var/lib/docker`, `/var/lib/containerd`, config | Vẫn tồn tại nhưng không được coi là backup |
+| Purge host hoàn toàn | Gỡ package/repository/config | Xóa data roots | Mất image, container, volume nếu không backup/export |
+
+`apt purge` hoặc `dnf remove` theo Docker docs **không tự xóa** image, container, volume và custom config. `rm -rf /var/lib/docker /var/lib/containerd` mới là bước phá hủy state, và không nên chạy cho tới khi xác minh mount/path/backup.
+
+## Trước upgrade: thu inventory
+
+```bash
+docker context show
+docker version
+docker info
+docker ps --all --no-trunc
+docker system df -v
+```
+
+Trên Linux rootful:
+
+```bash
+sudo systemctl status docker containerd --no-pager
+sudo systemctl cat docker
+sudo journalctl -u docker -n 100 --no-pager
+```
+
+Package inventory:
+
+```bash
+# Debian/Ubuntu
+dpkg-query -W 'docker*' 'containerd*' 'runc*' 2>/dev/null || true
+apt-cache policy docker-ce docker-ce-cli containerd.io
+
+# Fedora/CentOS/RHEL family
+rpm -qa | grep -E 'docker|containerd|runc' || true
+dnf list docker-ce --showduplicates 2>/dev/null || true
+```
+
+Ghi thêm:
+
+- OS/kernel/cgroup version;
+- storage driver hoặc containerd image store;
+- daemon JSON, systemd drop-in, proxy/CA/registry config;
+- Docker API clients, Compose files và orchestration dependencies;
+- volumes/bind mounts/database backup status;
+- maintenance window, canary node và rollback owner.
+
+Redact registry credential, proxy URL có password và token khỏi report.
+
+## Backup đúng thứ cần khôi phục
+
+### Application data trước daemon internals
+
+Volume chứa database cần application-consistent backup: flush/quiesce, snapshot theo database/storage procedure và **test restore**. Copy trực tiếp file đang được database ghi không đảm bảo consistency.
+
+Liệt kê mounts:
+
+```bash
+docker inspect --format '{{.Name}} {{json .Mounts}}' $(docker ps -aq)
+```
+
+Trên host không có container, command substitution rỗng có thể làm `docker inspect` báo thiếu argument; dùng script xử lý danh sách rỗng trong automation.
+
+### Config và certificate
+
+Backup có quyền hạn chế:
+
+```bash
+sudo tar --create --gzip \
+  --file "/root/docker-config-$(date +%Y%m%d%H%M%S).tar.gz" \
+  /etc/docker \
+  /etc/systemd/system/docker.service.d 2>/dev/null
+```
+
+Tar có thể báo path không tồn tại; review archive và exit status. Backup private registry CA/client keys theo secret policy, không đưa archive vào source control.
+
+### Daemon data root
+
+Snapshot/copy toàn bộ data root chỉ hữu ích khi:
+
+- daemon/containerd đã dừng hoặc storage snapshot bảo đảm consistency;
+- restore dùng compatible Engine/containerd/storage setup;
+- ownership, xattr, SELinux label và mount semantics được giữ;
+- restore đã được test.
+
+Đừng coi tar nóng `/var/lib/docker` là rollback đáng tin cậy. Trên fresh Engine 29+ với containerd image store, state còn có thể nằm ở `/var/lib/containerd`.
+
+## Đọc release notes và compatibility
+
+Trước production upgrade, kiểm tra từng version trung gian về:
+
+- removed/deprecated daemon flags và API behavior;
+- storage driver/image store migration;
+- minimum kernel, cgroup/systemd và OS support;
+- networking/firewall changes;
+- BuildKit/Buildx/Compose compatibility;
+- plugin/runtime (`nvidia`, gVisor, Kata, logging/volume/network plugin);
+- Swarm/Kubernetes/CI integration nếu có;
+- known issue và security fix.
+
+Không nhảy version chỉ vì package manager có candidate mới. Pin target đã test, nâng canary trước và có acceptance criteria.
+
+## Upgrade Docker Engine trên Debian/Ubuntu
+
+Refresh metadata và liệt kê version:
+
+```bash
+sudo apt update
+apt list --all-versions docker-ce
+apt list --all-versions docker-ce-cli
+```
+
+Chọn exact `<VERSION_STRING>` từ repository của chính OS release:
+
+```bash
+VERSION_STRING='<VERSION_STRING>'
+sudo apt install \
+  docker-ce="$VERSION_STRING" \
+  docker-ce-cli="$VERSION_STRING" \
+  containerd.io docker-buildx-plugin docker-compose-plugin
+```
+
+Nếu policy cho phép stable mới nhất thay vì pin:
+
+```bash
+sudo apt install \
+  docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+```
+
+Đọc transaction plan trước khi xác nhận: package nào update/remove, containerd/runc version nào thay đổi và service script có restart daemon không.
+
+## Upgrade trên Fedora/CentOS
+
+Liệt kê version:
+
+```bash
+dnf list docker-ce --showduplicates | sort -r
+```
+
+Cài target đã test:
+
+```bash
+sudo dnf install \
+  docker-ce-<VERSION_STRING> \
+  docker-ce-cli-<VERSION_STRING> \
+  containerd.io docker-buildx-plugin docker-compose-plugin
+```
+
+Hoặc update theo repository policy:
+
+```bash
+sudo dnf upgrade \
+  docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+```
+
+`<VERSION_STRING>` phải lấy từ output thật. Review GPG fingerprint theo official install docs khi repository/key thay đổi.
+
+## Điều phối downtime và workload
+
+Package transaction có thể restart daemon. Trước canary/host production:
+
+1. Drain hoặc chuyển traffic theo load balancer/orchestrator.
+2. Kiểm tra database/job có thể dừng an toàn.
+3. Thu events/log trước thay đổi.
+4. Upgrade một failure domain/canary.
+5. Xác minh daemon, container lifecycle, application request và persistence.
+6. Chỉ tiếp tục rollout khi soak period đạt tiêu chí.
+
+`live-restore` có thể giữ standalone containers chạy khi daemon unavailable trong một số daemon upgrade/restart scenario, nhưng không thay thế HA, không bảo đảm mọi option/version transition và cần được cấu hình/test trước incident. Daemon down vẫn làm mất management operations và monitoring path phụ thuộc API.
+
+## Xác minh sau upgrade
+
+### Control plane
+
+```bash
+docker version
+docker info
+systemctl is-active docker containerd
+```
+
+Client/Server version phải là target dự kiến; context không đổi ngoài ý muốn.
+
+### Logs và deprecation
+
+```bash
+sudo journalctl -u docker --since '15 minutes ago' --no-pager
+sudo journalctl -u containerd --since '15 minutes ago' --no-pager
+```
+
+Tìm config ignored/deprecated, storage migration, network rule error, plugin/runtime failure và restart loop.
+
+### Object và application
+
+```bash
+docker ps --all
+docker network ls
+docker volume ls
+docker system df
+```
+
+Sau đó:
+
+- gửi request thật qua published port/load balancer;
+- đọc/ghi dữ liệu test có cleanup;
+- restart một canary container;
+- pull image approved;
+- chạy build nhỏ bằng BuildKit;
+- chạy `docker compose config`/canary nếu Compose là dependency;
+- xác minh metrics/log collection.
+
+Service active chưa đủ để kết luận upgrade thành công.
+
+## Rollback upgrade
+
+Package downgrade đơn thuần không phải rollback an toàn mặc định. Engine/containerd mới có thể đã thay metadata, image store hoặc network state mà binary cũ không đọc đúng. Rollback tốt hơn dựa trên phương án đã test:
+
+- revert VM/disk snapshot nhất quán;
+- rebuild host từ immutable image cũ rồi restore application data;
+- fail traffic về node/version cũ;
+- restore daemon config và data snapshot tương thích.
+
+Nếu vendor release notes cho phép package downgrade cụ thể, vẫn test trên clone/canary trước. Không xóa data directory để “làm Engine cũ start” trên production; thao tác đó biến rollback thành data loss.
+
+Rollback hoàn tất khi application, persistence, monitoring và control plane trở về acceptance baseline, không chỉ package version cũ.
+
+## Gỡ Docker Engine nhưng giữ dữ liệu
+
+Dừng workload theo runbook, rồi remove package.
+
+Debian/Ubuntu:
+
+```bash
+sudo apt purge \
+  docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras
+```
+
+Fedora/CentOS:
+
+```bash
+sudo dnf remove \
+  docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras
+```
+
+Sau đó xác minh package/service:
+
+```bash
+command -v docker || true
+systemctl status docker --no-pager 2>/dev/null || true
+sudo du -sh /var/lib/docker /var/lib/containerd 2>/dev/null || true
+```
+
+Data và custom config thường vẫn còn. Giữ chúng nếu đang reinstall/điều tra, nhưng bảo vệ vì volume/layer có thể chứa secret và business data.
+
+## Purge toàn bộ state trên Linux
+
+<Callout type="error" title="Không thể hoàn tác">
+  Các command `rm -rf` dưới đây xóa image, container state, build cache và volumes nằm trong daemon roots. Chỉ chạy sau khi xác minh host, mount, backup và restore test. Không copy-paste trên remote context hoặc shared host.
+</Callout>
+
+Xác minh path không phải symlink/mount ngoài dự kiến:
+
+```bash
+sudo findmnt /var/lib/docker /var/lib/containerd || true
+sudo readlink -f /var/lib/docker /var/lib/containerd
+sudo du -sh /var/lib/docker /var/lib/containerd 2>/dev/null || true
+```
+
+Sau khi package/service đã dừng và sign-off phá hủy dữ liệu:
+
+```bash
+sudo rm -rf /var/lib/docker
+sudo rm -rf /var/lib/containerd
+```
+
+Xóa APT repository/key trên Ubuntu/Debian nếu không dùng nữa:
+
+```bash
+sudo rm -f /etc/apt/sources.list.d/docker.sources
+sudo rm -f /etc/apt/keyrings/docker.asc
+sudo apt update
+```
+
+Custom config phải xóa riêng sau review:
+
+```bash
+sudo rm -rf /etc/docker
+sudo rm -rf /etc/systemd/system/docker.service.d
+sudo systemctl daemon-reload
+```
+
+Nếu từng dùng custom `data-root`, xóa default paths chưa chắc xóa dữ liệu. Đọc backup config/systemd arguments để tìm actual location.
+
+## Gỡ rootless Docker
+
+Chuyển đúng user/context và inventory:
+
+```bash
+docker context show
+docker info --format '{{.DockerRootDir}}'
+systemctl --user status docker --no-pager
+```
+
+Gỡ setup:
+
+```bash
+dockerd-rootless-setuptool.sh uninstall
+```
+
+Rootless data mặc định `~/.local/share/docker` không nhất thiết bị xóa. Chỉ xóa bằng path đã xác minh sau backup:
+
+```bash
+rootlesskit rm -rf <ROOTLESS_DATA_ROOT>
+```
+
+Tắt lingering khi user không còn service cần chạy:
+
+```bash
+sudo loginctl disable-linger <USER>
+```
+
+Gỡ package rootless extras qua package manager nếu không còn user nào cần.
+
+## Docker Desktop: backup trước uninstall/reset
+
+Docker Desktop lưu Linux container data trong VM/WSL disk riêng, không phải `/var/lib/docker` trực tiếp trên Windows/macOS host. Trước uninstall hoặc factory reset:
+
+1. Dừng workload và backup database/volumes bằng documented procedure.
+2. Export/push image cần giữ hoặc bảo đảm có Dockerfile/registry source.
+3. Ghi Compose files, contexts, settings và credential dependencies.
+4. Dùng Docker Desktop backup/restore guidance đúng platform/version.
+5. Xác minh restore trên installation thử nếu dữ liệu quan trọng.
+
+Trên WSL backend, không tự copy virtual disk khi Desktop đang chạy rồi coi đó là consistent backup. Installer/uninstaller behavior và data path có thể đổi; theo official uninstall docs hiện hành.
+
+## Cleanup không đồng nghĩa uninstall
+
+Nếu mục tiêu chỉ là lấy lại disk, không cần gỡ Engine. Bắt đầu bằng:
+
+```bash
+docker system df -v
+docker container ls --all
+docker image ls
+docker volume ls
+docker builder prune --filter 'until=168h'
+```
+
+Command prune cuối chỉ là ví dụ xóa build cache cũ hơn ngưỡng theo parser hiện hành; đọc candidate/impact trước. Named volume không được coi là disposable chỉ vì không attach vào running container.
+
+## Troubleshooting sau upgrade/reinstall
+
+### Client mới nhưng Server cũ
+
+```bash
+docker context ls
+docker version
+```
+
+Bạn có thể đã update local CLI nhưng context trỏ remote daemon chưa upgrade. Đây không nhất thiết là lỗi; kiểm tra API compatibility và rollout plan của remote host.
+
+### Daemon không start với config cũ
+
+```bash
+sudo dockerd --validate --config-file=/etc/docker/daemon.json
+sudo journalctl -u docker -b --no-pager
+systemctl cat docker
+```
+
+Tìm removed option, duplicate flag/JSON, plugin/runtime path và storage migration. Rollback config trước khi cân nhắc data changes.
+
+### Container có nhưng application lỗi
+
+Kiểm tra:
+
+```bash
+docker inspect <CONTAINER>
+docker logs --timestamps <CONTAINER>
+docker events --since 15m
+```
+
+Đối chiếu network, mount, cgroup/resource, DNS, healthcheck và application dependency. Không recreate hàng loạt trước khi thu evidence.
+
+### Reinstall xong không thấy image/volume cũ
+
+Xác minh context, `DockerRootDir`, image store/driver và custom `data-root`. Hai daemon hoặc Desktop/native Engine có data store khác nhau. Không move internal directories thủ công giữa storage drivers/version để “làm object xuất hiện”.
+
+## Checklist change hoàn tất
+
+- [ ] Inventory và application-consistent backup đã có restore test.
+- [ ] Release notes/support matrix của target đã review.
+- [ ] Canary và maintenance/drain plan đã chạy.
+- [ ] Client, Server, runtime/plugin version đúng.
+- [ ] Daemon journal không có regression quan trọng.
+- [ ] Pull, build, network, persistence và application request đều đạt.
+- [ ] Rollback path vẫn khả dụng trong soak window.
+- [ ] Nếu uninstall, đã quyết định rõ giữ hay purge data/config.
+- [ ] Destructive path đã được xác minh không phải mount/symlink ngoài ý định.
+
+Sau upgrade/reinstall, chạy toàn bộ [Xác minh môi trường](/docs/cai-dat-va-moi-truong/verify-environment/) thay vì chỉ lặp `hello-world`.
+
+## Nguồn chính thức để đối chiếu
+
+- [Install Docker Engine](https://docs.docker.com/engine/install/)
+- [Ubuntu upgrade and uninstall](https://docs.docker.com/engine/install/ubuntu/)
+- [Fedora upgrade and uninstall](https://docs.docker.com/engine/install/fedora/)
+- [Docker Desktop backup and restore](https://docs.docker.com/desktop/settings-and-maintenance/backup-and-restore/)
+- [Docker Desktop uninstall](https://docs.docker.com/desktop/uninstall/)

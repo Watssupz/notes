@@ -1,0 +1,168 @@
+---
+title: "Exit codes"
+description: "Đọc exit code của container và Docker CLI, phân biệt lỗi application với lỗi runtime/daemon, liên hệ signal/OOM và thiết kế script kiểm tra failure chính xác."
+---
+
+Exit code là bằng chứng ngắn gọn nhất cho biết lần chạy của process chính kết thúc như thế nào. Docker lưu exit code trong container state, `docker container wait` in ra code đó, còn `docker run` ở foreground thường trả code về shell gọi lệnh.
+
+Không nên đọc exit code một mình. Cùng một số có thể đến từ nhiều nguyên nhân: `137` thường tương ứng `128 + SIGKILL`, nhưng signal đó có thể do operator chạy `docker kill`, do `docker stop` hết timeout, hoặc do kernel OOM kill. Muốn kết luận đúng, cần kết hợp `inspect`, logs, events và evidence từ host.
+
+## Ba lớp cần phân biệt
+
+| Lớp | Nơi đọc | Ý nghĩa |
+|---|---|---|
+| Exit code của process trong container | `.State.ExitCode`, `docker wait`, `docker run` foreground | Application/PID 1 đã trả code nào hoặc bị signal nào |
+| Lỗi Docker CLI/daemon trước khi process chạy | Exit code của lệnh `docker run` trên host | Docker không tạo/start được container đúng cách |
+| Health status | `.State.Health.Status` | Probe trong container đang đánh giá workload khỏe hay không |
+
+Healthcheck thất bại không tự biến thành exit code của PID 1. Một container có thể `running`, exit code cũ là `0`, nhưng health status hiện tại là `unhealthy`.
+
+## Đọc exit code đúng cách
+
+Với container đã dừng:
+
+```bash
+docker container inspect CONTAINER \
+  --format 'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{json .State.Error}} finished={{.State.FinishedAt}}'
+```
+
+Với job cần chờ kết quả:
+
+```bash
+docker container wait CONTAINER
+```
+
+`wait` block cho đến khi container dừng rồi in exit code của process chính. Đây là primitive phù hợp hơn polling `docker ps` khi script cần biết một job batch thành công hay thất bại.
+
+Ví dụ one-shot:
+
+```bash
+docker container run --name lifecycle-exit-demo alpine:3.22 sh -c 'echo "about-to-fail"; exit 42'
+docker container inspect lifecycle-exit-demo \
+  --format 'status={{.State.Status}} exit={{.State.ExitCode}}'
+docker container logs lifecycle-exit-demo
+```
+
+Expected: command `run` trả về `42`, container ở state `exited`, logs có `about-to-fail`.
+
+Cleanup:
+
+```bash
+docker container rm lifecycle-exit-demo
+```
+
+## Các code đặc biệt khi chạy `docker run`
+
+Docker CLI dùng một số exit code để báo lỗi xảy ra trước hoặc trong lúc invoke command:
+
+| Code | Ý nghĩa thường gặp | Cách chẩn đoán |
+|---:|---|---|
+| `125` | Docker daemon/CLI không chạy được container theo request | Đọc stderr của CLI, kiểm tra option, image pull, name conflict, quyền, daemon/context |
+| `126` | Command tìm thấy nhưng không invoke được | Kiểm tra permission, executable format, user, mount `noexec`, shebang |
+| `127` | Command không tìm thấy trong image/PATH | Inspect `ENTRYPOINT`/`CMD`, shell có tồn tại không, path đúng không |
+| code khác | Thường là exit code của process trong container | Đọc logs và contract exit code của application |
+
+Ví dụ phân biệt `126` và `127`:
+
+```bash
+# Command không tồn tại trong Alpine tối giản.
+docker container run --rm alpine:3.22 definitely-not-a-command
+
+# File tồn tại nhưng không executable.
+docker container run --rm alpine:3.22 sh -c 'printf "#!/bin/sh\n" >/tmp/x; /tmp/x'
+```
+
+Trong automation, đừng chỉ ghi “docker run failed”. Capture command, stderr, image ID, container ID nếu đã tạo được, và context đang dùng.
+
+## Signal và công thức `128 + signal`
+
+Trên Linux/Unix, nhiều shell biểu diễn process chết vì signal bằng `128 + số signal`. Ví dụ phổ biến:
+
+| Exit code | Signal thường tương ứng | Diễn giải cần kiểm chứng |
+|---:|---|---|
+| `130` | `SIGINT` (`2`) | Người dùng nhấn `Ctrl+C` hoặc signal tương đương |
+| `137` | `SIGKILL` (`9`) | Force kill, stop hết timeout hoặc OOM kill |
+| `143` | `SIGTERM` (`15`) | Stop signal mặc định hoặc orchestration yêu cầu shutdown |
+
+Đây là convention thường gặp, không phải bằng chứng đầy đủ. Application có thể tự `exit 137`; shell wrapper có thể biến đổi code; Windows container có semantics khác. Vì vậy, luôn đọc thêm:
+
+```bash
+docker container inspect CONTAINER --format '{{json .State}}'
+docker events --since '15m' --until '0s' --filter 'container=CONTAINER'
+docker container logs --timestamps --tail 300 CONTAINER
+```
+
+Nếu nghi OOM, kiểm tra thêm kernel/daemon logs và metric memory của host/container. `.State.OOMKilled=true` là tín hiệu mạnh hơn exit code đơn lẻ.
+
+## Thiết kế exit code cho application
+
+Một image vận hành tốt nên có contract rõ:
+
+- `0` cho hoàn tất thành công hoặc graceful shutdown có chủ đích;
+- non-zero cho lỗi thật sự cần operator/pipeline chú ý;
+- phân biệt lỗi cấu hình, lỗi dependency tạm thời và dữ liệu input không hợp lệ nếu job runner cần retry khác nhau;
+- log thông điệp cuối cùng trước khi exit, nhưng không in secret;
+- PID 1 thoát khi workload không thể phục vụ thay vì treo vô hạn trong trạng thái hỏng.
+
+Nếu dùng shell wrapper, thêm `set -e` có cân nhắc và kết thúc bằng `exec` để signal/exit code của application chính không bị che khuất:
+
+```sh
+#!/bin/sh
+set -eu
+
+prepare_runtime_config
+exec /app/server "$@"
+```
+
+## Exit code và restart policy
+
+Restart policy `on-failure` phản ứng với non-zero exit code; `always` và `unless-stopped` có semantics khác khi container dừng hoặc daemon restart. Dùng `RestartCount` để biết daemon đã cố khởi động lại bao nhiêu lần:
+
+```bash
+docker container inspect api \
+  --format 'status={{.State.Status}} exit={{.State.ExitCode}} restarts={{.RestartCount}}'
+```
+
+Một service crash loop có thể hiển thị `Up` trong một khoảnh khắc giữa các lần restart. Đừng chỉ nhìn trạng thái hiện tại; đọc timeline bằng `docker events` và logs quanh từng lần start.
+
+## Troubleshooting nhanh
+
+### Container vừa chạy đã thoát với `0`
+
+Đây thường không phải crash. Command one-shot đã hoàn tất, ví dụ `echo`, migration script hoặc shell không có loop foreground. Kiểm tra `ENTRYPOINT`/`CMD`:
+
+```bash
+docker image inspect IMAGE --format 'entrypoint={{json .Config.Entrypoint}} cmd={{json .Config.Cmd}}'
+docker container inspect CONTAINER --format 'path={{.Path}} args={{json .Args}} exit={{.State.ExitCode}}'
+```
+
+Nếu container là service, process chính phải chạy foreground.
+
+### Exit code `125`
+
+Lỗi có thể xảy ra trước khi có container object để inspect. Kiểm tra stderr của CLI, Docker context, daemon availability, image pull, name conflict và option không tương thích platform.
+
+```bash
+docker context show
+docker version
+docker container ls --all --filter 'name=^/NAME$'
+```
+
+### Exit code `137`
+
+Thu evidence trước khi restart/recreate:
+
+```bash
+docker container inspect CONTAINER --format '{{json .State}}'
+docker container logs --timestamps --tail 500 CONTAINER
+docker events --since '30m' --until '0s' --filter 'container=CONTAINER'
+```
+
+Nếu `.State.OOMKilled=true`, chuyển sang điều tra memory limit, leak, workload spike và host pressure. Nếu OOMKilled là `false`, xem stop timeout, operator action hoặc runtime kill.
+
+## Nguồn chính thức
+
+- [docker container run](https://docs.docker.com/reference/cli/docker/container/run/)
+- [docker container wait](https://docs.docker.com/reference/cli/docker/container/wait/)
+- [docker container inspect](https://docs.docker.com/reference/cli/docker/container/inspect/)
+- [Start containers automatically](https://docs.docker.com/engine/containers/start-containers-automatically/)

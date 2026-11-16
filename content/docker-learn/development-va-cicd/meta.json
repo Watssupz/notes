@@ -1,0 +1,18 @@
+{
+  "title": "Development và CI/CD",
+  "pages": [
+    "index",
+    "dev-containers",
+    "hot-reload",
+    "debug-applications",
+    "testcontainers",
+    "local-development-patterns",
+    "ci-builds",
+    "ci-cache",
+    "github-actions",
+    "gitlab-ci",
+    "release-pipelines",
+    "promotion-strategies",
+    "gitops"
+  ]
+}

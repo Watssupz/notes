@@ -1,0 +1,148 @@
+---
+title: "tmpfs mounts"
+description: "Dùng tmpfs cho dữ liệu tạm trong memory, đặt size và permission rõ ràng, hiểu swap, lifecycle và giới hạn trên Linux."
+---
+
+`tmpfs` mount cho container ghi file ngoài writable layer vào memory do Linux kernel quản lý. Nội dung biến mất khi container dừng hoặc bị recreate, nên phù hợp với scratch data có chủ ý không cần persistence.
+
+```text
+Container process ──> /run/app (tmpfs) ──> host memory
+                                           └── có thể đi vào swap
+```
+
+<Callout type="warn" title="tmpfs không bảo đảm dữ liệu không chạm disk">
+  Linux có thể đưa page của tmpfs vào swap. Nếu threat model yêu cầu secret không bao giờ xuất hiện trên disk, phải cấu hình hoặc mã hóa swap và đánh giá toàn bộ host memory policy; chỉ thêm tmpfs là chưa đủ.
+</Callout>
+
+## Use case phù hợp và không phù hợp
+
+| Phù hợp | Không phù hợp |
+|---|---|
+| Runtime scratch files | Database data directory |
+| Cache ngắn hạn, có thể tái tạo | User uploads |
+| Socket/PID file của process | Audit logs |
+| Secret material tạm thời với host policy phù hợp | Dữ liệu cần share giữa container |
+| Giảm write vào writable layer | Dữ liệu lớn không có memory budget |
+
+Tmpfs chỉ hỗ trợ khi chạy Linux containers. Một tmpfs mount không được share trực tiếp giữa nhiều container.
+
+## Cú pháp và giới hạn
+
+Cú pháp explicit:
+
+```bash
+docker run --mount type=tmpfs,dst=/run/app,tmpfs-size=67108864,tmpfs-mode=0700 IMAGE
+```
+
+`tmpfs-size` dùng byte; ví dụ trên là 64 MiB. Nếu không đặt, Docker documentation nêu maximum mặc định bằng 50% RAM host. Không dựa vào mặc định rộng này cho production.
+
+Cú pháp Linux linh hoạt hơn cho mount options:
+
+```bash
+docker run --tmpfs /run/app:rw,noexec,nosuid,nodev,size=64m,mode=0700 IMAGE
+```
+
+`--tmpfs` không dùng được với Swarm services; service phải dùng `--mount`.
+
+Các hardening option phổ biến:
+
+| Option | Tác dụng |
+|---|---|
+| `size=64m` | Giới hạn dung lượng mount |
+| `mode=0700` | Chỉ owner truy cập |
+| `uid=1000,gid=1000` | Đặt numeric owner khi dùng `--tmpfs` |
+| `noexec` | Không thực thi binary trực tiếp từ mount |
+| `nosuid` | Không honor setuid/setgid bits |
+| `nodev` | Không dùng device node trong mount |
+
+Không thêm `noexec` nếu application thực sự chạy code từ path đó. Hardening phải dựa trên behavior đã kiểm thử.
+
+## Lab: xác minh lifecycle qua stop/start
+
+Tạo container chạy lâu với tmpfs 16 MiB:
+
+```bash
+docker run -d --name tmpfs-lab \
+  --mount type=tmpfs,dst=/scratch,tmpfs-size=16777216,tmpfs-mode=0700 \
+  alpine:3.22 sleep 1d
+```
+
+Ghi dữ liệu và xem filesystem:
+
+```bash
+docker exec tmpfs-lab sh -c '
+  printf ephemeral > /scratch/value
+  df -h /scratch
+  cat /scratch/value
+'
+```
+
+Inspect mount:
+
+```bash
+docker inspect tmpfs-lab \
+  --format '{{range .Mounts}}{{println .Type .Destination .RW}}{{end}}'
+```
+
+Dừng rồi start container:
+
+```bash
+docker stop tmpfs-lab
+docker start tmpfs-lab
+docker exec tmpfs-lab test ! -e /scratch/value
+echo $?
+```
+
+Expected exit code là `0`: mount được tạo mới và dữ liệu cũ đã mất. Đây khác với writable layer, vốn còn qua stop/start.
+
+## Memory accounting và failure mode
+
+Tmpfs cạnh tranh memory với process và các workload khác. Khi mount đầy, write thường thất bại với `No space left on device`; khi host/container memory pressure nghiêm trọng, process có thể chậm hoặc bị OOM kill tùy cấu hình.
+
+Theo dõi từ hai góc:
+
+```bash
+docker exec tmpfs-lab df -h /scratch
+docker stats tmpfs-lab
+```
+
+`df` cho capacity của filesystem; `docker stats` cho resource usage ở cấp container. Không giả định hai số map 1:1 trong mọi cgroup/kernel setup.
+
+Thiết kế application phải xử lý write failure. Tmpfs không phải cách né resource limits.
+
+## Permission có thể reset
+
+Permission thay đổi bên trong tmpfs có thể không còn sau restart vì mount mới được tạo. Đặt `tmpfs-mode`, hoặc `uid`/`gid` với `--tmpfs`, ngay trong deployment config thay vì chỉ `chmod` sau khi start.
+
+Ví dụ chạy process UID 1000:
+
+```bash
+docker run --rm --user 1000:1000 \
+  --tmpfs /scratch:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=1000,gid=1000 \
+  alpine:3.22 sh -c 'printf ok > /scratch/value && cat /scratch/value'
+```
+
+Khả năng hỗ trợ option phụ thuộc Linux kernel và Docker environment; kiểm thử trên target host, không chỉ Docker Desktop development machine.
+
+## Mount che nội dung image
+
+Giống volume và bind mount, tmpfs che file sẵn có tại target. Khi container start lỗi vì config biến mất sau khi thêm tmpfs, kiểm tra target có chứa default file trong image không:
+
+```bash
+docker run --rm alpine:3.22 ls -la /run
+docker run --rm --mount type=tmpfs,dst=/run alpine:3.22 ls -la /run
+```
+
+Không có cách gỡ riêng mount để lộ dữ liệu image trong container hiện tại; recreate container mà không mount hoặc đổi target.
+
+## Cleanup bài thực hành
+
+```bash
+docker rm -f tmpfs-lab
+```
+
+## Nguồn chính thức
+
+- [Docker tmpfs mounts](https://docs.docker.com/engine/storage/tmpfs/)
+- [Linux tmpfs documentation](https://docs.kernel.org/filesystems/tmpfs.html)
+- [Runtime memory constraints](https://docs.docker.com/engine/containers/resource_constraints/#memory)

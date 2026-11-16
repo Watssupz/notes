@@ -1,0 +1,297 @@
+---
+title: "Control groups"
+description: "Cách cgroups v1/v2 account và kiểm soát CPU, memory, PIDs và I/O cho container; kèm lab đặt limit, đọc throttling và xác minh OOM."
+---
+
+Control groups, thường viết là **cgroups**, tổ chức process theo hierarchy để kernel account, phân phối và giới hạn tài nguyên. Nếu namespaces trả lời process nhìn thấy gì, cgroups trả lời nhóm process **được dùng bao nhiêu và được ưu tiên thế nào khi tranh chấp**.
+
+Docker dùng cgroups để hiện thực các option như `--memory`, `--cpus`, `--cpu-shares`, `--pids-limit` và một số I/O controls. Không đặt limit đồng nghĩa container có thể dùng tài nguyên theo scheduler và tài nguyên còn lại của host; container không tự có quota chỉ vì đang isolated.
+
+## Mental model: hierarchy, cgroup và controller
+
+```text
+cgroup hierarchy
+└── system.slice
+    ├── docker.service
+    ├── docker-<container-A>.scope
+    │   └── process A1, A2
+    └── docker-<container-B>.scope
+        └── process B1
+```
+
+Ba khái niệm cần tách:
+
+- **Hierarchy:** cây tổ chức cgroups.
+- **Cgroup:** một node trong cây, chứa process và configuration/statistics files.
+- **Controller:** kernel subsystem quản lý một loại resource như CPU, memory, PIDs hoặc I/O.
+
+Limit ở parent có thể constrain toàn bộ descendants. Vì vậy, container limit không tồn tại độc lập với systemd slice, VM allocation hoặc orchestrator/node policy ở phía trên.
+
+## Cgroups v1 và v2
+
+Cgroups v1 cho phép mỗi controller có hierarchy riêng. Cgroups v2 dùng unified hierarchy và semantics nhất quán hơn cho delegation/resource distribution. File names và behavior khác đáng kể giữa hai version.
+
+Kiểm tra host:
+
+```bash
+if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+  echo 'cgroup v2'
+else
+  echo 'cgroup v1 hoặc layout không chuẩn'
+fi
+
+docker info --format 'CgroupVersion={{.CgroupVersion}} CgroupDriver={{.CgroupDriver}}'
+```
+
+Trên cgroup v2, các file thường gặp gồm:
+
+| Controller | Cấu hình/signal tiêu biểu |
+|---|---|
+| CPU | `cpu.max`, `cpu.weight`, `cpu.stat` |
+| Memory | `memory.max`, `memory.high`, `memory.current`, `memory.events` |
+| PIDs | `pids.max`, `pids.current`, `pids.events` |
+| I/O | `io.max`, `io.weight`, `io.stat` |
+| Cgroup core | `cgroup.procs`, `cgroup.controllers`, `cgroup.events` |
+
+Đừng dùng file path v1 như `memory.limit_in_bytes` trên host v2. Khi viết collector hoặc runbook, detect version trước rồi dùng kernel documentation tương ứng.
+
+## CPU: quota, weight và affinity không giống nhau
+
+### CPU quota là ceiling theo thời gian
+
+`--cpus 0.5` yêu cầu giới hạn tương đương nửa CPU time theo period/quota model. Container có thể chạy trên nhiều core ở các thời điểm khác nhau nhưng tổng CPU time bị throttle theo quota.
+
+```bash
+docker run --rm --cpus 0.5 IMAGE
+```
+
+Quota không bảo đảm application luôn nhận đủ 0.5 CPU. Host contention, parent cgroup, CPU affinity và scheduler vẫn có thể làm nó nhận ít hơn.
+
+### CPU shares/weight là ưu tiên tương đối
+
+`--cpu-shares` điều chỉnh weight khi có contention. Nó không phải hard limit và không reserve một tỷ lệ CPU cố định khi host idle. Hai container có weight khác nhau có thể đều dùng nhiều CPU nếu không tranh chấp.
+
+### Cpuset chọn CPU được phép chạy
+
+`--cpuset-cpus 0,2` giới hạn process vào CPU IDs cụ thể. Nó hữu ích cho affinity/NUMA hoặc workload đặc biệt, nhưng dễ làm imbalance và phụ thuộc topology host. Cpuset không thay thế quota.
+
+## Memory: limit, reclaim và OOM
+
+Memory controller account nhiều loại memory, gồm anonymous memory và page cache theo semantics kernel. Một memory limit không chỉ đo heap application hiển thị trong profiler.
+
+Với Docker:
+
+```bash
+docker run --rm --memory 256m IMAGE
+```
+
+`--memory` đặt hard limit theo runtime/platform support. Khi workload tiến gần limit, kernel có thể reclaim cache; nếu không thể thỏa allocation trong cgroup, OOM handling có thể kill process. Container state có thể ghi `OOMKilled=true`, nhưng phải kiểm tra evidence thay vì suy ra chỉ từ exit code.
+
+Swap semantics phụ thuộc host, cgroup version và kết hợp `--memory`/`--memory-swap`. Docker documentation định nghĩa `--memory-swap` là tổng memory + swap khi đặt giá trị dương cùng `--memory`. Không copy một cấu hình swap giữa host mà chưa xác minh kernel support và daemon warning.
+
+<Callout type="warn" title="Cảnh báo">
+  Tắt OOM killer mà không có hard memory boundary an toàn có thể đẩy host vào tình trạng cạn memory và làm kernel kill process quan trọng khác. Không dùng `--oom-kill-disable` như cách giữ application sống bằng mọi giá.
+</Callout>
+
+## PIDs: chống process explosion
+
+PIDs controller giới hạn số task/process trong cgroup hierarchy. `--pids-limit` hữu ích để giảm blast radius của fork bomb hoặc application tạo child không kiểm soát:
+
+```bash
+docker run --rm --pids-limit 100 IMAGE
+```
+
+Khi chạm limit, lời gọi tạo process/thread có thể lỗi. Application có thể báo `Resource temporarily unavailable`, `fork: retry` hoặc lỗi runtime-specific. Limit quá thấp cũng làm JVM, web server hoặc test runner lỗi vì thread có thể được account theo task semantics.
+
+## I/O: phụ thuộc device và scheduler
+
+I/O controller có thể đặt weight hoặc bandwidth/IOPS limit cho block device. Hiệu lực phụ thuộc cgroup version, backing device, filesystem, storage stack và scheduler. Container ghi vào network filesystem, volume plugin hoặc device-mapper layer có thể không phản ánh đơn giản như một local block device.
+
+Trước khi dùng I/O limit, xác định path thực sự đi tới device nào và load test trên cùng storage topology. Không hứa một latency SLO chỉ từ `--device-read-bps` hoặc `--blkio-weight`.
+
+## Lab 1: quan sát limit qua Docker
+
+Khởi động container với nhiều loại control:
+
+```bash
+docker run --name cgroup-demo -d \
+  --memory 128m \
+  --cpus 0.5 \
+  --pids-limit 64 \
+  alpine:3.20 sleep 300
+```
+
+Inspect cấu hình mà Engine lưu:
+
+```bash
+docker inspect --format \
+  'Memory={{.HostConfig.Memory}} NanoCpus={{.HostConfig.NanoCpus}} PidsLimit={{.HostConfig.PidsLimit}}' \
+  cgroup-demo
+```
+
+Expected values mang tính machine-readable:
+
+- memory `134217728` bytes cho `128m`;
+- NanoCPUs `500000000` cho `0.5` CPU;
+- PIDs limit `64`.
+
+Kiểm tra runtime stats:
+
+```bash
+docker stats --no-stream cgroup-demo
+```
+
+`docker stats` cung cấp view thuận tiện về CPU, memory, network và block I/O. Cách tính memory/cache và CPU percentage có thể khác giữa CLI/platform; dùng cgroup files/monitoring backend khi cần semantics chính xác cho alert.
+
+Dọn lab:
+
+```bash
+docker rm -f cgroup-demo
+```
+
+## Lab 2: tìm cgroup v2 của container
+
+Lab này chạy trên Linux host cgroup v2. Tạo container:
+
+```bash
+docker run --name cgroup-path-demo -d --memory 128m alpine:3.20 sleep 300
+PID=$(docker inspect --format '{{.State.Pid}}' cgroup-path-demo)
+cat "/proc/$PID/cgroup"
+```
+
+Trên cgroup v2, output thường có dạng:
+
+```text
+0::/system.slice/docker-<long-id>.scope
+```
+
+Không hard-code path. Lấy relative path từ `/proc/<pid>/cgroup`:
+
+```bash
+CGROUP_PATH=$(awk -F: '$1 == "0" {print $3}' "/proc/$PID/cgroup")
+printf '/sys/fs/cgroup%s\n' "$CGROUP_PATH"
+```
+
+Nếu đủ quyền, đọc các file:
+
+```bash
+sudo cat "/sys/fs/cgroup${CGROUP_PATH}/memory.max"
+sudo cat "/sys/fs/cgroup${CGROUP_PATH}/memory.current"
+sudo cat "/sys/fs/cgroup${CGROUP_PATH}/memory.events"
+sudo cat "/sys/fs/cgroup${CGROUP_PATH}/cpu.max"
+sudo cat "/sys/fs/cgroup${CGROUP_PATH}/cpu.stat"
+sudo cat "/sys/fs/cgroup${CGROUP_PATH}/pids.max"
+```
+
+Điểm cần quan sát:
+
+- `memory.max` phản ánh hard boundary;
+- `memory.current` thay đổi theo workload;
+- `memory.events` có counters như `high`, `max`, `oom`, `oom_kill` tùy kernel;
+- `cpu.stat` có usage và throttling counters;
+- `cpu.max` biểu diễn quota/period hoặc `max` nếu không giới hạn.
+
+Dọn lab:
+
+```bash
+docker rm -f cgroup-path-demo
+```
+
+## Lab 3: xác minh OOM an toàn
+
+Chỉ chạy trên máy lab còn đủ memory. Container sau có hard limit nhỏ và Python allocate memory cho đến khi bị kill. Image sẽ được pull nếu chưa có:
+
+```bash
+docker run --name oom-demo --memory 64m python:3.12-alpine \
+  python -c 'x=[]
+while True:
+    x.append(bytearray(1024 * 1024))'
+```
+
+Command có thể kết thúc với signal-related exit. Kiểm tra state:
+
+```bash
+docker inspect --format \
+  'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}' \
+  oom-demo
+```
+
+Expected evidence quan trọng là `oom=true`. Exit code thường là `137` khi process nhận `SIGKILL`, nhưng `137` một mình không chứng minh OOM vì admin/runtime cũng có thể gửi `SIGKILL`.
+
+Dọn lab:
+
+```bash
+docker rm oom-demo
+```
+
+## Từ triệu chứng đến controller
+
+| Triệu chứng | Evidence nên lấy | Diễn giải có thể |
+|---|---|---|
+| CPU cao nhưng throughput đứng | `docker stats`, `cpu.stat`, app latency | CPU throttling, lock/contention hoặc dependency bottleneck |
+| Container exit 137 | `.State.OOMKilled`, `memory.events`, kernel/daemon events | OOM nếu counters xác nhận; cũng có thể external SIGKILL |
+| `fork`/thread creation lỗi | `pids.current`, `pids.max`, `pids.events` | PIDs limit hoặc user/process rlimit |
+| I/O latency tăng | `io.stat`, device metrics, filesystem/backend metrics | cgroup throttle, device saturation hoặc remote storage |
+| Limit đúng nhưng usage vượt kỳ vọng | parent hierarchy, cache semantics, sidecar/process membership | Đọc sai metric hoặc process nằm ngoài cgroup dự kiến |
+
+Không sửa limit trước khi biết metric là gauge, counter hay cumulative time. Ví dụ `nr_throttled` tăng chứng minh từng có throttling; tốc độ tăng trong cửa sổ quan sát mới cho biết mức độ hiện tại.
+
+## Parent cgroup và systemd driver
+
+Docker có thể dùng `systemd` hoặc `cgroupfs` driver. Driver ảnh hưởng cách Engine đặt cgroup trong hierarchy và naming/path, không thay đổi mục tiêu của resource controller.
+
+Trên host do systemd quản lý, container scope có thể nằm dưới `system.slice` hoặc parent được cấu hình. Orchestrator còn tạo pod/slice hierarchy riêng. Effective limit luôn bị chặn bởi ancestor nhỏ nhất phù hợp, vì vậy inspect container flag chưa đủ nếu parent đã bị giới hạn.
+
+Dùng `/proc/<pid>/cgroup` làm nguồn để tìm membership thực tế thay vì đoán path từ container ID.
+
+## Sizing và vận hành
+
+### Đặt limit từ measurement
+
+Quy trình thực tế:
+
+1. đo baseline và peak theo workload đại diện;
+2. tách startup spike, steady state và failure behavior;
+3. đặt request/reservation/weight và hard limit theo platform;
+4. load test dưới contention;
+5. alert trước khi chạm hard boundary;
+6. quan sát OOM/throttling sau rollout;
+7. điều chỉnh cùng capacity của host, không chỉ từng container.
+
+Limit quá rộng không ngăn noisy neighbor; limit quá hẹp tạo OOM/throttle và tail latency. Không có con số mặc định phù hợp mọi application.
+
+### Memory limit không phải application tuning
+
+Nếu JVM hoặc runtime đọc sai memory availability, heap có thể lớn hơn cgroup budget hoặc GC hoạt động không phù hợp. Runtime hiện đại thường có container awareness, nhưng behavior phụ thuộc version/flags. Đối chiếu profiler/application metrics với `memory.current` và limit thực tế.
+
+### Cgroups không tạo network metrics trực tiếp
+
+Network interfaces thuộc network namespaces; cgroups không expose một controller network usage đơn giản giống memory/CPU. `docker stats` lấy network counters từ interface/runtime view. Với production, thu thập interface, eBPF/CNI hoặc platform metrics phù hợp và định nghĩa rõ traffic nào được tính.
+
+## Những lỗi cấu hình phổ biến
+
+- Dùng `--cpu-shares` rồi kỳ vọng hard ceiling.
+- Đọc cgroup v1 paths trên host v2.
+- Chỉ nhìn `docker stats` mà không kiểm tra OOM/throttle events.
+- Tắt OOM killer thay vì sửa leak/sizing.
+- Đặt PIDs limit thấp hơn thread count hợp lệ.
+- Hard-code systemd scope path vào collector.
+- Bỏ qua parent cgroup hoặc resource allocation của Docker Desktop VM.
+- Cho rằng `free` trong container luôn phản ánh đúng swap limit của container.
+
+## Tự kiểm tra
+
+1. Cgroups khác namespaces ở câu hỏi nào?
+2. CPU quota, CPU weight và cpuset khác nhau ra sao?
+3. Vì sao exit code 137 không đủ để kết luận OOM?
+4. Dùng file nào phát hiện cgroup v1 hay v2?
+5. Vì sao parent cgroup có thể làm container nhận ít resource hơn flag Docker gợi ý?
+
+Tiếp theo, [Linux capabilities](/docs/nen-tang-container/capabilities/) chuyển từ “được dùng bao nhiêu resource” sang “process được phép thực hiện nhóm privileged operation nào”.
+
+## Nguồn đối chiếu
+
+- [Control Group v2 — Linux kernel documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+- [Resource constraints — Docker Docs](https://docs.docker.com/engine/containers/resource_constraints/)
+- [Runtime metrics — Docker Docs](https://docs.docker.com/engine/containers/runmetrics/)
+- [cgroups(7) — Linux manual](https://man7.org/linux/man-pages/man7/cgroups.7.html)

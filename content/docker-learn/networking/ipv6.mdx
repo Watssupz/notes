@@ -1,0 +1,187 @@
+---
+title: "IPv6"
+description: "Cấu hình Docker bridge dual-stack hoặc IPv6-only, lập kế hoạch prefix, DNS, published port, routing và ip6tables thay vì chỉ bật một flag."
+---
+
+IPv6 trong Docker là quyết định end-to-end: host kernel, daemon, network IPAM, DNS, application listen address, firewall và upstream routing đều phải hỗ trợ. Docker Engine chỉ hỗ trợ IPv6 networking trên Linux daemon.
+
+## Dual-stack và IPv6-only
+
+| Mode | Endpoint | Khi dùng |
+|---|---|---|
+| Dual-stack | Có IPv4 và IPv6 | Migration, client hỗn hợp |
+| IPv6-only | Tắt cấp IPv4 bằng `--ipv4=false` | Môi trường đã kiểm chứng toàn bộ dependency qua IPv6 |
+
+Tạo dual-stack user-defined bridge với documentation prefix:
+
+```bash
+docker network create \
+  --ipv6 \
+  --subnet 172.30.60.0/24 \
+  --subnet 2001:db8:60::/64 \
+  dualstack-lab
+```
+
+`2001:db8::/32` chỉ dành cho tài liệu, không route trên production Internet. Dùng prefix được tổ chức cấp hoặc ULA trong `fd00::/8` cho private design phù hợp.
+
+Tạo IPv6-only:
+
+```bash
+docker network create \
+  --ipv6 \
+  --ipv4=false \
+  --subnet 2001:db8:61::/64 \
+  v6only-lab
+```
+
+IPv4 không thể bị disable trên default `bridge`; dùng custom network.
+
+## Dynamic prefix allocation
+
+Nếu bật `--ipv6` mà không ghi subnet, Docker có thể cấp ULA `/64` tự động khi default pools không có IPv6. Để kiểm soát fleet, khai báo cả IPv4 và IPv6 pools trong daemon config:
+
+```json
+{
+  "default-address-pools": [
+    { "base": "172.30.0.0/16", "size": 24 },
+    { "base": "fd12:3456:789a::/48", "size": 64 }
+  ]
+}
+```
+
+Chọn ULA Global ID theo quy trình tránh collision; không copy literal ví dụ vào nhiều tổ chức/site. Network hiện có không tự đổi prefix khi daemon config thay đổi.
+
+## Lab dual-stack
+
+```bash
+docker run -d --name ipv6-web \
+  --network dualstack-lab \
+  -p 127.0.0.1:8086:80 \
+  -p '[::1]:8086:80' \
+  nginx:1.29-alpine
+```
+
+Inspect addresses:
+
+```bash
+docker inspect ipv6-web \
+  --format '{{json .NetworkSettings.Networks}}'
+docker exec ipv6-web ip -br address
+```
+
+Gọi qua host loopback:
+
+```bash
+curl http://127.0.0.1:8086/
+curl 'http://[::1]:8086/'
+```
+
+Gọi trực tiếp container IPv6 từ host chỉ hoạt động nếu host route/firewall/gateway mode cho phép. Published port và direct routing là hai path khác nhau.
+
+## DNS trong IPv6-only container
+
+Custom network vẫn dùng Docker embedded DNS tại `127.0.0.11`; Docker cung cấp đường đi đặc biệt để IPv4 resolver address này hoạt động trong IPv6-only container.
+
+```bash
+docker run --rm --network v6only-lab alpine:3.23 \
+  cat /etc/resolv.conf
+```
+
+Application hard-code DNS server chỉ chấp nhận IPv6 literal có thể không tương thích. Test resolver library và external AAAA dependency trước rollout.
+
+## Application listen và URL syntax
+
+Server listen `[::]:80` có thể hoặc không nhận IPv4-mapped connection tùy sysctl/runtime. Để behavior rõ ràng, cấu hình/list sockets cho cả address families khi dual-stack:
+
+```bash
+docker exec CONTAINER ss -lntup
+```
+
+IPv6 literal trong URL cần bracket:
+
+```text
+http://[2001:db8:60::2]:8080/
+```
+
+TLS certificate nên dùng DNS name; raw IP cần IP Subject Alternative Name đúng.
+
+## Default bridge daemon config
+
+Để bật IPv6 cho legacy default bridge:
+
+```json
+{
+  "ipv6": true,
+  "fixed-cidr-v6": "fd12:3456:789a:1::/64",
+  "ip6tables": true
+}
+```
+
+Validate rồi restart daemon:
+
+```bash
+sudo systemctl restart docker
+```
+
+User-defined networks thường dễ kiểm soát hơn và không cần bật IPv6 default bridge toàn cục chỉ để một application dùng IPv6.
+
+## NAT hay routed IPv6
+
+IPv6 không bắt buộc NAT. Docker bridge hỗ trợ gateway mode `routed` để external peers route tới container prefix, còn firewall chỉ mở published container ports:
+
+```bash
+docker network create --ipv6 \
+  --subnet 2001:db8:70::/64 \
+  -o com.docker.network.bridge.gateway_mode_ipv6=routed \
+  v6-routed
+```
+
+Upstream phải có route tới prefix qua Docker host. Kiểm tra return path, router advertisement/static route, source address policy và firewall; “container có global IPv6” không tự làm Internet reachable.
+
+## Firewall và exposure
+
+- `ip6tables` mặc định được dùng để isolation/port mapping trên bridge.
+- Host firewall phải lọc IPv6 riêng; chỉ có IPv4 rules để lại lỗ hổng dual-stack.
+- `-p 8080:80` có thể bind cả IPv4 và IPv6 host addresses.
+- Macvlan/IPvlan không nhận Docker bridge firewall rules.
+- ICMPv6 là thành phần thiết yếu cho Neighbor Discovery và Path MTU Discovery; không drop toàn bộ ICMPv6.
+
+## Troubleshooting
+
+```bash
+# Host
+sysctl net.ipv6.conf.all.forwarding
+ip -6 address
+ip -6 route
+ip6tables -S 2>/dev/null || true
+nft list ruleset 2>/dev/null | less
+
+# Container
+docker exec CONTAINER ip -6 address
+docker exec CONTAINER ip -6 route
+docker exec CONTAINER nslookup example.com
+docker exec CONTAINER ping -6 -c 2 GATEWAY_OR_PEER
+```
+
+Phân lớp:
+
+1. endpoint có IPv6 và prefix đúng;
+2. route/default gateway tồn tại;
+3. DNS có AAAA record;
+4. application listen IPv6;
+5. firewall cho NDP/ICMPv6 và service port;
+6. upstream route/return path đúng;
+7. MTU không bị encapsulation làm black-hole.
+
+## Cleanup
+
+```bash
+docker rm -f ipv6-web 2>/dev/null || true
+docker network rm dualstack-lab v6only-lab v6-routed 2>/dev/null || true
+```
+
+## Nguồn chính thức
+
+- [Use IPv6 networking](https://docs.docker.com/engine/daemon/ipv6/)
+- [Networking overview — IP address and hostname](https://docs.docker.com/engine/network/#ip-address-and-hostname)
+- [Port publishing and mapping](https://docs.docker.com/engine/network/port-publishing/)

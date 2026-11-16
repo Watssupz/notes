@@ -1,0 +1,298 @@
+---
+title: "Seccomp"
+description: "Cách seccomp lọc Linux syscalls cho container, Docker default profile, custom JSON profile, phương pháp xác minh và troubleshooting mà không vô hiệu hóa bảo vệ production."
+---
+
+Secure computing mode (**seccomp**) là Linux kernel feature dùng để hạn chế system calls một process được phép thực hiện. Vì process container dùng chung host kernel, giảm tập syscall reachable là một lớp defense-in-depth quan trọng.
+
+Seccomp trả lời **“process được gọi syscall nào với điều kiện nào?”**. Nó không kiểm tra path ở mức policy tổng quát, không thay Unix file permissions, không giới hạn CPU/memory và không quyết định process thấy network/PID namespace nào.
+
+## Syscall là đường vào kernel
+
+Application thường gọi library, rồi library phát sinh syscall:
+
+```text
+Application
+    │ open(), socket(), clone(), mount()...
+    ▼
+libc / language runtime
+    │ syscall instruction
+    ▼
+seccomp filter
+    ├── allow → kernel tiếp tục xử lý capability, LSM, permission...
+    └── deny  → errno, kill, trap, log hoặc user notification tùy action
+```
+
+Một syscall được seccomp cho phép vẫn có thể bị capability hoặc AppArmor/SELinux từ chối. Ngược lại, process có capability phù hợp vẫn không qua được syscall bị seccomp chặn. Đây là lý do lỗi `EPERM`/`Operation not permitted` cần chẩn đoán theo nhiều layer.
+
+## Seccomp filter hoạt động thế nào?
+
+Linux seccomp filter mode dùng Berkeley Packet Filter representation trong kernel để đánh giá syscall number, architecture và một số argument values. Policy chọn action khi rule match hoặc khi không rule nào match.
+
+Các action phổ biến trong ecosystem gồm:
+
+| Action | Hiệu ứng khái niệm |
+|---|---|
+| `SCMP_ACT_ALLOW` | Cho syscall đi tiếp tới các permission/security checks khác |
+| `SCMP_ACT_ERRNO` | Không thực thi syscall và trả errno đã cấu hình |
+| `SCMP_ACT_KILL_PROCESS`/`KILL_THREAD` | Kết thúc process/thread |
+| `SCMP_ACT_TRAP` | Gửi `SIGSYS` để process/tracer xử lý theo khả năng |
+| `SCMP_ACT_LOG` | Cho syscall chạy nhưng yêu cầu logging theo kernel audit setup |
+| `SCMP_ACT_NOTIFY` | Chuyển quyết định sang user-space notifier theo implementation support |
+
+Runtime/libseccomp/kernel version quyết định action/architecture/syscall name nào được hỗ trợ. Một profile hợp lệ trên host mới có thể không load trên host cũ.
+
+## Docker default seccomp profile
+
+Trên Linux với seccomp support, Docker áp default profile trừ khi cấu hình override. Docker documentation mô tả profile này theo allowlist model: default action trả permission error và các syscall tương thích phổ biến được allow, cùng rules có điều kiện.
+
+Profile default cố cân bằng compatibility và protection. Nó thường chặn các nhóm syscall rủi ro hoặc không cần cho application container thông thường, chẳng hạn:
+
+- kernel module/system administration;
+- mount/namespace manipulation nhất định;
+- kernel keyring hoặc low-level I/O interfaces;
+- clock/system-wide state thay đổi;
+- tracing/performance interfaces có thể lộ host state;
+- syscall đã lỗi thời hoặc có attack history.
+
+Danh sách cụ thể thay đổi theo Docker Engine, kernel architecture, capability và security updates. Không copy con số hoặc danh sách từ bài viết cũ làm baseline. Đối chiếu default profile đi cùng Engine đang chạy và release/security notes.
+
+<Callout type="warn" title="Quan trọng">
+  Docker khuyến nghị không thay default seccomp profile nếu không có nhu cầu đã được kiểm chứng. Dùng `seccomp=unconfined` lâu dài làm tăng kernel attack surface và không phải cách sửa chung cho application lỗi.
+</Callout>
+
+## Kiểm tra seccomp có đang active
+
+Từ container:
+
+```bash
+docker run --rm alpine:3.20 grep -E '^Seccomp|^NoNewPrivs' /proc/1/status
+```
+
+Output minh họa:
+
+```text
+NoNewPrivs: 0
+Seccomp:    2
+Seccomp_filters: 1
+```
+
+Theo Linux proc semantics, `Seccomp: 2` biểu thị filter mode. Số filter và `NoNewPrivs` có thể khác theo runtime/configuration. `Seccomp: 2` không cho biết toàn bộ rule; nó chỉ là evidence filter đang được áp.
+
+Kiểm tra Engine security options:
+
+```bash
+docker info --format '{{json .SecurityOptions}}'
+```
+
+Output phụ thuộc host. Nếu không thấy seccomp, kiểm tra kernel config, Engine build/platform và daemon logs. Docker seccomp cần kernel hỗ trợ `CONFIG_SECCOMP` và Engine được build với support tương ứng.
+
+Trên Linux host có kernel config file:
+
+```bash
+grep CONFIG_SECCOMP /boot/config-"$(uname -r)"
+```
+
+Một số distribution không expose file ở path này; dùng kernel package/config documentation tương ứng.
+
+## Gắn custom profile
+
+Docker nhận profile JSON qua `--security-opt`:
+
+```bash
+docker run --rm \
+  --security-opt seccomp=/absolute/path/profile.json \
+  IMAGE
+```
+
+Path được Docker client/daemon xử lý theo command/API semantics và deployment mode; với daemon remote, đừng giả định file local client tự tồn tại trên daemon host. Dùng absolute path rõ ràng và quản lý profile như versioned policy artifact.
+
+Một profile thường có:
+
+- `defaultAction`;
+- architecture mappings nếu cần multi-architecture;
+- danh sách syscall rules và action;
+- argument filters;
+- include/exclude điều kiện theo capability/architecture trong schema Docker profile hỗ trợ.
+
+Không bắt đầu production profile bằng một allowlist đoán từ startup “happy path”. Application có thể cần syscall khác khi rotate log, reload certificate, handle signal, recover database hoặc gặp error path.
+
+## Lab: chặn `mkdir` bằng profile tối thiểu
+
+Lab này chứng minh cơ chế, **không phải production baseline**. Tạo `deny-mkdir.json`:
+
+```json
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "syscalls": [
+    {
+      "names": ["mkdir", "mkdirat"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    }
+  ]
+}
+```
+
+Profile trên cho mọi syscall khác chạy và chỉ từ chối `mkdir`/`mkdirat`. Nó yếu hơn Docker default profile, vì vậy chỉ dùng trong lab.
+
+Chạy:
+
+```bash
+docker run --rm \
+  --security-opt seccomp="$PWD/deny-mkdir.json" \
+  alpine:3.20 sh -c 'mkdir /tmp/seccomp-test'
+```
+
+Expected result là command lỗi tương tự:
+
+```text
+mkdir: can't create directory '/tmp/seccomp-test': Operation not permitted
+```
+
+Xác minh cùng operation chạy với default profile:
+
+```bash
+docker run --rm alpine:3.20 mkdir /tmp/seccomp-test
+```
+
+Command thứ hai dự kiến exit `0`. Nếu custom profile không load, Docker trả lỗi trước khi container start; kiểm tra JSON, syscall names, libseccomp/kernel support và path.
+
+Dọn file lab:
+
+```bash
+rm deny-mkdir.json
+```
+
+## Default-deny profile cần được xây thế nào?
+
+Một production allowlist thường cần quy trình:
+
+1. Chọn Docker default/profile từ runtime làm baseline thay vì `ALLOW` mọi syscall.
+2. Xác định application, language runtime, architecture và kernel matrix.
+3. Chạy integration tests bao phủ startup, traffic, shutdown, reload, backup và failure recovery.
+4. Thu thập denial qua audit/log/tracing trong môi trường kiểm soát.
+5. Review syscall bị yêu cầu theo capability và threat model.
+6. Add rule hẹp, ưu tiên argument filter nếu behavior ổn định và implementation hỗ trợ.
+7. Version profile cùng deployment configuration.
+8. Canary rollout và monitor `EPERM`, `SIGSYS`, crash/health regressions.
+9. Có rollback về **baseline profile đã biết**, không mặc định rollback về `unconfined`.
+
+Auto-generate profile từ một trace ngắn dễ bỏ syscall hiếm. Profile quá chặt mà không test failure path có thể làm incident nghiêm trọng hơn đúng lúc application cần recovery.
+
+## `seccomp=unconfined` chỉ dùng để phân lớp nguyên nhân
+
+Trong lab, có thể so sánh:
+
+```bash
+docker run --rm --security-opt seccomp=unconfined IMAGE COMMAND
+```
+
+Nếu operation chỉ chạy khi unconfined, seccomp là một nghi phạm mạnh. Nhưng kết luận vẫn cần xác định syscall/rule cụ thể. Không deploy unconfined làm fix; hãy tạo exception hẹp hoặc thay thiết kế để không cần syscall đó.
+
+Một A/B test an toàn:
+
+| Lần chạy | Capabilities | Seccomp | Mục đích |
+|---|---|---|---|
+| A | Giữ nguyên | Default | Reproduce baseline |
+| B | Giữ nguyên | Unconfined trong lab | Xác định seccomp có tham gia không |
+| C | Giữ nguyên | Profile với exception hẹp | Xác nhận rule tối thiểu |
+
+Chỉ đổi một dimension mỗi lần. Nếu đồng thời bật `--privileged` và `seccomp=unconfined`, bạn không biết capability, device, LSM hay seccomp là nguyên nhân.
+
+## Seccomp và capabilities tương tác
+
+Docker default profile có thể dùng capability condition để allow một số syscall khi capability tương ứng được cấp. Vì vậy thêm capability đôi khi thay cả hai layer: process vượt capability check và profile runtime có rule phù hợp.
+
+Điều này không làm `--cap-add` trở thành cách cấu hình seccomp. Hãy inspect profile/version cụ thể và tránh dựa vào behavior ngầm không được test.
+
+Ví dụ `mount` có thể cần:
+
+- syscall không bị seccomp chặn;
+- `CAP_SYS_ADMIN` trong user namespace thích hợp;
+- mount namespace và filesystem support;
+- source/device access;
+- AppArmor/SELinux cho phép;
+- mount propagation/configuration phù hợp.
+
+Chỉ thỏa một điều kiện vẫn có thể nhận `EPERM`.
+
+## Multi-architecture và syscall names
+
+Syscall number khác giữa architectures; một syscall có thể không tồn tại hoặc có variant khác. OCI/Docker seccomp profile có architecture mapping để libseccomp resolve đúng ABI.
+
+Khi image hỗ trợ `linux/amd64` và `linux/arm64`:
+
+- test profile trên cả hai architecture;
+- không hard-code numeric syscall từ một architecture;
+- kiểm tra libseccomp version trên từng node;
+- theo dõi syscall mới của language runtime/kernel;
+- bảo đảm orchestrator không schedule workload sang node ngoài compatibility matrix.
+
+Emulation như QEMU còn làm đường thực thi khác native. Không suy profile production arm64 chỉ từ test amd64.
+
+## Logging và quan sát denial
+
+Dấu hiệu seccomp denial có thể xuất hiện dưới dạng:
+
+- application nhận `EPERM`/`Permission denied`;
+- process nhận `SIGSYS` hoặc bị kill tùy action;
+- kernel audit log ghi `SECCOMP` event nếu audit/log setup hỗ trợ;
+- runtime trả lỗi khi profile không load;
+- healthcheck thất bại sau một code path cụ thể.
+
+Các nguồn kiểm tra trên Linux host:
+
+```bash
+journalctl -k --since '10 minutes ago' | grep -i seccomp
+ausearch -m SECCOMP -ts recent
+```
+
+`ausearch` cần audit userspace và quyền phù hợp; không phải host nào cũng cài hoặc bật audit. Thu log trước khi restart container nếu restart làm mất context application.
+
+Khi có syscall name/number, đối chiếu:
+
+1. application có thật sự cần operation không;
+2. syscall có thể được thay bằng API ít quyền hơn không;
+3. capability/namespace scope liên quan;
+4. Docker default chặn vì lý do gì;
+5. exception có mở attack surface trên mọi architecture/node không.
+
+## Seccomp không làm được gì?
+
+- Không chọn file path cụ thể mà `openat` được đọc/ghi theo policy tổng quát; dùng DAC/LSM/mount.
+- Không giới hạn memory/CPU; dùng cgroups.
+- Không ẩn process/network; dùng namespaces.
+- Không xác thực image provenance.
+- Không vá kernel vulnerability.
+- Không biến shared-kernel container thành VM boundary.
+
+Seccomp chỉ là một layer nhưng có giá trị vì giảm số kernel entry points application có thể tiếp cận.
+
+## Checklist production
+
+- Giữ Docker default seccomp nếu chưa có lý do rõ để thay.
+- Không dùng `unconfined` hoặc `--privileged` như fix lâu dài.
+- Version custom profile và gắn với application release.
+- Test mọi architecture, kernel/runtime version trong support matrix.
+- Bao phủ graceful shutdown, healthcheck, backup và failure path.
+- Thu seccomp/audit events vào observability phù hợp.
+- Review exception cùng capability, namespace, mount và LSM policy.
+- Chuẩn bị rollback về profile trước đó đã biết an toàn.
+
+## Tự kiểm tra
+
+1. Seccomp nằm ở đâu trên đường syscall vào kernel?
+2. Vì sao syscall được allow vẫn có thể nhận `EPERM`?
+3. Vì sao profile chặn `mkdir` trong lab không phù hợp production?
+4. `seccomp=unconfined` nên được dùng thế nào khi troubleshooting?
+5. Vì sao custom profile phải test theo CPU architecture?
+
+Tiếp theo, [Union filesystem và image layers](/docs/nen-tang-container/union-filesystem/) chuyển sang cách runtime tạo root filesystem hiệu quả từ content bất biến và writable state.
+
+## Nguồn đối chiếu
+
+- [Seccomp security profiles for Docker](https://docs.docker.com/engine/security/seccomp/)
+- [seccomp(2) — Linux manual](https://man7.org/linux/man-pages/man2/seccomp.2.html)
+- [seccomp_unotify(2) — Linux manual](https://man7.org/linux/man-pages/man2/seccomp_unotify.2.html)
+- [OCI Runtime Specification — Linux seccomp configuration](https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md#seccomp)

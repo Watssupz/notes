@@ -1,0 +1,257 @@
+---
+title: "Theo dõi tài nguyên"
+description: "Đọc docker stats, Engine API và cgroup metrics đúng semantics; xây time series, alert và correlation giữa container, host, application cùng release."
+---
+
+Resource monitoring phải trả lời được ba lớp câu hỏi:
+
+1. **Usage:** workload đang dùng bao nhiêu CPU, memory, I/O, network và tasks?
+2. **Pressure/enforcement:** workload có bị throttle, reclaim, OOM hoặc chạm limit không?
+3. **Impact:** latency, throughput, error rate và queue của application thay đổi thế nào?
+
+`docker stats` hữu ích để triage, nhưng một bảng hiện tại không đủ cho capacity planning hoặc root-cause analysis.
+
+## Đọc `docker stats`
+
+```bash
+docker stats
+```
+
+Snapshot một hoặc vài container:
+
+```bash
+docker stats --no-stream api worker
+```
+
+Output Linux thường có:
+
+| Cột | Ý nghĩa | Caveat |
+|---|---|---|
+| `CPU %` | CPU usage trong sampling interval | Có thể vượt 100% trên multi-CPU |
+| `MEM USAGE / LIMIT` | Usage CLI tính và effective limit | CLI Linux trừ một phần cache; API không tự trừ |
+| `MEM %` | Usage so với limit | Limit có thể là host/VM capacity nếu không đặt container limit |
+| `NET I/O` | Bytes nhận/gửi tích lũy | Không phải current bandwidth; semantics theo interface/runtime |
+| `BLOCK I/O` | Bytes read/write tích lũy | Không cho latency/queue/current rate |
+| `PIDS` | Process và kernel threads/tasks | Có thể lớn hơn số process `ps` hiển thị |
+
+Machine-readable snapshot:
+
+```bash
+docker stats --no-stream --format '{{json .}}' api
+```
+
+Bảng chọn cột:
+
+```bash
+docker stats --no-stream \
+  --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.PIDs}}\t{{.BlockIO}}'
+```
+
+Các field format là string đã định dạng cho người đọc. Nếu cần số thô và semantics ổn định cho collector, dùng Engine API/cgroup metrics thay vì parse `MiB` và `%` từ CLI text.
+
+## Configured limit và current usage là hai nguồn khác nhau
+
+```bash
+docker inspect api --format '{{json .HostConfig}}' |
+  jq '{Memory, MemoryReservation, MemorySwap, NanoCpus, CpuShares, CpusetCpus, PidsLimit}'
+
+docker stats --no-stream api
+```
+
+- `inspect` cho desired/effective config Engine lưu lúc create/update;
+- `stats` cho runtime sample;
+- cgroup files cho kernel counters/limits;
+- application telemetry cho tác động tới request/job.
+
+Không dùng `MEM USAGE / LIMIT` để suy ra Compose source hoặc reservation; inspect đúng fields.
+
+## Engine stats API
+
+Docker Engine cung cấp endpoint:
+
+```text
+GET /containers/{id}/stats?stream=false
+```
+
+Trên Linux local socket, có thể thử trong lab:
+
+```bash
+CID=$(docker inspect --format '{{.Id}}' api)
+curl --unix-socket /var/run/docker.sock \
+  "http://localhost/containers/$CID/stats?stream=false" | jq '.'
+```
+
+<Callout type="warn" title="Docker socket là host authority">
+  Quyền đọc Docker socket thường đồng nghĩa quyền rất mạnh trên daemon/host, không chỉ đọc metrics. Không mount socket vào collector tùy tiện; dùng proxy/authorization hoặc integration được thiết kế theo threat model.
+</Callout>
+
+API trả raw counters và previous sample fields để client tính rate. Schema/platform khác nhau; pin Engine API compatibility và xử lý container biến mất/restart.
+
+## Cgroup v2 metrics
+
+Với container đang chạy và private cgroup namespace phù hợp:
+
+```bash
+docker exec api sh -c '
+  for f in \
+    cpu.stat cpu.pressure \
+    memory.current memory.max memory.events memory.stat memory.pressure \
+    pids.current pids.max pids.events \
+    io.stat io.pressure; do
+    [ -r "/sys/fs/cgroup/$f" ] && { echo "--- $f"; cat "/sys/fs/cgroup/$f"; }
+  done
+'
+```
+
+Collector host nên tìm cgroup membership từ container PID thay vì hard-code systemd path:
+
+```bash
+PID=$(docker inspect --format '{{.State.Pid}}' api)
+cat "/proc/$PID/cgroup"
+```
+
+Cgroup v1 có hierarchy/file names khác. Detect `/sys/fs/cgroup/cgroup.controllers` trước khi chọn parser.
+
+## Gauge, counter và rate
+
+| Kiểu | Ví dụ | Cách dùng |
+|---|---|---|
+| Gauge | `memory.current`, `pids.current` | Giá trị tại thời điểm scrape |
+| Limit/config | `memory.max`, `pids.max`, `cpu.max` | Boundary; đổi khi config/hierarchy đổi |
+| Monotonic counter | CPU usage, I/O bytes, `oom_kill`, throttled time | Tính delta/rate; reset khi cgroup/container mới |
+| Pressure ratio/time | PSI `some`/`full` | Đọc cửa sổ `avg10/60/300` và total |
+| Application histogram | Request duration | Tính percentile đúng ở backend, không average percentile tùy tiện |
+
+Container ID thay đổi khi recreate. Time series phải gắn identity ổn định như service/project/workload cùng container ID và image digest; đồng thời xử lý counter reset.
+
+## Bộ metrics tối thiểu
+
+### Container/runtime
+
+- CPU usage rate, quota và throttling rate/time;
+- memory current/working set, limit, events, OOM kill;
+- PIDs current/limit và failed allocations;
+- block/network byte rates;
+- restart count, lifecycle state và health;
+- image digest, labels, host/node và start time.
+
+### Host
+
+- CPU utilization, load/run queue và steal time khi là VM;
+- available memory, swap, PSI và host OOM;
+- filesystem bytes/inodes, device latency/queue;
+- network errors/drops/retransmits;
+- Docker daemon/runtime health;
+- parent cgroup/systemd slice pressure.
+
+### Application
+
+- request/job throughput;
+- p50/p95/p99 latency;
+- error/timeout/retry rate;
+- queue depth và concurrency;
+- GC, heap, thread/worker/connection pool;
+- dependency latency/error.
+
+Resource graph không có application signal dễ dẫn đến tối ưu sai mục tiêu.
+
+## Lab tạo tín hiệu và quan sát
+
+Tạo CPU-bound container có quota:
+
+```bash
+docker run --detach --name monitor-cpu --cpus 0.25 \
+  --label com.example.lab=monitoring \
+  alpine:3.23 sh -c 'while :; do :; done'
+```
+
+Lấy hai loại snapshot:
+
+```bash
+docker stats --no-stream monitor-cpu
+docker inspect monitor-cpu --format \
+  'id={{.Id}} started={{.State.StartedAt}} cpus={{.HostConfig.NanoCpus}}'
+docker exec monitor-cpu cat /sys/fs/cgroup/cpu.stat 2>/dev/null || true
+sleep 5
+docker exec monitor-cpu cat /sys/fs/cgroup/cpu.stat 2>/dev/null || true
+```
+
+Nếu là cgroup v2, delta `nr_throttled`/`throttled_usec` cho thấy enforcement. Cleanup:
+
+```bash
+docker rm --force monitor-cpu
+```
+
+## Alert theo symptom và exhaustion
+
+Alert tốt gắn với hành động:
+
+| Alert | Điều kiện gợi ý | Hành động đầu tiên |
+|---|---|---|
+| SLO burn | Error/latency vượt error budget | Triage release/dependency/resource |
+| CPU throttle | Throttling rate tăng + latency/queue xấu | Xác minh CPU bottleneck/quota |
+| Memory risk | Time-to-limit thấp, events tăng, GC/PSI xấu | Giảm load/leak hoặc điều chỉnh budget |
+| OOM kill | `oom_kill` hoặc lifecycle OOM event | Capture state/log/release, kiểm tra memory page |
+| PID exhaustion | `pids.current` gần max hoặc event tăng | Tìm thread/process leak, không chỉ tăng limit |
+| I/O saturation | Device/backend latency + queue/PSI tăng | Map path tới backend và noisy neighbor |
+| Disk exhaustion | Bytes/inodes/time-to-full | Log/data cleanup theo runbook, bảo vệ evidence |
+
+Không alert mọi container `CPU > 80%`: batch CPU-bound có thể hoạt động đúng, trong khi service CPU 30% vẫn outage vì downstream.
+
+## Labels và cardinality
+
+Gắn metadata cần để correlation:
+
+```bash
+docker run --label com.example.service=checkout \
+  --label com.example.environment=production \
+  --label com.example.release=2026.03.1 \
+  IMAGE
+```
+
+Tránh label cardinality không giới hạn như request ID/user ID trong infrastructure metrics. Container ID là dimension kỹ thuật có lifecycle; service/release/host là dimensions vận hành.
+
+Không đưa secret vào labels/environment chỉ để collector đọc; `docker inspect` có thể lộ chúng.
+
+## Collection architecture
+
+Một mô hình phổ biến:
+
+```text
+container/app metrics ─┐
+cgroup/runtime metrics ├─> node collector/agent -> time-series backend -> dashboard/alert
+host/device metrics ───┘                                  |
+logs/events/traces ---------------------------------------+
+```
+
+Tool có thể là cAdvisor/node exporter/vendor agent/OTel integration, nhưng tiêu chí quan trọng hơn tên tool:
+
+- hỗ trợ cgroup version và Engine hiện dùng;
+- không cần Docker socket authority quá mức;
+- giữ labels có cardinality kiểm soát;
+- scrape interval phù hợp incident window;
+- xử lý restart/counter reset;
+- có retention cho capacity và postmortem;
+- dashboard liên kết release/deploy events.
+
+## Khi số liệu không khớp
+
+CLI, API, cgroup, `top`, host agent và application runtime có thể khác vì:
+
+- sampling window khác;
+- cache/working-set formula khác;
+- process nằm ở cgroup khác;
+- container restart làm counter reset;
+- host vs Docker Desktop VM boundary;
+- network interface/path khác;
+- unit SI (`MB`) và IEC (`MiB`);
+- clock/time range hoặc label join sai.
+
+Ghi rõ metric definition trước khi “sửa” collector. Sai khác không tự chứng minh một nguồn bị lỗi.
+
+## Nguồn chính thức
+
+- [`docker container stats`](https://docs.docker.com/reference/cli/docker/container/stats/)
+- [Runtime metrics — Docker Docs](https://docs.docker.com/engine/containers/runmetrics/)
+- [Docker Engine API: Container stats](https://docs.docker.com/reference/api/engine/)
+- [Control Group v2 — Linux kernel documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)

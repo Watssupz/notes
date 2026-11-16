@@ -1,0 +1,266 @@
+---
+title: "Filter và sort Docker object"
+description: "Thu hẹp object bằng --filter theo semantics từng command, kết hợp label an toàn và sắp xếp machine-readable output mà không grep table mặc định."
+---
+
+Filter và sort giải quyết hai câu hỏi khác nhau:
+
+- **filter** chọn object nào được command trả về hoặc tác động;
+- **sort** thay đổi thứ tự trình bày sau khi đã chọn object.
+
+Docker CLI hỗ trợ `--filter` trên nhiều command, nhưng không có một `--sort` chung cho mọi object. Workflow đáng tin cậy là filter bằng field native của command, format thành JSON/TSV, rồi sort bằng tool có contract rõ như `jq` hoặc `sort`.
+
+## Cú pháp filter
+
+Dạng phổ biến:
+
+```bash
+docker COMMAND --filter 'KEY=VALUE'
+docker COMMAND --filter 'KEY!=VALUE'
+```
+
+Short form thường là `-f` nếu help của command có khai báo.
+
+Ví dụ container đang chạy:
+
+```bash
+docker container ls --filter 'status=running'
+```
+
+Ví dụ image theo reference:
+
+```bash
+docker image ls --filter 'reference=alpine:*'
+```
+
+Key, matching rule và support cho `!=` phụ thuộc command. Có filter exact match, partial match, glob hoặc regular expression. Luôn đọc reference/help đúng command:
+
+```bash
+docker container ls --help
+docker image ls --help
+docker system prune --help
+```
+
+## Kết hợp nhiều filter
+
+Thông thường, nhiều value cùng key biểu diễn tập lựa chọn kiểu OR, còn key khác nhau thu hẹp kiểu AND. Ví dụ event của một trong hai container nhưng chỉ action `die`:
+
+```bash
+docker events \
+  --filter 'container=api-a' \
+  --filter 'container=api-b' \
+  --filter 'event=die'
+```
+
+Semantics chính xác vẫn thuộc command. Đặc biệt, negated label filters có behavior dễ gây hiểu nhầm; test trên inventory read-only trước khi dùng với prune/xóa.
+
+## Container filters hữu ích
+
+### Theo status
+
+```bash
+docker container ls --all --filter 'status=exited'
+docker container ls --all --filter 'status=running'
+```
+
+`docker container ls` mặc định chỉ hiện running container. Muốn filter stopped/exited, cần `--all`.
+
+### Theo label
+
+```bash
+docker container ls --all \
+  --filter 'label=com.example.project=checkout' \
+  --filter 'label=com.example.environment=dev'
+```
+
+Label là selector tốt cho automation vì không phụ thuộc generated name. Thiết kế taxonomy từ lúc tạo object:
+
+```bash
+docker container create \
+  --name checkout-api-dev \
+  --label com.example.project=checkout \
+  --label com.example.environment=dev \
+  --label com.example.lifecycle=ephemeral \
+  alpine:latest sleep 1h
+```
+
+### Theo ancestor
+
+```bash
+docker container ls --all --filter 'ancestor=alpine:latest'
+```
+
+Tag có thể được move sang image khác. Nếu cần audit chính xác, ghi image ID/digest từ inspect thay vì chỉ dựa tag.
+
+### Theo name
+
+```bash
+docker container ls --all --filter 'name=checkout'
+```
+
+Name filter có thể match partial/regex theo command behavior. Với destructive action, đừng coi partial match là exact. In ID/name, review cardinality rồi mới xóa.
+
+## Image, volume và network filters
+
+Ví dụ:
+
+```bash
+docker image ls --filter 'dangling=true'
+docker image ls --filter 'label=com.example.owner=platform'
+docker volume ls --filter 'label=com.example.project=checkout'
+docker network ls --filter 'driver=bridge'
+```
+
+`dangling=true` không đồng nghĩa mọi image không còn được dùng. `docker system prune -a` có phạm vi rộng hơn dangling image. Đọc preview/inventory trước cleanup.
+
+Không phải mọi object đều có label theo cùng lifecycle. Compose và tool khác có thể tự thêm label; không xóa label-managed object nếu chưa hiểu owner/controller.
+
+## Filter time
+
+Một số prune/event command hỗ trợ `until` hoặc `since`; tên và clock reference phụ thuộc command. Ví dụ inventory event trong 30 phút gần nhất:
+
+```bash
+docker events --since '30m' --until '0s'
+```
+
+Với `docker events`, relative time được tính từ clock client theo official reference. Với prune `until`, relative time được tính theo daemon. Clock skew và timezone có thể làm boundary khác dự kiến; production automation nên ưu tiên timestamp có timezone và ghi rõ source clock.
+
+## Từ filter read-only tới action phá hủy
+
+Không truyền command substitution từ list sang `rm` mà chưa kiểm tra empty/multiple result. Dùng workflow hai pha.
+
+### Pha 1: inventory
+
+```bash
+docker container ls --all \
+  --filter 'label=com.example.lifecycle=ephemeral' \
+  --filter 'status=exited' \
+  --format '{{.ID}}\t{{.Names}}\t{{.Status}}'
+```
+
+### Pha 2: validate cardinality và execute
+
+```bash
+mapfile -t ids < <(
+  docker container ls --all \
+    --filter 'label=com.example.lifecycle=ephemeral' \
+    --filter 'status=exited' \
+    --format '{{.ID}}'
+)
+
+printf 'Matched %d containers\n' "${#ids[@]}"
+printf '%s\n' "${ids[@]}"
+
+# Chỉ chạy sau approval trong workflow thực tế:
+# ((${#ids[@]} > 0)) && docker container rm "${ids[@]}"
+```
+
+Production cần upper bound, owner approval và context guard. Một label sai có thể mở rộng blast radius.
+
+## Sort output bằng `sort`
+
+Tạo TSV không header, rồi sort theo field đầu:
+
+```bash
+docker container ls --all \
+  --format '{{.Names}}\t{{.ID}}\t{{.State}}' |
+  LC_ALL=C sort -t $'\t' -k1,1
+```
+
+`LC_ALL=C` làm ordering byte-wise ổn định hơn giữa host. Tuy nhiên, text sort số/human duration không cho thứ tự thời gian chính xác.
+
+Sort reverse theo name:
+
+```bash
+docker container ls --all \
+  --format '{{.Names}}\t{{.ID}}' |
+  LC_ALL=C sort -r -t $'\t' -k1,1
+```
+
+Không sort table có header rồi giả định header luôn ở đầu; bỏ header ở source và tự thêm sau nếu cần.
+
+## Sort JSON bằng `jq`
+
+JSON giúp giữ type và xử lý field rõ hơn:
+
+```bash
+docker container ls --all --format '{{json .}}' |
+  jq -s 'sort_by(.Names) | map({name: .Names, id: .ID, state: .State})'
+```
+
+Sort theo thời điểm tạo từ inspect:
+
+```bash
+docker container inspect $(docker container ls --all --quiet) |
+  jq 'sort_by(.Created) | map({name: .Name, created: .Created, id: .Id})'
+```
+
+Command substitution trên có một caveat: nếu không có container, `docker container inspect` thiếu argument và có thể báo lỗi. Viết script robust bằng cách thu ID array và xử lý empty trước.
+
+```bash
+mapfile -t ids < <(docker container ls --all --quiet)
+if ((${#ids[@]} == 0)); then
+  printf '[]\n'
+else
+  docker container inspect "${ids[@]}" |
+    jq 'sort_by(.Created) | map({name: .Name, created: .Created, id: .Id})'
+fi
+```
+
+ISO/RFC3339 timestamp có cùng normalization thường sort lexicographically được; nếu input timezone/format khác nhau, parse time bằng `jq` hoặc application code.
+
+## Vì sao không dùng `grep` trên table?
+
+Command sau dễ match cả image, command, status hoặc name:
+
+```bash
+# Không dùng làm selector xóa
+# docker ps -a | grep checkout
+```
+
+Nó còn phụ thuộc:
+
+- cột và truncation;
+- locale/terminal width;
+- default format trong `config.json`;
+- substring trùng ngoài ý muốn;
+- whitespace trong field.
+
+Dùng native filter trước, sau đó exact validation bằng machine-readable field.
+
+## Negation và prune
+
+Negated label filter cần đặc biệt thận trọng. Official filter guide nêu rằng kết hợp nhiều negated label filters có thể tạo constraint khiến object chỉ được bảo vệ nếu match đồng thời các điều kiện; object có một trong hai label vẫn có thể bị prune.
+
+Không bắt đầu bằng:
+
+```bash
+# Nguy hiểm nếu chưa hiểu semantics
+# docker container prune --filter 'label!=keep' --filter 'label!=critical'
+```
+
+Thay vào đó:
+
+1. liệt kê toàn bộ candidate bằng read-only command;
+2. tạo positive lifecycle label cho object được phép xóa;
+3. filter theo positive label;
+4. review count và age;
+5. dùng object-specific delete khi cần kiểm soát chính xác.
+
+## Troubleshooting
+
+| Triệu chứng | Nguyên nhân | Cách xử lý |
+|---|---|---|
+| Filter trả rỗng | Sai key/value hoặc quên `--all` | Đọc help, xem unfiltered inventory nhỏ |
+| Match quá rộng | Partial/regex semantics | In ID/name/label và exact-check trước action |
+| Sort “10” trước “2” | Lexicographic sort | Dùng numeric key/JSON number và `sort -n`/`jq` |
+| Output khác giữa máy | Locale hoặc personal format | `LC_ALL=C`, truyền `--format` explicit |
+| Prune xóa ngoài dự kiến | Negation/multi-filter hiểu sai | Dùng positive selector và two-phase review |
+| Script lỗi khi zero object | Command substitution tạo no argument | Thu array và handle cardinality 0 |
+
+## Nguồn chính thức
+
+- [Filter commands](https://docs.docker.com/engine/cli/filter/)
+- [docker container ls](https://docs.docker.com/reference/cli/docker/container/ls/)
+- [docker image ls](https://docs.docker.com/reference/cli/docker/image/ls/)
+- [docker system prune](https://docs.docker.com/reference/cli/docker/system/prune/)

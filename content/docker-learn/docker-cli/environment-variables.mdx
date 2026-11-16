@@ -1,0 +1,267 @@
+---
+title: "Environment variables của Docker CLI"
+description: "Dùng DOCKER_CONTEXT, DOCKER_HOST, TLS, API version, platform, proxy và BuildKit environment variables đúng scope, precedence và security boundary."
+---
+
+Environment variable cho phép cấu hình Docker CLI theo process hoặc shell session mà không lặp flag. Sự tiện lợi này đi kèm hai rủi ro: biến còn sót có thể chuyển command sang daemon khác, và giá trị nhạy cảm có thể bị lộ qua log CI hoặc process environment.
+
+Trước khi chẩn đoán một command hành xử khác dự kiến, thu inventory:
+
+```bash
+docker context show
+env | grep -E '^(DOCKER_|BUILDKIT_PROGRESS|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|NO_COLOR)=' || true
+```
+
+Redact proxy credential, internal hostname và certificate path trước khi chia sẻ output.
+
+## Precedence và scope
+
+Docker CLI có thể nhận setting từ command-line flag, environment variable và `config.json`. Với setting trùng nhau, official CLI reference mô tả thứ tự tổng quát:
+
+```text
+command-line option > environment variable > config.json
+```
+
+`--config` override `DOCKER_CONFIG`. `DOCKER_CONTEXT` override `DOCKER_HOST` và context được chọn bằng `docker context use`.
+
+Không phải field nào cũng tồn tại ở cả ba layer. Tránh đặt cùng intent ở nhiều nơi; một source of truth giúp biết target effective.
+
+Scope của shell:
+
+```bash
+# Chỉ áp dụng cho một process
+DOCKER_CONTEXT=staging docker version
+
+# Áp dụng cho command sau trong shell hiện tại
+export DOCKER_CONTEXT=staging
+docker version
+
+# Bỏ override
+unset DOCKER_CONTEXT
+```
+
+Trong CI, ưu tiên env theo step/job và xóa credential sau job thay vì ghi vào shell profile.
+
+## Nhóm chọn daemon
+
+| Variable | Vai trò | Khi nên dùng |
+|---|---|---|
+| `DOCKER_CONTEXT` | Chọn named context | CI/job hoặc shell cần target đã provision |
+| `DOCKER_HOST` | Chỉ định daemon socket trực tiếp | Tool legacy hoặc test endpoint tạm thời |
+| `DOCKER_TLS` | Bật TLS khi value không rỗng | Remote TLS endpoint có cấu hình phù hợp |
+| `DOCKER_TLS_VERIFY` | Bật TLS và verify remote khi được set | Remote TLS; cần CA/certificate đúng |
+| `DOCKER_CERT_PATH` | Directory chứa key/certificate authentication | Khi dùng TLS material ngoài default config |
+
+Ví dụ pin context cho một command:
+
+```bash
+DOCKER_CONTEXT=staging docker version
+```
+
+Ví dụ Unix socket explicit:
+
+```bash
+DOCKER_HOST=unix:///var/run/docker.sock docker version
+```
+
+Đừng dùng `DOCKER_HOST=tcp://host:2375` qua network. Plaintext Docker API không có authentication và trao quyền quản lý daemon cho bất kỳ client nào truy cập được.
+
+### Tránh biến Boolean giả
+
+`DOCKER_TLS_VERIFY` được hiểu theo việc biến **có được set hay không**, không theo text `true`/`false` như application config thông thường. `DOCKER_TLS` bật khi value không rỗng. Khi muốn tắt override, dùng:
+
+```bash
+unset DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+```
+
+Không dùng `DOCKER_TLS_VERIFY=0` với giả định chắc chắn là false.
+
+## Client configuration directory
+
+`DOCKER_CONFIG` đổi directory chứa client config, context metadata liên quan và credential state:
+
+```bash
+export DOCKER_CONFIG="$HOME/.docker-ci"
+docker --config "$HOME/.docker-ci" context ls
+```
+
+Global flag `--config` chỉ áp dụng command hiện tại và có precedence cao hơn variable.
+
+Tạo directory với permission hạn chế:
+
+```bash
+install -d -m 0700 "$HOME/.docker-ci"
+```
+
+Không copy nguyên config cá nhân vào CI. Provision credential helper/context tối thiểu và đặt lifecycle xóa rõ ràng.
+
+## API version
+
+`DOCKER_API_VERSION` ép CLI hoặc SDK dùng một API version cụ thể và vô hiệu API negotiation tự động. Chỉ dùng để debug compatibility hoặc khi integration bắt buộc pin version:
+
+```bash
+DOCKER_API_VERSION=1.54 docker version
+```
+
+Không copy version trên vào production mà chưa xem daemon của bạn:
+
+```bash
+docker version
+```
+
+Dùng sai version có thể làm feature mới biến mất hoặc request bị daemon từ chối. Bình thường nên để client và daemon negotiation.
+
+## Default platform
+
+`DOCKER_DEFAULT_PLATFORM` đặt platform mặc định cho command hỗ trợ `--platform`:
+
+```bash
+DOCKER_DEFAULT_PLATFORM=linux/amd64 docker image inspect alpine:latest
+```
+
+Biến này hữu ích trên máy multi-architecture nhưng cũng có thể che việc image không có variant native. Trong CI release, truyền `--platform` tường minh ở build/pull/run quan trọng và kiểm tra image manifest thay vì dựa hoàn toàn vào profile shell.
+
+## BuildKit progress và màu
+
+| Variable | Value phổ biến | Tác dụng |
+|---|---|---|
+| `BUILDKIT_PROGRESS` | `auto`, `plain`, `tty`, `rawjson` | Chọn cách BuildKit render progress |
+| `NO_COLOR` | bất kỳ theo convention của tool | Yêu cầu tắt ANSI color trong output hỗ trợ convention |
+
+CI log thường dễ lưu và tìm kiếm hơn với:
+
+```bash
+BUILDKIT_PROGRESS=plain docker buildx build .
+```
+
+`rawjson` phù hợp consumer xử lý event có schema; không dùng khi chỉ cần log text cho người đọc.
+
+## Proxy: ba boundary khác nhau
+
+Các biến `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` trên process CLI ảnh hưởng HTTP client theo behavior của Go runtime và command liên quan. Chúng không tự động cấu hình mọi network path của Docker.
+
+| Boundary | Cấu hình ở đâu | Ví dụ traffic |
+|---|---|---|
+| Docker CLI process | Environment của CLI | Một số request do client/plugin thực hiện |
+| Docker daemon | Service environment hoặc daemon settings | Pull/push và daemon egress |
+| Container/build workload | `config.json` `proxies`, `--env`, build settings | Application bên trong container/build step |
+
+Nếu `docker pull` lỗi proxy, chỉ export proxy trong terminal có thể chưa đủ vì daemon là process thực hiện registry traffic. Xem [Proxy và registry mirror](/docs/cai-dat-va-moi-truong/proxy-and-mirror/) để cấu hình theo boundary.
+
+`NO_PROXY` cần chứa hostname/domain/IP/CIDR theo behavior được support bởi component thực tế. Test DNS và request từ đúng process; đừng giả định syntax được mọi runtime diễn giải giống nhau.
+
+## Variable khác của CLI
+
+Các biến sau hữu ích trong trường hợp cụ thể:
+
+| Variable | Ý nghĩa |
+|---|---|
+| `DOCKER_CUSTOM_HEADERS` | Gửi custom HTTP headers; tính năng experimental, có từ CLI v27.1 theo official reference |
+| `DOCKER_HIDE_LEGACY_COMMANDS` | Ẩn legacy top-level commands khỏi help, chỉ hiện management commands |
+
+Không dùng custom header để truyền secret nếu proxy, daemon log hoặc tracing có thể ghi header. Kiểm tra CLI version và policy trước khi dùng experimental behavior.
+
+## Phân biệt host env và container env
+
+Environment của terminal không tự động đi vào container:
+
+```bash
+export APP_ENV=host-value
+docker container run --rm alpine:latest env | grep '^APP_ENV=' || true
+```
+
+Muốn truyền value, dùng `--env`:
+
+```bash
+docker container run --rm --env APP_ENV alpine:latest \
+  env | grep '^APP_ENV='
+```
+
+Cú pháp `--env APP_ENV` lấy value từ environment của CLI. Không dùng cách này cho secret nếu command history, inspect, Engine API hoặc downstream process có thể lộ value. Dùng secret mechanism phù hợp workload.
+
+## Pattern CI có target tường minh
+
+```bash
+set -euo pipefail
+
+: "${DOCKER_CONTEXT:?DOCKER_CONTEXT is required}"
+
+case "$DOCKER_CONTEXT" in
+  ci-builder-* ) ;;
+  * )
+    echo "Context not allowed: $DOCKER_CONTEXT" >&2
+    exit 1
+    ;;
+esac
+
+export BUILDKIT_PROGRESS=plain
+
+docker context inspect "$DOCKER_CONTEXT" \
+  --format '{{.Endpoints.docker.Host}}'
+docker version
+docker buildx build --pull --tag example/app:test --load .
+```
+
+CI secret store nên inject credential theo job, mask log và revoke sau dùng. Không in toàn bộ `env` trong diagnostic bundle nếu chưa redact.
+
+## Troubleshooting
+
+### Context không như `docker context use`
+
+```bash
+printf 'DOCKER_CONTEXT=%q\n' "${DOCKER_CONTEXT-}"
+printf 'DOCKER_HOST=%q\n' "${DOCKER_HOST-}"
+docker context show
+```
+
+Bỏ override rồi kiểm tra lại:
+
+```bash
+unset DOCKER_CONTEXT DOCKER_HOST
+docker context show
+```
+
+### TLS vẫn bật sau khi đặt `0`
+
+Unset variable thay vì gán string `0`:
+
+```bash
+unset DOCKER_TLS DOCKER_TLS_VERIFY
+```
+
+### Config hoặc context “biến mất”
+
+```bash
+printf 'DOCKER_CONFIG=%q\n' "${DOCKER_CONFIG-}"
+docker --config "$HOME/.docker" context ls
+```
+
+Bạn có thể đang chạy dưới user khác, `sudo`, CI home khác hoặc custom `DOCKER_CONFIG`.
+
+### Behavior chỉ lỗi trong CI
+
+So sánh có redact:
+
+```bash
+docker version
+docker context inspect "${DOCKER_CONTEXT:-default}"
+env | grep -E '^(DOCKER_|BUILDKIT_PROGRESS|HTTP_PROXY|HTTPS_PROXY|NO_PROXY)=' || true
+```
+
+Kiểm tra shell non-interactive không nạp profile, credential helper không có trên `PATH`, HOME khác và plugin version khác.
+
+## Best practices
+
+- Dùng env cho setting theo process/job; dùng context cho endpoint có tên và metadata.
+- Pin target trong automation và validate endpoint trước mutate.
+- Unset override sau troubleshooting.
+- Không lưu private key, token hoặc proxy password trong repository hay output CI.
+- Không ép `DOCKER_API_VERSION` nếu negotiation hoạt động.
+- Tách proxy của CLI, daemon và workload.
+- Ghi rõ variable bắt buộc bằng `${VAR:?message}` để fail sớm.
+
+## Nguồn chính thức
+
+- [Docker CLI environment variables](https://docs.docker.com/reference/cli/docker/#environment-variables)
+- [Docker contexts](https://docs.docker.com/engine/manage-resources/contexts/)
+- [Docker Engine API versioning](https://docs.docker.com/reference/api/engine/)

@@ -1,0 +1,175 @@
+---
+title: "User namespace remapping"
+description: "Map UID/GID trong container sang subordinate ID không đặc quyền trên host bằng userns-remap, với lưu ý về bind mount, storage và migration."
+---
+
+`userns-remap` giữ Docker daemon chạy rootful nhưng đặt container vào user namespace. UID `0` bên trong được map sang một UID số lớn, không đặc quyền trên host.
+
+```text
+Container UID     0      1      2 ... 65535
+                  │      │      │
+Host UID       231072 231073 231074 ... 296607
+```
+
+Nếu process escape khỏi các namespace khác nhưng vẫn chịu user namespace mapping, nó không trở thành host UID `0`. Đây là lớp giảm blast radius, không thay việc chạy application non-root.
+
+## User namespace giải quyết gì?
+
+| Tình huống | Tác dụng |
+|---|---|
+| Process là root trong container | Map sang subordinate host UID |
+| Ghi bind mount | Chỉ được theo permission của mapped UID/GID |
+| Kernel/runtime exploit | Có thể tăng rào cản; không đảm bảo chặn mọi exploit |
+| Docker socket bị lộ | Không bảo vệ daemon rootful khỏi caller có quyền API |
+| Secret được mount cho app | App vẫn đọc được theo quyền trong container |
+
+<Callout type="warn" title="Daemon vẫn là root">
+  `userns-remap` giảm quyền container process nhưng không giảm authority của `dockerd`. Bảo vệ socket/API riêng; nếu cần daemon không root, đánh giá rootless mode.
+</Callout>
+
+## Subordinate UID/GID
+
+Mapping nằm trong `/etc/subuid` và `/etc/subgid`:
+
+```bash
+grep '^dockremap:' /etc/subuid /etc/subgid
+```
+
+Ví dụ:
+
+```text
+/etc/subuid:dockremap:231072:65536
+/etc/subgid:dockremap:231072:65536
+```
+
+Ba field là tên user, ID bắt đầu và số lượng ID. Range của các user phải không overlap. Kernel chỉ hỗ trợ số entry mapping giới hạn; Docker dùng tối đa năm range đầu theo tài liệu Engine.
+
+Có thể để Docker tạo account `dockremap` bằng giá trị `default`, hoặc dùng account đã quản lý sẵn. Production nên dùng account riêng, range được cấp qua tooling của distro/IAM host.
+
+## Bật trên daemon mới
+
+`/etc/docker/daemon.json`:
+
+```json
+{
+  "userns-remap": "default"
+}
+```
+
+Kiểm tra JSON trước khi restart:
+
+```bash
+sudo python3 -m json.tool /etc/docker/daemon.json >/dev/null
+sudo systemctl restart docker
+```
+
+Sau đó:
+
+```bash
+id dockremap
+grep '^dockremap:' /etc/subuid /etc/subgid
+docker info --format '{{json .SecurityOptions}}'
+docker run --rm alpine:3.23 sh -c 'id; cat /proc/self/uid_map'
+```
+
+<Callout type="error" title="Bật trên host đang có dữ liệu">
+  Enabling `userns-remap` làm các image, container và object hiện có dưới `/var/lib/docker` bị che bởi storage namespace mới. Ưu tiên node mới, backup và thử restore/rollback; không bật trực tiếp trên host production rồi kỳ vọng object cũ vẫn xuất hiện.
+</Callout>
+
+Disable remap cũng làm object tạo trong chế độ remap không còn nhìn thấy theo cùng cách. Xem đây là migration storage/node, không phải toggle vô hại.
+
+## Bind mount và ownership
+
+Ví dụ container root map sang host UID `231072`. Path bind mount cần permission cho UID/GID mapped:
+
+```bash
+sudo install -d -o 231072 -g 231072 -m 0750 /srv/userns-demo
+
+docker run --rm \
+  --mount type=bind,src=/srv/userns-demo,dst=/data \
+  alpine:3.23 sh -c 'id; touch /data/created-by-container; ls -ln /data'
+
+sudo ls -ln /srv/userns-demo
+```
+
+Cleanup:
+
+```bash
+sudo rm -rf /srv/userns-demo
+```
+
+Chỉ chạy cleanup sau khi xác nhận path lab. Trong production, hard-code `231072` là mong manh nếu mapping đổi. Quản lý ownership như một phần provisioning và xác minh effective map.
+
+Tránh `chmod 777`: nó mở dữ liệu cho mọi local user và container khác. Nếu application chỉ cần một path, cấp đúng path; ưu tiên named volume khi không cần host thao tác file trực tiếp.
+
+## Root trong container và application user
+
+Giả sử image dùng `USER 10001`. Với start UID `231072`, host UID hiệu dụng thường là `231072 + 10001 = 241073` nếu mapping liên tục. Vì vậy:
+
+- `USER` vẫn giảm quyền bên trong namespace;
+- userns tiếp tục map identity đó sang host range;
+- file ownership từ image, volume và bind mount phải tương thích cả hai lớp.
+
+Không suy ra mapping bằng phép cộng trong automation nếu có nhiều range; đọc `/proc/<pid>/uid_map` hoặc runtime metadata.
+
+## Ngoại lệ `--userns=host`
+
+Khi daemon bật remap, có thể tắt cho một container:
+
+```bash
+docker run --rm --userns=host alpine:3.23 id
+```
+
+Đây là security exception. Một số ownership của shared image layer vẫn có thể gây behavior bất ngờ; binary setuid và tool kỳ vọng owner UID `0` có thể lỗi. Không dùng flag này như fix mặc định cho bind mount.
+
+## Giới hạn cần kiểm tra
+
+Theo Docker Engine, user namespace remapping không tương thích hoặc cần xử lý đặc biệt với:
+
+- `--network=host` và `--pid=host`;
+- external volume/storage driver không hiểu mapping;
+- `--privileged` nếu không đồng thời dùng `--userns=host`;
+- device creation và một số syscall bị kernel hạn chế;
+- bind mount cần ownership host được chuẩn bị;
+- workload phụ thuộc setuid hoặc host UID cụ thể.
+
+Test full workload trên node canary: startup, healthcheck, volume restore, log collector, backup agent và cleanup.
+
+## So sánh với rootless
+
+| Thuộc tính | `userns-remap` | Rootless |
+|---|---|---|
+| Daemon | Root | User thường |
+| Container UID mapping | Subordinate range của remap user | Subordinate range của user chạy daemon |
+| Compatibility | Gần rootful hơn nhưng có giới hạn userns | Có thêm giới hạn network/cgroup/storage |
+| Socket | Rootful socket cần bảo vệ như root | Socket thuộc user; vẫn rất mạnh trong scope user |
+| Dùng khi | Cần rootful Engine nhưng giảm container root | Muốn giảm cả daemon authority |
+
+## Troubleshooting
+
+### Container không ghi được bind mount
+
+```bash
+docker inspect CONTAINER --format '{{json .Mounts}}'
+pid="$(docker inspect -f '{{.State.Pid}}' CONTAINER)"
+sudo cat "/proc/${pid}/uid_map"
+sudo namei -l /path/on/host
+```
+
+Kiểm tra permission mọi parent directory, ACL, SELinux/AppArmor và filesystem support; không chỉ file cuối.
+
+### Image/container cũ biến mất
+
+```bash
+docker info --format '{{.DockerRootDir}}'
+sudo find /var/lib/docker -maxdepth 2 -type d -name '*.*' -print
+```
+
+Không xóa storage cũ. Xác nhận daemon config, backup và kế hoạch migration trước khi đổi lại mode.
+
+## Nguồn chính thức
+
+- [Isolate containers with a user namespace](https://docs.docker.com/engine/security/userns-remap/)
+- [Linux user namespaces](https://man7.org/linux/man-pages/man7/user_namespaces.7.html)
+- [Rootless mode](/docs/security/rootless-security/)
+- [Bảo vệ Docker daemon](/docs/security/daemon-socket-security/)

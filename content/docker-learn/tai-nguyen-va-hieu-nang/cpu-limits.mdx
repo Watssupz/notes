@@ -1,0 +1,269 @@
+---
+title: "CPU limits và reservations"
+description: "Giới hạn và ưu tiên CPU cho container bằng quota, shares/weight và cpuset; đọc throttling, phân biệt ceiling với reservation và sizing theo latency."
+---
+
+Docker cung cấp ba nhóm CPU control khác nhau:
+
+- **quota** giới hạn tổng CPU time trong mỗi scheduling period;
+- **shares/weight** quyết định ưu tiên tương đối khi có contention;
+- **cpuset** giới hạn CPU IDs mà process được phép chạy.
+
+Dùng sai loại control thường dẫn tới hai lỗi đối nghịch: tưởng đã reserve CPU trong khi chỉ đặt weight, hoặc đặt quota quá chặt khiến latency tăng dù host vẫn còn core nhàn rỗi ở nơi khác.
+
+## Chọn option đúng
+
+| Option | Loại control | Dùng khi | Điểm cần nhớ |
+|---|---|---|---|
+| `--cpus 1.5` | Hard quota thuận tiện | Phần lớn workload | Ceiling CPU time, không phải core reservation |
+| `--cpu-period`, `--cpu-quota` | Hard quota mức thấp | Cần điều khiển period/quota rõ | Thường nên dùng `--cpus` |
+| `--cpu-shares 512` | Relative weight | Ưu tiên peer khi contention | Không chặn CPU khi host rảnh |
+| `--cpuset-cpus 2-3` | Affinity | NUMA/cache/license hoặc workload đặc biệt | Có thể gây hotspot và giảm scheduler flexibility |
+| `--cpuset-mems 0` | NUMA memory-node affinity | Host NUMA đã được đo/thiết kế | Chỉ có hiệu lực trên NUMA system phù hợp |
+
+Với default period 100000 microseconds, `--cpus 0.5` tương đương gần với:
+
+```bash
+--cpu-period 100000 --cpu-quota 50000
+```
+
+Container có thể chạy trên nhiều core tại các thời điểm khác nhau, nhưng chỉ nhận tổng cộng 50000 microseconds CPU time trong mỗi period. Khi dùng hết quota, cgroup bị throttle tới period tiếp theo.
+
+<Callout type="info" title="CPU percentage có thể lớn hơn 100%">
+  Trên Linux, `docker stats` có thể hiển thị khoảng 200% khi workload dùng hai CPU đầy đủ. Vì vậy `--cpus 0.5` thường hướng tới ceiling xấp xỉ 50%, không phải 0.5%.
+</Callout>
+
+## `--cpus` là ceiling, không phải reservation
+
+```bash
+docker run --detach \
+  --name cpu-half \
+  --cpus 0.5 \
+  alpine:3.23 sh -c 'while :; do :; done'
+```
+
+Container không được bảo đảm luôn có 0.5 CPU. Nó có thể nhận ít hơn nếu:
+
+- parent cgroup đã bị giới hạn;
+- cpuset chỉ vào core đang bận;
+- host oversubscribe hoặc có scheduler pressure;
+- Docker Desktop VM chỉ được cấp ít CPU;
+- process block vì I/O, lock hoặc external dependency.
+
+Xác minh Engine config:
+
+```bash
+docker inspect cpu-half --format \
+  'NanoCpus={{.HostConfig.NanoCpus}} Period={{.HostConfig.CpuPeriod}} Quota={{.HostConfig.CpuQuota}} Cpuset={{.HostConfig.CpusetCpus}}'
+```
+
+`NanoCpus=500000000` biểu diễn `0.5` CPU trong Engine API model.
+
+Quan sát:
+
+```bash
+docker stats --no-stream cpu-half
+```
+
+Cleanup lab:
+
+```bash
+docker rm --force cpu-half
+```
+
+## CPU shares chỉ có ý nghĩa khi cạnh tranh
+
+Mặc định Docker dùng CPU shares tương ứng weight mặc định của platform. Ví dụ:
+
+```bash
+docker run --detach --name cpu-important --cpu-shares 1024 \
+  alpine:3.23 sh -c 'while :; do :; done'
+
+docker run --detach --name cpu-batch --cpu-shares 256 \
+  alpine:3.23 sh -c 'while :; do :; done'
+```
+
+Khi hai container thực sự tranh cùng CPU capacity/hierarchy, `cpu-important` có weight cao hơn. Tỷ lệ quan sát không phải contract tuyệt đối vì còn có process count, cpuset, parent hierarchy, scheduler và các workload khác.
+
+Nếu host rảnh, `cpu-batch` vẫn có thể dùng nhiều CPU. Muốn ceiling, thêm `--cpus`.
+
+```bash
+docker rm --force cpu-important cpu-batch
+```
+
+Không gọi `--cpu-shares` là “CPU reservation”. Trên orchestrator, `reservations.cpus` có thể tham gia scheduling/admission; trên standalone Engine, shares chỉ là runtime weight. Luôn xác minh platform đích.
+
+## Cpuset và topology
+
+```bash
+docker run --detach \
+  --name cpu-pinned \
+  --cpuset-cpus 2-3 \
+  --cpus 1 \
+  alpine:3.23 sh -c 'while :; do :; done'
+```
+
+Cấu hình này chỉ cho workload chạy trên CPU IDs `2` và `3`, đồng thời giới hạn tổng CPU time ở mức một CPU. Cpuset không tự chia đều giữa hai core.
+
+Kiểm tra effective affinity trong container:
+
+```bash
+docker exec cpu-pinned grep Cpus_allowed_list /proc/1/status
+```
+
+Trước khi pin, thu thập topology:
+
+```bash
+lscpu --extended
+lscpu | grep -E 'CPU\(s\)|Core|Socket|NUMA'
+```
+
+Pinning có thể hữu ích cho jitter-sensitive workload hoặc locality, nhưng có trade-off:
+
+- scheduler không chuyển workload sang core nhàn ngoài cpuset;
+- sibling hyperthreads chia execution resources;
+- IRQ và host process có thể vẫn chạy trên cùng core;
+- container recreate trên host khác có topology khác;
+- NUMA memory ở node xa làm latency xấu dù CPU đã pin.
+
+Cleanup:
+
+```bash
+docker rm --force cpu-pinned
+```
+
+## Đọc CPU throttling trên cgroup v2
+
+Tạo workload có quota nhỏ:
+
+```bash
+docker run --detach --name cpu-throttle --cpus 0.25 \
+  alpine:3.23 sh -c 'while :; do :; done'
+```
+
+Từ trong container cgroup v2:
+
+```bash
+docker exec cpu-throttle sh -c '
+  echo "--- cpu.max"; cat /sys/fs/cgroup/cpu.max
+  echo "--- cpu.stat"; cat /sys/fs/cgroup/cpu.stat
+'
+```
+
+Các field thường gặp:
+
+| Field | Ý nghĩa |
+|---|---|
+| `usage_usec` | Tổng CPU time đã dùng |
+| `user_usec`, `system_usec` | CPU time user/kernel nếu kernel expose |
+| `nr_periods` | Số enforcement periods đã trôi qua |
+| `nr_throttled` | Số period cgroup từng bị throttle |
+| `throttled_usec` | Tổng thời gian bị throttle |
+
+Chụp hai lần cách nhau một khoảng rồi tính delta. Counter từ lúc container chạy không cho biết mức throttling hiện tại nếu chỉ đọc một lần.
+
+```bash
+sleep 5
+docker exec cpu-throttle cat /sys/fs/cgroup/cpu.stat
+```
+
+Trên cgroup v1, file/path khác. Có thể tìm cgroup host từ PID như trang [Control groups](/docs/nen-tang-container/control-groups/) hướng dẫn.
+
+```bash
+docker rm --force cpu-throttle
+```
+
+## Throttling và saturation không giống nhau
+
+| Signal | Diễn giải có thể |
+|---|---|
+| CPU usage chạm quota, throttling delta tăng | Quota đang giới hạn workload CPU-bound |
+| CPU usage thấp, latency cao | I/O, lock, network, downstream hoặc thread-pool wait |
+| CPU usage cao, không throttling, run queue cao | Host/core saturation hoặc không có quota |
+| Một core 100%, tổng CPU thấp | Single-thread bottleneck hoặc affinity |
+| System CPU tăng mạnh | Syscall/network/storage overhead, contention kernel |
+| Throughput không tăng khi nới quota | Bottleneck nằm nơi khác hoặc workload không parallelize |
+
+Nới CPU limit chỉ sau khi chứng minh CPU là bottleneck. Nếu application giữ global lock, cấp từ một lên bốn CPU có thể không tăng throughput.
+
+## Cấu hình Compose
+
+Standalone Compose hỗ trợ service-level CPU options, ví dụ:
+
+```yaml
+services:
+  api:
+    image: example/api:1.4.2
+    cpus: 1.5
+    cpu_shares: 1024
+    cpuset: "2-3"
+```
+
+Với `deploy.resources`, semantics reservation/limit phụ thuộc Compose implementation và orchestrator:
+
+```yaml
+services:
+  api:
+    image: example/api:1.4.2
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+        reservations:
+          cpus: "0.5"
+```
+
+Validate model và effective Engine config:
+
+```bash
+docker compose config
+docker compose up --detach
+docker compose ps --quiet api | xargs docker inspect --format \
+  'NanoCpus={{.HostConfig.NanoCpus}} Shares={{.HostConfig.CpuShares}} Cpuset={{.HostConfig.CpusetCpus}}'
+```
+
+Không suy ra standalone Compose đã reserve CPU vật lý chỉ vì file có `reservations`.
+
+## Update container đang chạy
+
+Một số CPU limit có thể đổi bằng `docker update`:
+
+```bash
+docker update --cpus 1.0 CONTAINER
+```
+
+Thay đổi trực tiếp hữu ích để giảm incident pressure, nhưng tạo configuration drift nếu deployment source không được cập nhật. Sau emergency change:
+
+1. ghi lại giá trị cũ/mới và thời điểm;
+2. đo SLO cùng throttling;
+3. cập nhật Compose/IaC nếu quyết định giữ;
+4. recreate để xác minh desired state.
+
+## Sizing CPU theo workload
+
+- Đo **CPU-seconds trên mỗi request/job**, không chỉ average CPU %.
+- Tách request path, background worker, GC và startup/compilation.
+- Test ở concurrency đủ cao để lộ queueing và lock contention.
+- Quan sát p95/p99; quota period có thể ảnh hưởng tail latency.
+- Để headroom cho daemon, kernel, logging và host agents.
+- Với batch, dùng weight thấp và ceiling phù hợp để không phá latency workload.
+- Với latency-sensitive service, cân nhắc scale out trước khi pin core hoặc dùng real-time scheduling.
+
+Real-time CPU flags (`--cpu-rt-runtime`, `--cap-add SYS_NICE`, `--ulimit rtprio`) là cấu hình kernel nâng cao có thể làm host mất ổn định. Không dùng để “sửa” latency thông thường.
+
+## Lỗi thường gặp
+
+- Dùng shares rồi kỳ vọng hard limit.
+- Gọi quota là CPU reservation.
+- Chỉ nhìn CPU % mà không đọc throttling và SLO.
+- Pin cpuset theo CPU IDs của một host rồi deploy sang host khác.
+- Tăng worker count vượt CPU budget, làm context switching và tail latency xấu hơn.
+- Nới quota khi bottleneck thật là disk, lock hoặc downstream.
+- Quên giới hạn parent cgroup hoặc Docker Desktop VM.
+
+## Nguồn chính thức
+
+- [Resource constraints: CPU — Docker Docs](https://docs.docker.com/engine/containers/resource_constraints/#cpu)
+- [`docker container run` CPU options](https://docs.docker.com/reference/cli/docker/container/run/)
+- [`docker container update`](https://docs.docker.com/reference/cli/docker/container/update/)
+- [Cgroup v2 CPU controller](https://docs.kernel.org/admin-guide/cgroup-v2.html#cpu)

@@ -1,0 +1,549 @@
+---
+title: "Xác minh môi trường Docker"
+description: "Checklist end-to-end kiểm tra context, Client/Server, daemon, registry, runtime, bind mount, published port, Buildx, Compose, resource và cleanup."
+---
+
+Một installation “đúng” phải vượt qua nhiều boundary: CLI tới đúng daemon, daemon pull được image, runtime tạo được process, storage ghi được dữ liệu, network publish đúng port và toolchain build/Compose sẵn sàng. `docker run hello-world` hữu ích nhưng không kiểm tra hết các boundary đó.
+
+Trang này cung cấp acceptance test có cleanup. Chạy trên máy lab hoặc daemon local; không chạy trên shared/production daemon nếu chưa có change approval.
+
+## Phạm vi và biến dùng trong lab
+
+Lab tạo các object có prefix `env-check`:
+
+- image `env-check:local`;
+- container `env-check-run`, `env-check-web`;
+- volume `env-check-data`;
+- network `env-check-net`;
+- directory tạm chứa Dockerfile.
+
+Các test pull `alpine` và `nginx:alpine` từ registry. Nếu tổ chức chỉ cho phép internal registry, thay hai reference bằng approved equivalents và điều chỉnh command bên trong theo tool có trong image.
+
+<Callout type="error" title="Dừng nếu target không phải môi trường lab">
+  Command tạo/xóa Docker objects trên daemon của context hiện tại. Xác minh context, owner và maintenance policy trước. Published port `127.0.0.1:18080` xuất hiện trên host chạy daemon, không nhất thiết trên terminal local.
+</Callout>
+
+## Ma trận acceptance
+
+| Layer | Test | Dấu hiệu đạt |
+|---|---|---|
+| Target | Context và endpoint | Đúng daemon dự kiến, không phải production ngoài ý muốn |
+| API | `docker version` | Có Client và Server, không negotiation/connect error |
+| Daemon | `docker info`/service | Daemon active, config/security/storage như thiết kế |
+| Registry | Pull approved image | DNS, proxy, TLS, auth và content download thành công |
+| Runtime | Run process | Process start, output đúng, exit `0` |
+| Storage | Named volume + bind mount | Dữ liệu persist qua container và host file mount đọc được |
+| Network | User-defined network + published port | Container resolve nhau; host loopback nhận HTTP response |
+| Build | Buildx build local image | BuildKit hoàn tất và image chạy được |
+| Compose | Plugin/config | Plugin có mặt; model được parse hợp lệ |
+| Resource/security | Inspect effective config | Cgroup/security option khớp expectation |
+| Operations | Logs/events/cleanup | Quan sát được lifecycle và xóa đúng object lab |
+
+## 1. Xác minh target trước mọi thao tác
+
+```bash
+docker context show
+docker context ls
+env | grep '^DOCKER_' || true
+```
+
+Đọc:
+
+- dấu `*` trong `docker context ls`;
+- Docker endpoint (`unix://`, `ssh://`, Desktop endpoint...);
+- `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_TLS_VERIFY` có override không.
+
+Nếu context là remote, published port và bind-mount source path được resolve trên remote daemon host. Test bind mount trong phần sau chỉ phù hợp daemon local; bỏ qua hoặc chuẩn bị file trên remote host bằng runbook riêng.
+
+## 2. Xác minh Client và Server
+
+```bash
+docker version
+docker version --format 'Client={{.Client.Version}} Server={{.Server.Version}} API={{.Server.APIVersion}}'
+```
+
+Nếu format fail trên version cũ hoặc Server không reachable, dùng output đầy đủ. Tiêu chí đạt:
+
+- có cả Client và Server;
+- Server version đúng target upgrade/install;
+- không có `Cannot connect`, permission denied hoặc API incompatibility.
+
+Client và Server không bắt buộc cùng patch version, nhất là remote context, nhưng feature bạn dùng phải được API/daemon target hỗ trợ.
+
+## 3. Đọc daemon capability và security baseline
+
+```bash
+docker info
+```
+
+Không chỉ kiểm tra exit code. Review các field:
+
+| Field | Câu hỏi cần trả lời |
+|---|---|
+| `Operating System`, `OSType`, `Architecture` | Có đúng Linux/Windows container mode và architecture không? |
+| `Storage Driver`/image store | Có đúng filesystem/support plan không? |
+| `Docker Root Dir` | Data có nằm ở disk được monitor/backup không? |
+| `Cgroup Driver`, `Cgroup Version` | Resource control có đúng host design không? |
+| `Logging Driver` | Có rotation/aggregation phù hợp không? |
+| `Security Options` | Seccomp, AppArmor/SELinux, rootless/userns có đúng expectation không? |
+| `Registry Mirrors`, proxy | Egress có đi đúng path không? |
+| `Warnings` | Có limit nào bị ignore hoặc kernel capability thiếu không? |
+
+Trên Linux Engine rootful:
+
+```bash
+systemctl is-active docker
+systemctl is-enabled docker
+sudo journalctl -u docker -n 100 --no-pager
+```
+
+Rootless dùng:
+
+```bash
+systemctl --user is-active docker
+systemctl --user is-enabled docker
+journalctl --user -u docker -n 100 --no-pager
+```
+
+Docker Desktop dùng UI/diagnostic bundle tương ứng thay systemd host command.
+
+## 4. Kiểm tra plugin cần cho curriculum
+
+```bash
+docker buildx version
+docker compose version
+```
+
+Hai command phải in version và exit `0`. `docker-compose` có dấu gạch nối là standalone legacy command khác với Compose plugin `docker compose`; curriculum này ưu tiên plugin.
+
+Kiểm tra builder:
+
+```bash
+docker buildx ls
+```
+
+Builder hiện tại phải ở trạng thái usable. Driver/endpoint có thể khác giữa Engine và Desktop; không yêu cầu output khớp cứng một tên builder.
+
+## 5. Kiểm tra registry path
+
+Pull tường minh:
+
+```bash
+docker pull alpine
+docker image inspect alpine --format '{{json .RepoDigests}}'
+```
+
+Pull thành công chứng minh daemon giải quyết được DNS, proxy, TLS, registry authentication/policy và ghi content. `RepoDigests` có thể khác hoặc rỗng trong một số workflow local; không copy digest minh họa.
+
+Để biết local cache có che network test không, xem pull output và daemon/mirror logs. Trong production acceptance, dùng approved test image/reference và registry observability thay vì xóa image đang được workload dùng.
+
+## 6. Kiểm tra runtime và exit code
+
+```bash
+docker run --name env-check-run alpine \
+  sh -c 'echo runtime-ok; id; uname -m'
+```
+
+Command chạy foreground rồi container chuyển `Exited`. Kiểm tra state:
+
+```bash
+docker inspect env-check-run \
+  --format 'status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}'
+docker logs env-check-run
+```
+
+Tiêu chí đạt:
+
+- logs chứa `runtime-ok`;
+- status `exited`;
+- exit code `0`;
+- `.State.Error` rỗng.
+
+Xóa container test:
+
+```bash
+docker rm env-check-run
+```
+
+Việc process exit ngay là expected vì command đã hoàn thành, không phải daemon lỗi.
+
+## 7. Kiểm tra named volume persistence
+
+Tạo volume:
+
+```bash
+docker volume create env-check-data
+```
+
+Ghi dữ liệu từ container thứ nhất:
+
+```bash
+docker run --rm \
+  --mount source=env-check-data,target=/data \
+  alpine sh -c 'printf "%s\n" volume-ok > /data/result.txt'
+```
+
+Đọc từ container mới:
+
+```bash
+docker run --rm \
+  --mount source=env-check-data,target=/data,readonly \
+  alpine cat /data/result.txt
+```
+
+Output phải là:
+
+```text
+volume-ok
+```
+
+Test chứng minh volume tồn tại độc lập với container và runtime mount được nó. Nó không chứng minh backup/restore hoặc database consistency.
+
+## 8. Kiểm tra bind mount local
+
+Chỉ chạy khi daemon nằm trên cùng Linux/WSL environment với shell. Tạo directory tạm:
+
+```bash
+ENV_CHECK_DIR="$(mktemp -d)"
+printf '%s\n' 'bind-ok' > "$ENV_CHECK_DIR/host.txt"
+```
+
+Mount read-only:
+
+```bash
+docker run --rm \
+  --mount type=bind,src="$ENV_CHECK_DIR",dst=/input,readonly \
+  alpine cat /input/host.txt
+```
+
+Output phải là `bind-ok`. Sau đó kiểm tra file host không bị sửa:
+
+```bash
+cat "$ENV_CHECK_DIR/host.txt"
+```
+
+Nếu dùng Docker Desktop WSL 2, đặt directory trong Linux filesystem để test path/performance chuẩn. Nếu daemon remote, `src` thuộc remote host nên local path không tồn tại; đây là behavior đúng của client-daemon model.
+
+## 9. Kiểm tra user-defined network và DNS
+
+Tạo network và một server tạm:
+
+```bash
+docker network create env-check-net
+docker run --name env-check-peer -d \
+  --network env-check-net \
+  alpine sleep 300
+```
+
+Resolve container name từ container khác trên cùng network:
+
+```bash
+docker run --rm --network env-check-net \
+  alpine nslookup env-check-peer
+```
+
+Tiêu chí đạt là `env-check-peer` resolve thành container address trên network. IP là ephemeral, không ghi cứng vào config.
+
+Dọn peer trước khi xóa network:
+
+```bash
+docker rm -f env-check-peer
+docker network rm env-check-net
+```
+
+Default bridge có DNS semantics khác user-defined network; test này chủ đích dùng network riêng như application thực tế.
+
+## 10. Kiểm tra published port và HTTP
+
+Kiểm tra port chưa bị Docker container khác dùng:
+
+```bash
+docker ps --format 'table {{.Names}}\t{{.Ports}}'
+```
+
+Chạy web server chỉ bind loopback:
+
+```bash
+docker run --name env-check-web -d \
+  --publish 127.0.0.1:18080:80 \
+  nginx:alpine
+```
+
+Kiểm tra state và mapping:
+
+```bash
+docker ps --filter name=env-check-web
+docker port env-check-web
+```
+
+Gửi request:
+
+```bash
+curl --fail --show-error http://127.0.0.1:18080/
+```
+
+PowerShell dùng:
+
+```powershell
+curl.exe --fail --show-error http://127.0.0.1:18080/
+```
+
+HTML có thể thay đổi; exit code `0` và HTTP success mới là acceptance signal. Đọc logs:
+
+```bash
+docker logs env-check-web
+```
+
+Bạn cần thấy request access log sau `curl`. Dọn:
+
+```bash
+docker rm -f env-check-web
+```
+
+Nếu context remote, chạy `curl` trên remote host hoặc endpoint được route tới remote port; `localhost` tại laptop không phải remote host.
+
+## 11. Kiểm tra BuildKit/Buildx end-to-end
+
+Dùng directory tạm đã tạo ở bước bind mount. Nếu đã bỏ qua bước đó, tạo mới:
+
+```bash
+ENV_CHECK_DIR="${ENV_CHECK_DIR:-$(mktemp -d)}"
+```
+
+Tạo Dockerfile:
+
+```bash
+cat > "$ENV_CHECK_DIR/Dockerfile" <<'EOF'
+FROM alpine
+RUN printf '%s\n' 'build-ok' > /result.txt
+CMD ["cat", "/result.txt"]
+EOF
+```
+
+Build và load image vào daemon hiện tại:
+
+```bash
+docker buildx build \
+  --load \
+  --tag env-check:local \
+  "$ENV_CHECK_DIR"
+```
+
+Chạy:
+
+```bash
+docker run --rm env-check:local
+```
+
+Output phải là `build-ok`. Test kiểm tra build frontend, builder, base-image pull/cache, snapshot, export/load và runtime. Trong multi-platform/cloud builder, `--load` có giới hạn output; acceptance test này chủ đích build platform local đơn giản.
+
+## 12. Kiểm tra Compose parser mà không deploy stack
+
+Tạo file:
+
+```bash
+cat > "$ENV_CHECK_DIR/compose.yaml" <<'EOF'
+services:
+  check:
+    image: env-check:local
+EOF
+```
+
+Render model:
+
+```bash
+docker compose \
+  --file "$ENV_CHECK_DIR/compose.yaml" \
+  config
+```
+
+Command phải in normalized configuration và exit `0`. Nó chứng minh plugin parse file/reference; chưa chứng minh orchestration lifecycle. Nếu muốn test deployment trên daemon lab:
+
+```bash
+docker compose \
+  --project-name env-check \
+  --file "$ENV_CHECK_DIR/compose.yaml" \
+  up --abort-on-container-exit --exit-code-from check
+```
+
+Sau đó dọn:
+
+```bash
+docker compose \
+  --project-name env-check \
+  --file "$ENV_CHECK_DIR/compose.yaml" \
+  down --volumes --remove-orphans
+```
+
+`--volumes` chỉ xóa volumes thuộc Compose project đó; named volume `env-check-data` tạo riêng vẫn còn.
+
+## 13. Kiểm tra resource limit ở mức effective config
+
+Chạy một container có memory limit nhỏ nhưng không tạo memory pressure:
+
+```bash
+docker run --name env-check-limit -d \
+  --memory 128m --pids-limit 100 \
+  alpine sleep 60
+```
+
+Inspect:
+
+```bash
+docker inspect env-check-limit \
+  --format 'memory={{.HostConfig.Memory}} pids={{.HostConfig.PidsLimit}}'
+```
+
+`128 MiB` được biểu diễn bằng bytes, thường là `134217728`; PIDs là `100`. Sau đó:
+
+```bash
+docker rm -f env-check-limit
+```
+
+Inspect chỉ chứng minh config được ghi nhận. Trên rootless mode, enforcement phụ thuộc cgroup v2, systemd driver và controller delegation. Đọc `docker info` warnings và thực hiện enforcement test riêng nếu resource isolation là acceptance requirement.
+
+## 14. Cleanup và xác minh không để rác
+
+Xóa các object lab còn lại:
+
+```bash
+docker rm -f \
+  env-check-run env-check-web env-check-peer env-check-limit \
+  2>/dev/null || true
+
+docker network rm env-check-net 2>/dev/null || true
+docker volume rm env-check-data
+docker image rm env-check:local
+rm -rf "$ENV_CHECK_DIR"
+```
+
+Giữ `alpine` và `nginx:alpine` cache là tùy chọn. Nếu muốn xóa riêng và không có container khác tham chiếu:
+
+```bash
+docker image rm alpine nginx:alpine
+```
+
+Xác minh prefix không còn:
+
+```bash
+docker ps -a --filter name=env-check
+docker volume ls --filter name=env-check
+docker network ls --filter name=env-check
+docker image ls env-check
+```
+
+Không dùng `docker system prune` để cleanup một lab có tên rõ ràng; xóa chính xác object tạo ra an toàn hơn.
+
+## Chẩn đoán theo decision path
+
+### Không qua bước context/API
+
+```bash
+docker context ls
+docker version
+```
+
+- Chỉ Client: daemon/Desktop chưa chạy, endpoint sai hoặc permission/TLS/SSH lỗi.
+- Permission denied: review socket group/rootless context; không chmod world-writable.
+- Timeout remote: kiểm tra SSH/TLS endpoint/firewall trước registry.
+
+### API được nhưng pull fail
+
+```bash
+docker info
+sudo journalctl -u docker -n 100 --no-pager
+```
+
+Kiểm tra DNS, daemon proxy, `NO_PROXY`, corporate CA, registry auth/mirror và disk. Host browser/curl success không đủ.
+
+### Pull được nhưng run fail
+
+```bash
+docker ps -a --no-trunc
+docker inspect <CONTAINER> --format '{{json .State}}'
+docker logs <CONTAINER>
+```
+
+Tìm architecture/exec format, missing binary, seccomp/LSM, cgroup, mount/storage và runtime error.
+
+### Container running nhưng HTTP fail
+
+```bash
+docker port env-check-web
+docker logs env-check-web
+curl --verbose http://127.0.0.1:18080/
+```
+
+Phân biệt mapping sai, process chưa listen, health/application error, remote context và firewall/VPN.
+
+### Volume hoặc bind mount fail
+
+```bash
+docker inspect <CONTAINER> --format '{{json .Mounts}}'
+docker info --format '{{.DockerRootDir}}'
+```
+
+Với bind mount, xác nhận source nằm trên daemon host, path tồn tại, SELinux label/permission và filesystem sharing của Desktop. Với volume, kiểm tra driver/plugin và daemon logs.
+
+### Build fail nhưng run/pull được
+
+```bash
+docker buildx ls
+docker buildx inspect --bootstrap
+```
+
+Chạy build lại với `--progress=plain`. Tách lỗi Dockerfile/package repository/proxy trong build khỏi builder startup/cache/export.
+
+## Tạo report hỗ trợ có thể chia sẻ
+
+Các command hữu ích:
+
+```bash
+docker version
+docker info
+docker context ls
+docker buildx ls
+docker compose version
+```
+
+Linux Engine:
+
+```bash
+systemctl cat docker
+sudo journalctl -u docker --since '30 minutes ago' --no-pager
+uname -a
+cat /etc/os-release
+```
+
+Trước khi gửi report, redact:
+
+- registry/proxy hostname nếu policy yêu cầu;
+- username, token, certificate/key;
+- context SSH endpoint;
+- host labels, internal subnet, container environment;
+- proprietary image names và volume paths.
+
+Không paste toàn bộ `docker inspect` của production container vào public issue: environment có thể chứa secret.
+
+## Kết quả hoàn thành
+
+Environment đạt baseline khi mọi test áp dụng đều có evidence:
+
+- đúng context và Client/Server giao tiếp;
+- service/lifecycle đúng access model;
+- registry pull và runtime process thành công;
+- volume, bind mount và network hoạt động theo boundary dự kiến;
+- published port chỉ expose đúng interface;
+- Buildx và Compose plugin usable;
+- resource/security/logging fields khớp thiết kế;
+- cleanup không xóa object ngoài lab.
+
+Từ đây, chuyển sang [Docker CLI](/docs/docker-cli/) để học command/object model có hệ thống. Giữ checklist này làm smoke test sau upgrade, proxy change, daemon configuration change hoặc host migration.
+
+## Nguồn chính thức để đối chiếu
+
+- [`docker version`](https://docs.docker.com/reference/cli/docker/version/)
+- [`docker info`](https://docs.docker.com/reference/cli/docker/system/info/)
+- [`docker run`](https://docs.docker.com/reference/cli/docker/container/run/)
+- [Buildx](https://docs.docker.com/build/builders/)
+- [`docker compose config`](https://docs.docker.com/reference/cli/docker/compose/config/)

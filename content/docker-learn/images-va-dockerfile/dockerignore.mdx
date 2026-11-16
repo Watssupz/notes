@@ -1,0 +1,328 @@
+---
+title: ".dockerignore"
+description: "Viết và kiểm tra pattern .dockerignore để giảm build context, giữ cache ổn định và chặn source, artifact hoặc credential không cần thiết tới builder."
+---
+
+`.dockerignore` loại file/directory khỏi build context trước khi context được gửi cho builder. Nó phục vụ ba mục tiêu:
+
+1. giảm thời gian transfer/checksum, đặc biệt với remote builder;
+2. tránh file không liên quan làm cache invalidation;
+3. giảm nguy cơ Dockerfile đọc/copy nhầm credential, VCS history hoặc artifact local.
+
+`.dockerignore` không thay secret manager, `.gitignore`, scanner hay access control. Secret từng commit vẫn phải revoke/remove theo incident process.
+
+## Vị trí file
+
+Với default build:
+
+```text
+project/
+├── .dockerignore
+├── Dockerfile
+├── src/
+└── node_modules/
+```
+
+```bash
+docker build .
+```
+
+Builder tìm `.dockerignore` ở **root của context** (`.`), không nhất thiết cạnh Dockerfile.
+
+Nếu có nhiều Dockerfile, đặt ignore file riêng cạnh Dockerfile theo tên `<Dockerfile>.dockerignore`:
+
+```text
+project/
+├── .dockerignore
+├── docker/
+│   ├── build.Dockerfile
+│   ├── build.Dockerfile.dockerignore
+│   ├── test.Dockerfile
+│   └── test.Dockerfile.dockerignore
+└── src/
+```
+
+```bash
+docker build --file docker/build.Dockerfile .
+```
+
+`docker/build.Dockerfile.dockerignore` có precedence so với root `.dockerignore` cho Dockerfile đó. Pattern vẫn được đánh giá trên root của **build context**, không đổi sang `docker/`.
+
+## Pattern cơ bản
+
+Ví dụ project Node:
+
+```text
+# Version control
+.git
+.gitignore
+
+# Dependencies và build output
+node_modules
+coverage
+dist
+*.log
+
+# Local configuration và credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editor/OS
+.vscode
+.idea
+.DS_Store
+```
+
+Comment chỉ được nhận khi `#` ở column đầu. Blank line bị bỏ. Docker preprocessing path qua semantics của Go `filepath` và Docker pattern matcher; behavior separator có thể khác theo OS client, nên test trên CI platform thật.
+
+Leading/trailing slash trong pattern directory thường bị bỏ qua cho matching path tương ứng. Các pattern sau đều nhắm `foo/bar` dưới context root theo Docker docs:
+
+```text
+/foo/bar/
+/foo/bar
+foo/bar/
+foo/bar
+```
+
+## Wildcards
+
+| Pattern | Ý nghĩa thực hành |
+|---|---|
+| `*.log` | File/directory match ở cấp pattern áp dụng |
+| `temp?` | `tempa`, `temp1`, nhưng không `temp-long` |
+| `**/*.pem` | File `.pem` ở mọi độ sâu, kể cả theo recursive wildcard |
+| `build/**` | Nội dung dưới `build` |
+
+`**` là extension của Docker match bất kỳ số directory, kể cả zero. Pattern `.` bị bỏ qua vì compatibility lịch sử.
+
+Đừng giả định `.dockerignore` giống `.gitignore` ở mọi edge case. Khi pattern phức tạp, tạo fixture tree và chạy build test thay vì review bằng mắt.
+
+## Negation và quy tắc “dòng cuối match thắng”
+
+```text
+*.md
+!README.md
+```
+
+Loại Markdown match nhưng giữ `README.md` theo phạm vi pattern.
+
+Thứ tự quyết định kết quả:
+
+```text
+*.md
+!README*.md
+README-secret.md
+```
+
+`README-secret.md` bị loại vì dòng cuối match nó là exclusion.
+
+Đảo hai dòng cuối:
+
+```text
+*.md
+README-secret.md
+!README*.md
+```
+
+thì `README-secret.md` được include lại do negation cuối cùng. Đặt exception ngay sau rule liên quan và thêm comment lý do.
+
+Khi ignore cả parent directory, exception cho file con có thể không hoạt động như người viết kỳ vọng nếu matcher không traverse/include parent theo pattern hiện tại. Pattern an toàn là giữ parent traversal rồi ignore content và re-include allowlist, sau đó test. Ví dụ intent chỉ giữ production config:
+
+```text
+configs/**
+!configs/
+!configs/prod/
+!configs/prod/app.yaml
+```
+
+Semantics edge case cần được xác nhận với builder/version hiện hành; đơn giản hóa tree/context nếu allowlist quá khó đọc.
+
+## Dockerfile và `.dockerignore` bản thân
+
+Có thể khai báo ignore:
+
+```text
+Dockerfile
+.dockerignore
+```
+
+Builder vẫn cần gửi chúng để thực hiện build, nhưng Docker không cho `COPY` chúng vào image theo documented behavior. Đừng dựa vào rule này để bảo vệ secret; hai file phải không chứa credential ngay từ đầu.
+
+## `.gitignore` không đủ
+
+`.gitignore` chỉ điều khiển Git tracking. File untracked ignored vẫn tồn tại trong workspace và nằm trong build context nếu `.dockerignore` không loại. Ví dụ `.env` local có thể không commit nhưng vẫn bị `COPY . .` đưa vào image.
+
+Giữ hai file có thể trùng một số rule nhưng mục tiêu khác:
+
+- `.gitignore`: repository cleanliness;
+- `.dockerignore`: builder input boundary.
+
+Không symlink `.dockerignore` sang `.gitignore` một cách máy móc: build có thể cần file generated không commit, hoặc cần `.git` metadata cho một workflow đặc biệt.
+
+## Baseline theo ecosystem
+
+### Node.js
+
+```text
+.git
+node_modules
+npm-debug.log*
+yarn-error.log*
+coverage
+dist
+.env
+.env.*
+!.env.example
+```
+
+Nếu Dockerfile copy prebuilt `dist`, không ignore `dist`; hoặc tốt hơn build trong multi-stage từ source. Rule phải theo Dockerfile contract, không theo template chung.
+
+### Python
+
+```text
+.git
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+coverage.xml
+htmlcov
+.env
+```
+
+Virtualenv host thường không portable vào Linux image do path/platform/native wheel.
+
+### Java/Gradle/Maven
+
+```text
+.git
+.gradle
+# Chỉ ignore target/build nếu image compile source bên trong
+target
+build
+*.log
+.env
+```
+
+Nếu build dùng Maven/Gradle Wrapper, phải include script và wrapper files cần thiết. Không copy baseline mà chưa đối chiếu toolchain.
+
+### Go
+
+```text
+.git
+bin
+coverage.out
+*.test
+.env
+```
+
+`vendor/` chỉ ignore nếu build không dùng vendored modules; nếu policy yêu cầu vendoring, phải include.
+
+## Allowlist hay denylist
+
+Denylist dễ bắt đầu:
+
+```text
+.git
+node_modules
+.env
+```
+
+nhưng file mới có thể lọt vào context. Với repository nhạy cảm, có thể ignore rộng rồi include allowlist:
+
+```text
+**
+!package.json
+!package-lock.json
+!src/
+!src/**
+!Dockerfile
+```
+
+Allowlist giảm leak surface nhưng dễ làm build fail khi thêm migrations, certificate công khai hoặc config cần thiết. CI phải test build từ clean checkout và review `.dockerignore` cùng thay đổi file tree.
+
+Một lựa chọn khác rõ hơn là context directory chuyên biệt hoặc named contexts, tránh pattern exception quá phức tạp.
+
+## Kiểm tra context thực tế
+
+Build với plain progress:
+
+```bash
+docker build --no-cache --progress=plain --tag ignore-lab:test .
+```
+
+Đọc dòng `load build context` và bytes transfer. Kích thước giảm là signal, không chứng minh mọi secret đã loại.
+
+Tạo Dockerfile kiểm tra tạm trong repository test, không dùng production secret:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM scratch
+COPY . /context
+```
+
+Build rồi create/copy filesystem để inventory:
+
+```bash
+docker build --file Dockerfile.context-test --tag context-test .
+container_id=$(docker create context-test)
+mkdir -p /tmp/context-test
+
+docker cp "$container_id:/context/." /tmp/context-test/
+docker rm "$container_id"
+find /tmp/context-test -maxdepth 3 -type f -print
+rm -rf /tmp/context-test
+docker image rm context-test
+```
+
+Không chạy cách này trên context chứa secret thật nếu Dockerfile/context chưa đáng tin; image/cache sẽ nhận các file được include. Tốt hơn dùng test fixture không nhạy cảm để kiểm tra pattern matcher.
+
+## Cache và `.dockerignore`
+
+Nếu `COPY . .` đứng trước dependency install, mọi file được include có thể ảnh hưởng checksum. Ignore log/test report giúp cache ổn định. Tuy nhiên, cách chính vẫn là copy input theo lifecycle:
+
+```dockerfile
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY src/ ./src/
+```
+
+`.dockerignore` và instruction ordering bổ sung cho nhau; một file source cần build không thể ignore chỉ để giữ cache.
+
+## Troubleshooting
+
+### `COPY` báo file không tồn tại
+
+Tìm rule match cuối cùng, Dockerfile-specific ignore file và context root. Tên file case-sensitive trong Linux build dù host development có thể case-insensitive.
+
+### Exception `!` không include file
+
+Kiểm tra dòng match sau nó, parent directory có bị exclude và pattern có đúng depth không. Thu nhỏ thành fixture tree để test.
+
+### Context vẫn rất lớn
+
+Dùng `du -ah`/`find` trong workspace để tìm directory lớn, gồm hidden files. Xác nhận command build đang dùng đúng context và đúng ignore file; Dockerfile-specific file có thể override root file.
+
+### Build local và CI có context khác
+
+OS path matching, generated file, submodule/LFS và clean checkout khác nhau. Chạy build production trên clean Linux runner và pin tool versions.
+
+## Checklist review
+
+- [ ] `.dockerignore` nằm ở context root hoặc đúng Dockerfile-specific name.
+- [ ] `.git`, dependency host, output, log, local DB và credential bị loại nếu không cần.
+- [ ] Exception đặt sau exclusion và có test cho pattern phức tạp.
+- [ ] File bắt buộc cho build, license và runtime không bị loại nhầm.
+- [ ] Context bytes hợp lý và build thành công từ clean checkout.
+- [ ] Secret build dùng secret mount; runtime secret không bake vào context/image.
+
+## Nguồn chính thức
+
+- [.dockerignore files](https://docs.docker.com/build/concepts/context/#dockerignore-files)
+- [moby/patternmatcher](https://github.com/moby/patternmatcher)
+- [Dockerfile best practices: exclude with .dockerignore](https://docs.docker.com/build/building/best-practices/#exclude-with-dockerignore)

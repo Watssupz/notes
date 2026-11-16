@@ -1,0 +1,17 @@
+{
+  "title": "Docker CLI",
+  "pages": [
+    "index",
+    "command-structure",
+    "contexts",
+    "environment-variables",
+    "configuration-file",
+    "format-output",
+    "filter-and-sort",
+    "inspect",
+    "events",
+    "system-commands",
+    "completion",
+    "api-and-sdks"
+  ]
+}

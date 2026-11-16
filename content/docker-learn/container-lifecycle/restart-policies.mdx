@@ -1,0 +1,192 @@
+---
+title: "Restart policies"
+description: "Cấu hình Docker restart policy, phân biệt no/on-failure/always/unless-stopped, hiểu restart count, manual stop, daemon restart và giới hạn so với healthcheck/orchestrator."
+---
+
+Restart policy quyết định Docker daemon có tự start lại container sau khi process chính exit hoặc sau khi daemon khởi động lại hay không. Đây là cơ chế hữu ích cho daemon đơn lẻ, lab server hoặc workload nhỏ chưa chạy dưới orchestrator, nhưng nó không thay thế deployment controller, health-based routing hay rollback.
+
+Cấu hình khi tạo container:
+
+```bash
+docker container run --detach \
+  --name api \
+  --restart unless-stopped \
+  app:1.0
+```
+
+Cập nhật policy cho container đã có:
+
+```bash
+docker container update --restart unless-stopped api
+```
+
+Policy là một phần của container object. Nếu recreate container, phải cấu hình lại theo desired state của deployment.
+
+## Các policy
+
+| Policy | Khi process exit | Khi daemon restart | Ghi chú |
+|---|---|---|---|
+| `no` | Không restart | Không tự start | Default |
+| `on-failure[:max-retries]` | Restart nếu exit code non-zero | Không restart chỉ vì daemon restart | Có thể giới hạn số lần retry |
+| `always` | Restart khi container dừng | Start lại khi daemon restart, trừ trường hợp bị manual stop cho đến khi daemon/container được start lại theo semantics Docker | Phù hợp service luôn cần chạy trên host đó |
+| `unless-stopped` | Tương tự `always` khi không bị stop | Không start lại container đã bị stop trước đó | Thường ít bất ngờ hơn `always` trên máy dev/server nhỏ |
+
+Manual stop là một tín hiệu chủ đích. Tài liệu Docker ghi rằng nếu bạn dừng container thủ công, restart policy bị bỏ qua cho đến khi Docker daemon restart hoặc container được start thủ công lại, tùy policy. Điều này ngăn vòng lặp restart khi operator đang cố dừng workload.
+
+## Điều kiện policy bắt đầu có hiệu lực
+
+Docker chỉ áp dụng restart policy sau khi container đã start thành công. Theo tài liệu Docker, “start thành công” ở đây nghĩa là container đã chạy ít nhất 10 giây và daemon đã bắt đầu monitor nó. Cơ chế này tránh việc container không start được chút nào rơi ngay vào restart loop vô hạn.
+
+Hệ quả khi chẩn đoán:
+
+- container lỗi trước mốc này có thể không tăng `RestartCount` như bạn mong đợi;
+- một crash loop chậm hơn 10 giây sẽ được policy xử lý;
+- cần đọc events/logs thay vì chỉ nhìn restart count.
+
+```bash
+docker container inspect api \
+  --format 'status={{.State.Status}} exit={{.State.ExitCode}} restarts={{.RestartCount}} started={{.State.StartedAt}} finished={{.State.FinishedAt}}'
+```
+
+## `on-failure` và exit code
+
+`on-failure` chỉ restart khi process chính exit non-zero. Nó không restart khi exit code là `0`, và theo tài liệu Docker, nó không restart container chỉ vì daemon restart.
+
+Ví dụ job lỗi tối đa ba lần:
+
+```bash
+docker container run --detach \
+  --name lifecycle-retry-demo \
+  --label com.example.lab=restart-policies \
+  --restart on-failure:3 \
+  alpine:3.22 \
+  sh -c 'echo "attempt at $(date -u +%H:%M:%S)"; sleep 11; exit 2'
+```
+
+Sau một thời gian, kiểm tra:
+
+```bash
+docker container inspect lifecycle-retry-demo \
+  --format 'status={{.State.Status}} exit={{.State.ExitCode}} restarts={{.RestartCount}}'
+docker container logs lifecycle-retry-demo
+```
+
+Expected: logs có nhiều dòng `attempt`, `RestartCount` tăng cho đến giới hạn, rồi container ở `exited` với exit code `2`. `sleep 11` giúp vượt qua điều kiện start thành công 10 giây trong tài liệu Docker.
+
+Cleanup:
+
+```bash
+docker container rm --force lifecycle-retry-demo
+```
+
+## `always` và `unless-stopped`
+
+Hai policy này phù hợp với long-running service hơn batch job. Khác biệt quan trọng nằm ở trạng thái đã bị stop khi daemon restart.
+
+- `always`: container được thiết kế để luôn quay lại, nhưng manual stop tạm thời chặn restart cho đến khi daemon restart hoặc container được start lại theo semantics Docker.
+- `unless-stopped`: nếu container đã bị stop, Docker không tự start lại nó sau daemon restart.
+
+Trên máy dev, `unless-stopped` thường dễ kiểm soát hơn vì container bạn đã stop hôm qua không bất ngờ chạy lại sau khi Docker Desktop/daemon restart. Trong production host đơn lẻ, chọn policy dựa trên desired state: workload nào bắt buộc chạy trên host đó và ai chịu trách nhiệm start/stop.
+
+## Restart policy không deploy phiên bản mới
+
+Khi policy restart container, Docker dùng lại cùng container object:
+
+- image ID và config đã chốt không đổi;
+- environment, mount, port, user và security option không tự cập nhật;
+- writable layer cũ vẫn còn;
+- PID và start timestamp thay đổi.
+
+Nếu image tag `app:stable` đã trỏ sang image mới, restart policy vẫn chạy image ID cũ gắn với container lúc create. Rollout đúng cần recreate container theo desired config và xác minh image digest/ID.
+
+## Healthcheck không kích hoạt restart policy
+
+Standalone Docker Engine không restart container chỉ vì health status chuyển `unhealthy`. Policy nhìn vào process exit, không nhìn vào `.State.Health.Status`.
+
+Kiểm tra cả hai tín hiệu:
+
+```bash
+docker container inspect api \
+  --format 'state={{.State.Status}} health={{with .State.Health}}{{.Status}}{{else}}none{{end}} exit={{.State.ExitCode}} restarts={{.RestartCount}}'
+```
+
+Nếu muốn health failure dẫn tới restart, cần một lớp điều phối khác hoặc application/watchdog tự exit sau khi đã log đủ evidence. Thiết kế này phải có rate limit, alert và tránh che giấu root cause bằng restart loop liên tục.
+
+## Foreground container và CLI attach
+
+Khi chạy container foreground, CLI attach vào lần chạy hiện tại. Nếu process exit và policy restart container, phiên CLI ban đầu vẫn có thể kết thúc. Tài liệu Docker minh họa rằng attached CLI không “sống theo” mọi lần restart sau đó.
+
+Với service có restart policy, chạy detached và quan sát bằng `logs`, `events`, `inspect`:
+
+```bash
+docker container logs --follow --tail 100 api
+docker events --since '10m' --until '0s' --filter 'container=api'
+```
+
+## Restart policy, process manager và orchestrator
+
+Không chồng nhiều lớp restart nếu không có ownership rõ. Tài liệu Docker khuyến cáo tránh kết hợp restart policy với host-level process manager theo cách cả hai cùng cố restart container, vì chúng có thể tạo vòng lặp và timeline khó hiểu.
+
+Nếu dùng systemd để quản lý `docker start api`, hãy quyết định lớp nào là source of truth:
+
+- systemd quản lý container object: Docker policy có thể để `no`, systemd chịu trách nhiệm restart command;
+- Docker quản lý process chính trong container: systemd chỉ đảm bảo daemon chạy, container dùng restart policy;
+- orchestrator như Swarm/Kubernetes/Compose production: dùng primitive của orchestrator thay vì tự chồng policy tùy tiện.
+
+## Runbook chẩn đoán restart loop
+
+### 1. Xác định policy effective
+
+```bash
+docker container inspect CONTAINER \
+  --format 'restart-policy={{json .HostConfig.RestartPolicy}} restarts={{.RestartCount}}'
+```
+
+Nếu policy là `no`, restart có thể đến từ operator, Compose, systemd hoặc một lớp khác.
+
+### 2. Đọc nguyên nhân exit gần nhất
+
+```bash
+docker container inspect CONTAINER --format '{{json .State}}'
+docker container logs --timestamps --tail 500 CONTAINER
+```
+
+Tìm `.State.ExitCode`, `.State.OOMKilled`, `.State.Error`, thời điểm `StartedAt/FinishedAt` và log cuối.
+
+### 3. Xem timeline event
+
+```bash
+docker events \
+  --since '30m' \
+  --until '0s' \
+  --filter 'container=CONTAINER'
+```
+
+Event giúp phân biệt daemon auto-restart, operator `restart`, `kill`, OOM, die/start sequence hoặc daemon reconnect.
+
+### 4. Tạm dừng loop nếu cần giữ evidence
+
+Nếu restart loop đang ghi đè log hoặc gây tải, stop container có chủ đích:
+
+```bash
+docker container stop CONTAINER
+```
+
+Sau đó capture inspect/logs/diff cần thiết. Không `rm` hoặc `prune` trước khi biết dữ liệu nào cần giữ.
+
+## Lựa chọn policy theo workload
+
+| Workload | Policy gợi ý | Lý do |
+|---|---|---|
+| Command one-shot trong CI/lab | `no` hoặc `--rm` | Exit code là kết quả; restart làm sai nghĩa job |
+| Batch job có lỗi tạm thời hiếm | `on-failure:N` | Retry có giới hạn, tránh loop vô hạn |
+| Service nhỏ trên host đơn lẻ | `unless-stopped` | Tự phục hồi sau crash nhưng tôn trọng stop thủ công qua daemon restart |
+| Agent bắt buộc luôn chạy trên appliance | `always` | Desired state là chạy lại khi daemon/host phục hồi |
+| Workload dưới Kubernetes/Swarm | Dùng policy của orchestrator | Controller cần quản lý replica, rollout và health ở cấp cao hơn |
+
+## Nguồn chính thức
+
+- [Start containers automatically](https://docs.docker.com/engine/containers/start-containers-automatically/)
+- [docker container run `--restart`](https://docs.docker.com/reference/cli/docker/container/run/)
+- [docker container update](https://docs.docker.com/reference/cli/docker/container/update/)
+- [docker container inspect](https://docs.docker.com/reference/cli/docker/container/inspect/)

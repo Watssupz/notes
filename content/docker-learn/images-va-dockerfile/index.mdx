@@ -1,0 +1,200 @@
+---
+title: "Tổng quan Docker image"
+description: "Hiểu Docker image là gì, image khác container ra sao và thực hành build, kiểm tra, chạy rồi xóa một image từ Dockerfile."
+---
+
+Docker image là gói **read-only** dùng để tạo container. Gói này chứa filesystem của ứng dụng, cấu hình mặc định như command, working directory, user và metadata cần thiết để runtime khởi động process. Dockerfile là file mô tả cách tạo image đó theo từng instruction có thể lặp lại và review trong source control.
+
+Phân biệt ba object ngay từ đầu:
+
+| Object | Vai trò | Có thay đổi khi chạy không? |
+|---|---|---|
+| Dockerfile | Source mô tả quá trình build | Có, khi bạn sửa source |
+| Image | Kết quả build bất biến, được nhận diện bằng content digest | Không; thay đổi tạo image mới |
+| Container | Một instance chạy từ image, có runtime config và writable layer riêng | Có trong vòng đời container |
+
+Nếu chạy 10 container từ cùng một image, Docker có thể dùng chung các image layer read-only. Mỗi container chỉ thêm writable layer và runtime state của riêng nó. Vì vậy, sửa file trong một container không sửa image và không tự xuất hiện trong container khác.
+
+## Luồng từ source đến process
+
+```text
+Source code + Dockerfile + build context
+                 |
+                 | docker build
+                 v
+         Image: layers + config
+                 |
+                 | docker run + runtime options
+                 v
+       Container: process + writable layer
+```
+
+Build và run là hai giai đoạn khác nhau:
+
+- `RUN` trong Dockerfile thực thi khi **build** và ghi kết quả filesystem vào image.
+- `CMD` và `ENTRYPOINT` lưu cấu hình command mặc định; command chỉ chạy khi **container khởi động**.
+- `docker run -e`, `-p`, `--mount`, `--user` tạo runtime config cho container, không chỉnh sửa image gốc.
+
+Mental model này giúp tránh hai lỗi phổ biến: cài package thủ công trong container rồi tưởng image đã đổi, hoặc đưa config/secret production vào image chỉ vì ứng dụng cần chúng lúc chạy.
+
+## Thực hành: build image đầu tiên
+
+Bài thực hành dùng Linux containers, Docker Engine có BuildKit và base image `alpine:3.23`. Tạo thư mục riêng để build context không vô tình chứa file khác:
+
+```bash
+mkdir image-lab
+cd image-lab
+```
+
+Tạo script ứng dụng:
+
+```bash
+cat > hello.sh <<'EOF'
+#!/bin/sh
+set -eu
+printf 'hello from image; version=%s\n' "${APP_VERSION:-unknown}"
+EOF
+```
+
+Tạo `Dockerfile`:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM alpine:3.23
+
+ARG APP_VERSION=dev
+LABEL org.opencontainers.image.title="image-lab" \
+      org.opencontainers.image.version="$APP_VERSION"
+
+WORKDIR /app
+COPY --chmod=755 hello.sh /app/hello.sh
+
+ENV APP_VERSION="$APP_VERSION"
+USER 65534:65534
+ENTRYPOINT ["/app/hello.sh"]
+```
+
+Các dòng quyết định behavior:
+
+- `FROM` chọn filesystem và user-space ban đầu.
+- `ARG` nhận dữ liệu lúc build; `LABEL` ghi metadata vào image config.
+- `COPY` đưa file từ build context vào image và đặt executable bit.
+- `ENV`, `USER`, `ENTRYPOINT` trở thành default runtime config.
+
+Build với tag local dễ nhận biết:
+
+```bash
+docker build \
+  --build-arg APP_VERSION=1.0.0 \
+  --tag image-lab:1.0.0 \
+  .
+```
+
+Dấu `.` cuối command là build context, không phải ký tự trang trí. Dockerfile chỉ có thể `COPY` file nằm trong context và không bị `.dockerignore` loại bỏ.
+
+### Xác minh image trước khi chạy
+
+```bash
+docker image ls image-lab
+docker image inspect image-lab:1.0.0
+docker image history image-lab:1.0.0
+```
+
+Đọc nhanh những field đã cấu hình:
+
+```bash
+docker image inspect image-lab:1.0.0 \
+  --format 'id={{.Id}} user={{.Config.User}} entrypoint={{json .Config.Entrypoint}} env={{json .Config.Env}} labels={{json .Config.Labels}}'
+```
+
+Expected state: image có tag `image-lab:1.0.0`, `User` là `65534:65534`, entrypoint là `[/app/hello.sh]` và label version là `1.0.0`. Image ID/digest cụ thể phụ thuộc nội dung build nên không được hard-code vào script.
+
+### Tạo container từ image
+
+```bash
+docker run --rm image-lab:1.0.0
+```
+
+Expected output:
+
+```text
+hello from image; version=1.0.0
+```
+
+Override biến môi trường ở runtime:
+
+```bash
+docker run --rm --env APP_VERSION=runtime-override image-lab:1.0.0
+```
+
+Output đổi, nhưng image config vẫn giữ giá trị đã build:
+
+```bash
+docker image inspect image-lab:1.0.0 --format '{{json .Config.Env}}'
+```
+
+Đây là bằng chứng rằng runtime override thuộc container, không mutate image.
+
+## Image không phải VM snapshot đầy đủ
+
+Image thường không chứa kernel riêng. Linux container dùng kernel của host thông qua container runtime, namespaces và cgroups; image chủ yếu cung cấp user-space filesystem và OCI configuration. Vì thế:
+
+- Linux image không tự chạy như Windows container và ngược lại;
+- architecture của image phải phù hợp host hoặc có emulation;
+- binary, libc và certificate trong image vẫn phải tương thích ứng dụng;
+- image nhỏ đến mức thiếu shell/debug tool có lợi cho attack surface nhưng làm chẩn đoán trực tiếp khó hơn.
+
+Multi-platform image giải quyết việc một tên image có thể trỏ tới nhiều manifest theo platform; nó không biến một binary thành đa kiến trúc.
+
+## Image bất biến nhưng tag có thể thay đổi
+
+Image content được nhận diện bằng digest. Tag như `1.0.0`, `stable` hoặc `latest` chỉ là tên tham chiếu và có thể được chuyển sang content khác. Do đó:
+
+- dùng tag dễ đọc để quản lý release;
+- ghi nhận digest khi cần deploy chính xác hoặc audit;
+- không dùng `latest` như bằng chứng image mới nhất;
+- rebuild source tạo image mới ngay cả khi tái sử dụng cùng tag.
+
+`docker image tag` chỉ tạo thêm tham chiếu local tới cùng image; nó không copy layer. `docker push` mới phân phối content và tag tới registry.
+
+## Những gì không nên đưa vào image
+
+Không bake các dữ liệu sau vào layer hoặc `ENV`/`ARG`:
+
+- token, password, private key và credential registry;
+- dữ liệu database hoặc file người dùng;
+- config khác nhau theo environment nếu có thể inject lúc deploy;
+- package manager cache, compiler và source không cần ở runtime;
+- log và file tạm phát sinh trong build.
+
+Xóa secret ở instruction sau không bảo đảm secret biến mất khỏi layer trước hoặc build cache. Dùng BuildKit secret mount cho build credential và secret mechanism của runtime/orchestrator cho lúc chạy.
+
+## Bản đồ phần Images và Dockerfile
+
+1. [Cấu trúc Docker image](/docs/images-va-dockerfile/image-anatomy/) phân tích layer, config, manifest, index và digest.
+2. [Image layers và cache](/docs/images-va-dockerfile/layers-and-cache/) giải thích cache invalidation và cách sắp thứ tự instruction.
+3. [Dockerfile syntax](/docs/images-va-dockerfile/dockerfile-syntax/) trình bày parser directive, shell/exec form và variable replacement.
+4. Các trang [FROM](/docs/images-va-dockerfile/from/), [RUN](/docs/images-va-dockerfile/run/), [COPY và ADD](/docs/images-va-dockerfile/copy-and-add/) đi sâu vào instruction tạo filesystem.
+5. [CMD và ENTRYPOINT](/docs/images-va-dockerfile/cmd-and-entrypoint/) xác định process mặc định và cách runtime override.
+6. [ENV, ARG và LABEL](/docs/images-va-dockerfile/env-arg-label/) cùng [WORKDIR, USER và SHELL](/docs/images-va-dockerfile/workdir-user-shell/) quản lý image config.
+7. [EXPOSE, VOLUME và HEALTHCHECK](/docs/images-va-dockerfile/expose-volume-healthcheck/) mô tả network, data và health metadata.
+8. [Multi-stage builds](/docs/images-va-dockerfile/multi-stage-builds/) tách toolchain khỏi runtime image.
+9. [Build context](/docs/images-va-dockerfile/build-context/) và [.dockerignore](/docs/images-va-dockerfile/dockerignore/) kiểm soát input của build.
+10. [Tag và version image](/docs/images-va-dockerfile/image-tagging/) thiết kế naming/release; [Tối ưu Docker image](/docs/images-va-dockerfile/image-optimization/) kết hợp size, cache, security và reproducibility.
+
+## Cleanup bài thực hành
+
+```bash
+docker image rm image-lab:1.0.0
+cd ..
+rm -rf image-lab
+```
+
+Nếu image đang được container sử dụng, Docker từ chối xóa. Liệt kê container bằng `docker container ls --all --filter ancestor=image-lab:1.0.0` trước khi quyết định xóa container; không thêm `--force` chỉ để bỏ qua inventory.
+
+## Nguồn chính thức
+
+- [Dockerfile reference](https://docs.docker.com/reference/dockerfile/)
+- [What is an image?](https://docs.docker.com/get-started/docker-concepts/the-basics/what-is-an-image/)
+- [Understanding image layers](https://docs.docker.com/get-started/docker-concepts/building-images/understanding-image-layers/)
+- [Build context](https://docs.docker.com/build/concepts/context/)

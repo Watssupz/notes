@@ -1,0 +1,269 @@
+---
+title: "Docker system commands"
+description: "Dùng docker version, info, system df, events và prune để kiểm tra capability, dung lượng và cleanup daemon theo workflow inventory, approval, verification và rollback giới hạn."
+---
+
+Nhóm `docker system` quản lý và quan sát daemon ở phạm vi rộng:
+
+```bash
+docker system --help
+```
+
+Các subcommand cốt lõi:
+
+| Command | Mục tiêu | Mức rủi ro |
+|---|---|---|
+| `docker system info` | Hiển thị thông tin toàn daemon | Read-only nhưng output nhạy cảm |
+| `docker system df` | Ước lượng disk usage Docker quản lý | Read-only, có thể tốn thời gian ở daemon lớn |
+| `docker system events` | Stream event realtime/history gần | Read-only streaming |
+| `docker system prune` | Xóa nhiều loại unused data | Destructive, không có undo |
+
+`docker info` là alias phổ biến của `docker system info`; `docker events` là alias của `docker system events`.
+
+<Callout type="error" title="Xác minh daemon trước system command">
+  `system df` và đặc biệt `system prune` tác động daemon của context hiện tại. Với remote context, dung lượng và object thuộc remote host. Chạy `docker context show` và review endpoint trước.
+</Callout>
+
+## `docker version`: kiểm tra client, server và API
+
+Dù không nằm dưới `docker system`, `docker version` là bước đầu của system diagnosis:
+
+```bash
+docker version
+```
+
+Output phân biệt:
+
+- CLI Client version, OS/architecture;
+- Engine Server version;
+- API version và minimum API server hỗ trợ;
+- containerd/runc runtime version tùy platform;
+- context hiện tại.
+
+Nếu chỉ có Client và lỗi kết nối Server, đừng tiếp tục suy luận storage/network container. Chẩn đoán endpoint, daemon service và permission trước.
+
+Machine-readable projection:
+
+```bash
+docker version \
+  --format 'client={{.Client.Version}} server={{.Server.Version}} api={{.Server.APIVersion}}'
+```
+
+Format này fail hoặc thiếu value khi Server không reachable; dùng output đầy đủ cho diagnostic.
+
+## `docker info`: capability và daemon baseline
+
+```bash
+docker info
+```
+
+Các nhóm cần review:
+
+| Field/nhóm | Câu hỏi |
+|---|---|
+| Containers/Images | Inventory có tăng bất thường không? |
+| Server Version | Có đúng rollout target không? |
+| Storage Driver / image store | Có đúng platform và support plan không? |
+| Logging Driver | Có rotation/aggregation theo policy không? |
+| Cgroup Driver/Version | Resource control có đúng host không? |
+| Plugins | Network/volume/log plugin cần thiết có loaded không? |
+| Docker Root Dir | Data nằm ở disk nào? |
+| Registry Mirrors / proxy | Pull path có đúng design không? |
+| Security Options | Seccomp, AppArmor/SELinux, rootless/userns có effective không? |
+| Warnings | Kernel/cgroup/config nào đang không đạt expectation? |
+
+JSON/template có thể dùng cho một số field:
+
+```bash
+docker info --format '{{json .}}' | jq '.'
+```
+
+Schema phụ thuộc version/platform. Không gửi toàn output ra ngoài tổ chức nếu chưa redact hostname, registry, labels và plugin metadata.
+
+## `docker system df`: disk usage Docker nhìn thấy
+
+Summary:
+
+```bash
+docker system df
+```
+
+Verbose:
+
+```bash
+docker system df --verbose
+```
+
+Các khái niệm image:
+
+- **SHARED SIZE**: data layer dùng chung với image khác;
+- **UNIQUE SIZE**: phần chỉ image đó sử dụng;
+- **SIZE**: virtual size gồm shared + unique theo cách command báo cáo;
+- **RECLAIMABLE**: daemon ước lượng data có thể thu hồi theo usage/reference hiện tại.
+
+`RECLAIMABLE` không phải lời khuyên xóa. Cache/image không attached container hiện tại vẫn có thể cần cho deploy rollback, offline startup hoặc build performance.
+
+### Vì sao `system df` khác `df -h`?
+
+`docker system df` chỉ nhìn object/data Docker quản lý theo accounting của Engine. `df -h` nhìn filesystem block usage. Chênh lệch có thể đến từ:
+
+- container log file;
+- BuildKit cache ở builder khác;
+- deleted-but-open file;
+- volume plugin/external storage;
+- filesystem metadata/snapshot behavior;
+- file ngoài Docker data root;
+- Docker Desktop VM disk image và compaction behavior.
+
+Triage disk cần cả hai góc nhìn:
+
+```bash
+docker system df --verbose
+docker info --format '{{.DockerRootDir}}'
+df -h
+df -i
+```
+
+Không chạy `du` sâu trong Docker data root trên production mà chưa đánh giá I/O impact và implementation.
+
+## Chọn cleanup command theo object
+
+Ưu tiên phạm vi hẹp:
+
+```bash
+docker container prune
+docker image prune
+docker network prune
+docker volume prune
+docker builder prune
+```
+
+`docker system prune` gộp cleanup nhiều loại. Theo official current reference, mặc định nó xóa:
+
+- stopped containers;
+- network không được container dùng;
+- dangling images;
+- unused build cache.
+
+`--all` mở rộng image sang mọi unused image, không chỉ dangling. `--volumes` mở rộng sang anonymous volume không được dùng theo current CLI reference.
+
+```bash
+# Chỉ xem help, chưa xóa
+docker system prune --help
+```
+
+Behavior/version có thể thay đổi; warning interactive trên client hiện tại là contract cần review ngay trước xác nhận.
+
+## Workflow cleanup an toàn
+
+### 1. Xác minh context và change window
+
+```bash
+docker context show
+docker context inspect "$(docker context show)"
+docker version
+```
+
+Xác nhận owner, backup/rollback requirement, workload đang deploy và shared daemon policy.
+
+### 2. Thu baseline
+
+```bash
+docker system df --verbose
+docker container ls --all
+docker image ls --digests
+docker volume ls
+docker network ls
+```
+
+Với output lớn, filter theo project/label và lưu inventory có permission phù hợp.
+
+### 3. Bảo vệ lifecycle bằng policy và label
+
+Object cần giữ cho rollback không nên chỉ dựa vào “đang được container dùng”. Dùng retention policy, immutable registry digest và owner/lifecycle label. Tuy vậy, filter support khác theo prune command; kiểm tra help/reference từng command.
+
+### 4. Chọn command nhỏ nhất
+
+Nếu chỉ build cache tăng, dùng builder-specific inventory/prune thay vì `system prune -a --volumes`. Nếu chỉ stopped lab container, list exact label rồi `docker container rm` theo ID.
+
+### 5. Giữ interactive confirmation
+
+Chạy không `--force` trong lần đầu để review warning:
+
+```bash
+docker system prune
+```
+
+`--force` chỉ phù hợp automation đã có independent inventory, allowlist, approval và monitoring; nó không làm command an toàn hơn.
+
+### 6. Xác minh sau cleanup
+
+```bash
+docker system df
+docker container ls --all
+docker volume ls
+```
+
+Chạy smoke test workload quan trọng và theo dõi pull/build latency; cleanup cache có thể giải phóng disk nhưng làm lần build/deploy sau chậm hơn.
+
+## Không có rollback thực sự cho prune
+
+Prune xóa metadata/content local. Recovery có thể gồm:
+
+- pull lại image nếu registry vẫn giữ digest và network/auth hoạt động;
+- rebuild image nếu source/toolchain/cache còn tồn tại;
+- restore volume từ backup đã kiểm thử;
+- recreate network/container từ Compose/IaC config.
+
+Nếu chỉ tồn tại local image không push, stopped container chứa thay đổi thủ công hoặc volume chưa backup, prune có thể gây mất dữ liệu không khôi phục được. Vì vậy inventory và reproducibility là điều kiện trước cleanup.
+
+## Filter `until` và label
+
+Một số prune command hỗ trợ:
+
+```bash
+docker system prune --filter 'until=24h'
+docker system prune --filter 'label=com.example.lifecycle=ephemeral'
+```
+
+Đây là destructive command; không copy trực tiếp vào production. `until` của prune relative theo daemon clock theo official reference. Label filter có positive/negative semantics và phạm vi object khác nhau; chạy inventory read-only tương ứng trước.
+
+Negative filter đặc biệt khó preview vì list command có thể không hỗ trợ cùng semantics. Ưu tiên positive label chỉ rõ object được phép xóa.
+
+## BuildKit và nhiều builder
+
+`docker system df`/`docker builder prune` không nhất thiết cho bạn toàn bộ view của mọi Buildx builder/driver. Kiểm tra:
+
+```bash
+docker buildx ls
+docker buildx du
+```
+
+Cleanup đúng builder:
+
+```bash
+docker buildx prune --help
+```
+
+Remote, containerized hoặc cloud builder có storage lifecycle riêng. Đừng prune local daemon rồi kết luận build cache toàn hệ thống đã được xử lý.
+
+## Troubleshooting disk pressure
+
+Theo thứ tự evidence:
+
+1. `docker context show` — đúng daemon chưa?
+2. `docker system df -v` — object class nào lớn?
+3. `docker buildx ls` và `docker buildx du` — cache ở builder nào?
+4. `df -h`, `df -i` — block hay inode cạn?
+5. daemon/container logging config — log tăng không?
+6. volume/application data — data có retention/backup không?
+7. deleted-open files và host-level consumers — Docker accounting có bỏ sót không?
+
+Không bắt đầu incident bằng `docker system prune -af --volumes`. Command đó có thể xóa evidence, rollback image và data mà chưa giải quyết root cause như unbounded logs.
+
+## Nguồn chính thức
+
+- [docker system](https://docs.docker.com/reference/cli/docker/system/)
+- [docker system df](https://docs.docker.com/reference/cli/docker/system/df/)
+- [docker system prune](https://docs.docker.com/reference/cli/docker/system/prune/)
+- [Docker Build cache garbage collection](https://docs.docker.com/build/cache/garbage-collection/)

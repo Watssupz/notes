@@ -1,0 +1,276 @@
+---
+title: "Tag và version image"
+description: "Thiết kế image reference, tag release, digest pinning và promotion bất biến; tránh nhầm latest, local tag, registry tag và multi-platform digest."
+---
+
+Image tag là tên mutable trỏ tới image content trong một repository. Digest là định danh content-addressed của manifest hoặc image index. Release workflow tốt dùng tag cho khả năng đọc/tìm kiếm và digest cho tính chính xác khi deploy/audit.
+
+## Cấu trúc image reference
+
+```text
+[HOST[:PORT]/]NAMESPACE/REPOSITORY[:TAG][@DIGEST]
+```
+
+Ví dụ:
+
+```text
+registry.example.com:5000/payments/api:1.4.2
+```
+
+| Phần | Giá trị |
+|---|---|
+| Host/port | `registry.example.com:5000` |
+| Namespace | `payments` |
+| Repository | `api` |
+| Tag | `1.4.2` |
+
+Nếu bỏ host, Docker mặc định dùng Docker Hub. Với `alpine`, namespace mặc định là `library` và tag mặc định là `latest`, tương đương ý nghĩa reference `docker.io/library/alpine:latest` theo CLI resolution.
+
+Dùng full registry/repository trong automation để tránh push nhầm nơi.
+
+## Tag local không copy và không push
+
+```bash
+docker image tag app:build-123 \
+  registry.example.com/payments/api:1.4.2
+```
+
+Command tạo thêm local reference tới cùng image content. Xác minh:
+
+```bash
+docker image ls --no-trunc app registry.example.com/payments/api
+```
+
+Hai tag có thể cùng image ID. Registry chưa có tag mới cho tới khi:
+
+```bash
+docker image push registry.example.com/payments/api:1.4.2
+```
+
+Push upload các blob registry chưa có rồi cập nhật repository tag/manifest. Có credential push không đồng nghĩa artifact đáng tin; CI phải gate test, scan, provenance/signing theo policy.
+
+## `latest` không nghĩa “mới nhất”
+
+`latest` chỉ là default tag khi không viết tag. Publisher có thể không cập nhật, có thể trỏ release khác hoặc không tạo nó. Docker không so timestamp để chọn image mới nhất.
+
+Không dùng:
+
+```bash
+docker run registry.example.com/payments/api
+```
+
+nếu deployment cần version rõ. Dùng:
+
+```bash
+docker run registry.example.com/payments/api:1.4.2
+```
+
+hoặc digest:
+
+```bash
+docker run registry.example.com/payments/api@sha256:<DIGEST>
+```
+
+## Thiết kế tag theo release
+
+Một release có thể có nhiều alias:
+
+```text
+1.4.2       exact application version
+1.4         moving channel trong minor line
+1           moving channel trong major line
+stable      environment/policy channel
+sha-a1b2c3d trace tới source revision/build
+```
+
+Không phải project nào cũng nên publish mọi alias. Quy tắc quan trọng:
+
+- exact release tag không được overwrite sau khi công bố, dù registry cho phép;
+- moving channel chỉ update sau khi target digest đạt gate tương ứng;
+- commit/build tag phải unique đủ để không collision;
+- tag không thay metadata/provenance;
+- retention policy không xóa digest còn deployment/rollback tham chiếu.
+
+Semantic version chỉ hữu ích khi application thực sự theo SemVer. Đừng gắn `1.4.2` nếu release contract không có nghĩa đó; dùng date/build/revision scheme có tài liệu.
+
+## Build một lần, promote cùng digest
+
+Anti-pattern là rebuild source riêng cho dev, staging và production. Base tag, package repository, timestamp hoặc dependency mutable có thể tạo content khác dù cùng commit.
+
+Workflow tốt:
+
+1. CI build một artifact.
+2. Test/scan artifact theo digest.
+3. Push immutable release/build tag.
+4. Promote bằng cách gắn channel tag hoặc copy manifest **không rebuild**.
+5. Deployment resolve/pin digest đã approved.
+
+Ví dụ build và push:
+
+```bash
+IMAGE='registry.example.com/payments/api'
+VERSION='1.4.2'
+
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --tag "$IMAGE:$VERSION" \
+  --push \
+  .
+```
+
+Lấy metadata bằng registry-aware tool:
+
+```bash
+docker buildx imagetools inspect "$IMAGE:$VERSION"
+```
+
+Promotion command cụ thể phụ thuộc registry/tooling và policy. `docker buildx imagetools create --tag "$IMAGE:stable" "$IMAGE@$DIGEST"` có thể tạo/update manifest reference mà không rebuild; test trên registry và bảo đảm `$DIGEST` là index/manifest intended.
+
+## Digest nào cần ghi nhận
+
+Multi-platform tag thường trỏ tới image index; mỗi platform có manifest digest riêng. Ghi:
+
+- index digest khi deployment reference cần chọn platform tự động;
+- platform manifest digest khi policy/deployment pin artifact cụ thể cho một platform;
+- image config ID local để chẩn đoán local store, không thay registry digest.
+
+```bash
+docker buildx imagetools inspect registry.example.com/payments/api:1.4.2
+```
+
+`docker image inspect --format '{{json .RepoDigests}}'` chỉ hiển thị repo digest Engine local biết sau pull/push và có thể không mô tả toàn bộ multi-platform index như remote tool.
+
+## Tag + digest trong Dockerfile/deployment
+
+Base image:
+
+```dockerfile
+FROM alpine:3.23@sha256:<TRUSTED_DIGEST>
+```
+
+Tag cho biết release line; digest khóa bytes. Automation cần mở PR cập nhật digest, chạy test và giữ audit trail. Pin không có update process biến thành dependency cũ có CVE.
+
+Runtime có thể dùng reference gồm cả name và digest:
+
+```text
+registry.example.com/payments/api@sha256:<APPROVED_DIGEST>
+```
+
+Một số deployment system lưu cả human-readable tag metadata và digest-resolved image ID. Kiểm tra effective state của orchestrator, không chỉ source manifest.
+
+## Tag cho architecture: khi nào cần
+
+Trước manifest list, image thường dùng suffix `-amd64`, `-arm64`. Multi-platform index cho phép một tag chung:
+
+```text
+api:1.4.2 -> index -> linux/amd64 manifest
+                     -> linux/arm64 manifest
+```
+
+Giữ platform suffix chỉ khi consumer/tooling cũ cần hoặc khi artifact khác chức năng. Nếu dùng cả hai, document tag nào là index và tag nào là platform-specific để tránh deploy nhầm.
+
+## Không mã hóa mọi metadata vào tag
+
+Tag có giới hạn syntax và không phải database query đầy đủ. Không nhồi branch, OS, arch, commit, timestamp, ticket, customer vào một chuỗi khó đọc. Dùng:
+
+- OCI labels cho title/version/revision/source;
+- SBOM và provenance attestation;
+- registry metadata/policy;
+- release notes/changelog.
+
+Tag nên phục vụ selection/promotion; metadata khác phục vụ traceability.
+
+## CI tagging an toàn
+
+Pseudo-workflow Bash:
+
+```bash
+set -euo pipefail
+
+: "${REGISTRY:?}"
+: "${REPOSITORY:?}"
+: "${VERSION:?}"
+: "${GIT_SHA:?}"
+
+IMAGE="${REGISTRY}/${REPOSITORY}"
+
+case "$VERSION" in
+  [0-9]*.[0-9]*.[0-9]*) ;;
+  *) echo "Invalid release version: $VERSION" >&2; exit 1 ;;
+esac
+
+docker buildx build \
+  --label "org.opencontainers.image.version=$VERSION" \
+  --label "org.opencontainers.image.revision=$GIT_SHA" \
+  --tag "$IMAGE:$VERSION" \
+  --tag "$IMAGE:sha-$GIT_SHA" \
+  --push \
+  .
+```
+
+Shell pattern trên chỉ là guard tối thiểu, không validate SemVer đầy đủ. Production CI cần chống overwrite immutable tag bằng registry policy hoặc preflight API, kiểm tra clean source và ký/attest sau push theo digest.
+
+Không build/push untrusted pull request với credential có quyền ghi release repository.
+
+## Xác minh sau push
+
+```bash
+IMAGE='registry.example.com/payments/api:1.4.2'
+
+docker buildx imagetools inspect "$IMAGE"
+docker image pull "$IMAGE"
+docker image inspect "$IMAGE" --format '{{json .RepoDigests}}'
+docker run --rm "$IMAGE" --version
+```
+
+So sánh:
+
+- remote digest với digest CI ghi nhận;
+- platforms đủ target;
+- label version/revision;
+- binary `--version`;
+- scanner/signature/provenance policy.
+
+Pull bằng tag sau đó không chứng minh tag chưa bị đổi giữa thời điểm approve và deploy. Deploy digest đã approved hoặc registry immutability/promotion mechanism có guarantee tương đương.
+
+## Rollback
+
+Rollback nên chọn **digest release cũ đã test**, không rebuild source cũ với dependency mutable:
+
+```text
+api:1.4.1@sha256:<KNOWN_GOOD_DIGEST>
+```
+
+Giữ artifact theo rollback window, gồm platform manifests/index và attestation. Nếu chỉ giữ moving tag `stable`, cập nhật tag đã mất con trỏ cũ trừ khi registry audit/history giữ lại.
+
+## Cleanup local tag
+
+```bash
+docker image rm app:build-123
+```
+
+Xóa tag không nhất thiết xóa image content nếu reference/container khác còn dùng. Trước cleanup:
+
+```bash
+docker container ls --all --filter ancestor=app:build-123
+docker system df -v
+```
+
+Registry deletion/garbage collection là quy trình riêng; xóa tag local không tác động registry.
+
+## Anti-pattern
+
+- Deploy `latest` và kỳ vọng tự là release mới nhất.
+- Overwrite tag version bất biến để “vá nhanh”.
+- Rebuild cùng commit ở từng environment.
+- Pin digest nhưng không cập nhật security.
+- Dùng local image ID như registry manifest digest.
+- Push tag nhưng không inspect remote index/platform.
+- Xóa artifact cũ trước khi rollback window kết thúc.
+
+## Nguồn chính thức
+
+- [`docker image tag`](https://docs.docker.com/reference/cli/docker/image/tag/)
+- [`docker image push`](https://docs.docker.com/reference/cli/docker/image/push/)
+- [`docker buildx imagetools inspect`](https://docs.docker.com/reference/cli/docker/buildx/imagetools/inspect/)
+- [OCI Image Specification](https://github.com/opencontainers/image-spec)

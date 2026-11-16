@@ -1,0 +1,398 @@
+---
+title: "Troubleshooting build"
+description: "Runbook chẩn đoán Docker BuildKit theo builder, input, cache, network, platform và exporter thay vì thử --no-cache hoặc prune thiếu kiểm soát."
+---
+
+Troubleshooting build hiệu quả bắt đầu bằng việc xác định **operation đầu tiên sai** và boundary của lỗi. Không mở đầu bằng `docker system prune -af`, `--no-cache` hoặc đổi random Dockerfile instruction: các thao tác đó xóa bằng chứng, làm build chậm và có thể che nguyên nhân thật.
+
+```text
+Client/CLI -> builder -> frontend/LLB -> source/context -> RUN/network -> exporter/registry
+```
+
+Mỗi boundary có log và state riêng. Một build “không thấy image” có thể đã solve thành công nhưng không export local; một cache miss có thể do builder khác, không phải Dockerfile.
+
+## Thu thập baseline
+
+Chạy các command không phá hủy state:
+
+```bash
+docker version
+docker info
+docker buildx version
+docker context show
+docker buildx ls
+docker buildx inspect --bootstrap
+docker buildx du
+```
+
+Ghi nhận:
+
+- Docker Engine/Desktop, Buildx và BuildKit version;
+- Docker context và selected builder;
+- driver, endpoint, node status, platform;
+- command đầy đủ nhưng redact secret;
+- source revision và working tree có dirty không;
+- output mong muốn: local image, registry hay filesystem;
+- lần gần nhất build thành công và thay đổi từ đó.
+
+Không paste token, registry password, proxy credential hoặc full environment vào ticket.
+
+## Chuyển progress sang plain
+
+```bash
+docker buildx build --progress=plain --load -t app:debug . 2>&1 | tee build.log
+```
+
+Với log chứa thông tin nhạy cảm, lưu vào artifact access-controlled và redact trước khi chia sẻ. Tìm:
+
+1. step đầu tiên `ERROR`;
+2. step đầu tiên không còn `CACHED` nếu điều tra hiệu năng;
+3. lỗi xảy ra khi load source, chạy command hay export;
+4. platform/node nào thực thi.
+
+TTY progress dễ đọc cho người nhưng khó lưu/grep. Automation cần event có cấu trúc có thể dùng `--progress=rawjson` theo version.
+
+## Phân loại nhanh theo phase
+
+| Log/triệu chứng | Phase có khả năng | Kiểm tra đầu tiên |
+|---|---|---|
+| Cannot connect / inactive node | Builder | context, endpoint, `inspect --bootstrap` |
+| Failed to read Dockerfile | Input/frontend | `-f`, context root, permission |
+| `COPY ... not found` | Context | `.dockerignore`, path/case, context cuối command |
+| Package download timeout/DNS | `RUN` network | proxy, DNS, CA, egress của worker |
+| `exec format error` | Platform | binary/base platform, QEMU/binfmt |
+| Build success nhưng `docker run` không thấy image | Exporter | driver, `--load`, `--push`, `--output` |
+| Push denied | Registry auth | repository permission/tag, credential trên client |
+| Cache import warning/miss | Cache | ref, driver, mode, changed input |
+| `no space left on device` | Worker storage | `buildx du`, host disk/inode, GC policy |
+
+## 1. Builder không hoạt động
+
+```bash
+docker buildx ls
+docker buildx inspect <builder> --bootstrap
+docker context inspect "$(docker context show)"
+```
+
+Với `docker-container`:
+
+```bash
+docker ps --all --filter name=buildx_buildkit
+docker logs <buildkit-container>
+```
+
+Không xóa builder ngay. Kiểm tra daemon, network, certificate, container exit reason và disk. Với remote/Kubernetes builder, kiểm tra endpoint/pod/service/log ở platform tương ứng.
+
+Nếu cần tạo builder disposable để so sánh:
+
+```bash
+docker buildx create --name diagnosis --driver docker-container --use --bootstrap
+docker buildx build --builder diagnosis --progress=plain --load -t app:diagnosis .
+```
+
+Nếu builder mới thành công, khác biệt nằm ở config/cache/storage/network của builder cũ; chưa chắc Dockerfile đúng trong production topology.
+
+## 2. Dockerfile hoặc context sai
+
+### `COPY` không tìm thấy file
+
+Xác định context là argument cuối:
+
+```bash
+docker buildx build -f docker/Dockerfile .
+# context là repository root, không phải docker/
+```
+
+Kiểm tra:
+
+```bash
+pwd
+ls -la
+sed -n '1,240p' .dockerignore
+```
+
+Các nguyên nhân phổ biến:
+
+- file bị `.dockerignore` loại;
+- Dockerfile-specific ignore file override root;
+- path được tính từ context, không từ vị trí Dockerfile;
+- sai chữ hoa/thường chỉ lộ trên Linux CI;
+- file generated chưa được tạo trong clean checkout;
+- Git submodule/LFS chưa checkout.
+
+Dùng `--check`:
+
+```bash
+docker buildx build --check .
+docker buildx build --call=targets .
+docker buildx build --call=outline --target runtime .
+```
+
+### Context quá lớn
+
+Plain log hiển thị bytes ở `load build context`. Tìm directory lớn:
+
+```bash
+du -ah . | sort -h | tail -30
+find . -type f -size +100M -print
+```
+
+Cập nhật `.dockerignore`, nhưng không ignore source cần build chỉ để giảm số. Với remote builder, context transfer cost rõ hơn.
+
+## 3. Cache miss hoặc cache sai kỳ vọng
+
+```bash
+docker buildx build --progress=plain \
+  --cache-from type=registry,ref=registry.example.com/team/app:cache-main \
+  --load -t app:debug .
+```
+
+Đi từ step đầu tiên miss:
+
+- Dockerfile instruction/ARG/frontend version đổi;
+- input file checksum hoặc permission đổi;
+- base image digest đổi;
+- target platform/builder khác;
+- cache reference bị ghi đè/xóa hoặc auth import fail;
+- `mode=min` không chứa intermediate stage;
+- generated timestamp/file làm context thay đổi.
+
+Không dùng `--no-cache` để điều tra cache hit ratio. Dùng nó chỉ làm control experiment:
+
+```bash
+docker buildx build --no-cache --progress=plain ...
+```
+
+`--no-cache` không tự pull base mới; thêm `--pull` nếu đang kiểm tra base tag:
+
+```bash
+docker buildx build --pull --no-cache ...
+```
+
+Nếu chỉ cần refresh stage:
+
+```bash
+docker buildx build --no-cache-filter deps ...
+```
+
+### Cache mount không reuse
+
+- builder có persistent không;
+- `id` và target path có khớp;
+- package manager có thực sự dùng path đó;
+- tool có tự xóa cache;
+- concurrent writer cần `sharing=locked`;
+- artifact có bị ghi trong mount rồi biến mất sau `RUN`.
+
+## 4. Network, proxy, DNS và TLS
+
+Phân biệt network của **client** (pull/push context/output) với network của **BuildKit worker/RUN**. Remote builder có DNS/CA/proxy khác laptop.
+
+Tạo diagnostic stage tạm, không để trong final production target:
+
+```dockerfile
+FROM alpine:3.23 AS network-debug
+RUN apk add --no-cache curl bind-tools ca-certificates
+RUN cat /etc/resolv.conf \
+    && nslookup registry.npmjs.org \
+    && curl --fail --show-error --head https://registry.npmjs.org/
+```
+
+```bash
+docker buildx build --target network-debug --progress=plain .
+```
+
+Kiểm tra:
+
+- HTTP(S) proxy/no-proxy tại daemon/worker;
+- corporate CA trong build stage và daemon registry config;
+- DNS resolver/firewall/egress;
+- clock skew làm TLS fail;
+- rate limit registry/package manager;
+- URL private resolve khác trong container network.
+
+Không tắt TLS verification để “fix”. Cài CA đúng scope và xác minh hostname/certificate chain.
+
+Build arg proxy có behavior đặc biệt, nhưng vẫn không hard-code credential vào Dockerfile/log:
+
+```bash
+docker buildx build \
+  --build-arg HTTPS_PROXY="$HTTPS_PROXY" \
+  --build-arg NO_PROXY="$NO_PROXY" .
+```
+
+Review provenance/log disclosure và ưu tiên daemon-level config cho shared builder.
+
+## 5. Secret và SSH lỗi
+
+Secret missing:
+
+```dockerfile
+RUN --mount=type=secret,id=npmrc,required=true npm ci
+```
+
+```bash
+docker buildx build --secret id=npmrc,src="$HOME/.npmrc" .
+```
+
+SSH:
+
+```bash
+printf 'SSH_AUTH_SOCK=%s\n' "${SSH_AUTH_SOCK:-<unset>}"
+ssh-add -l
+docker buildx build --ssh default --progress=plain .
+```
+
+Phân biệt:
+
+- `required=true` và caller chưa truyền;
+- ID khác nhau;
+- source file/socket không accessible ở Buildx client;
+- host key verification fail;
+- credential không có quyền repository/package;
+- untrusted CI event cố tình không được cấp secret.
+
+Không echo secret để debug. Dùng API identity endpoint hoặc command trả username/scope không nhạy cảm nếu provider hỗ trợ.
+
+## 6. Multi-platform lỗi
+
+### `exec format error`
+
+```bash
+docker buildx inspect --bootstrap
+file ./path/to/binary
+```
+
+Kiểm tra Dockerfile:
+
+```dockerfile
+FROM --platform=$BUILDPLATFORM golang:1.25 AS build
+ARG TARGETOS TARGETARCH
+RUN GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -o /out/server .
+```
+
+Các lỗi điển hình:
+
+- binary target được chạy trong build stage native;
+- QEMU/binfmt thiếu hoặc hỏng;
+- final base không có target platform;
+- prebuilt native addon chỉ có amd64;
+- artifact cache dùng chung sai architecture;
+- shell script có CRLF/shebang sai, cũng có thể hiện như exec error.
+
+Build từng platform để cô lập:
+
+```bash
+docker buildx build --platform linux/amd64 --progress=plain ...
+docker buildx build --platform linux/arm64 --progress=plain ...
+```
+
+Test native nếu QEMU có segmentation fault hoặc build quá chậm.
+
+## 7. Export thành công nhưng không thấy output
+
+Đọc dòng cuối log `exporting to ...`.
+
+### Muốn image local
+
+```bash
+docker buildx build --load -t app:dev .
+docker image inspect app:dev
+```
+
+### Muốn image registry
+
+```bash
+docker buildx build --push -t registry.example.com/team/app:1.4.0 .
+docker buildx imagetools inspect registry.example.com/team/app:1.4.0
+```
+
+### Muốn file artifact
+
+```bash
+rm -rf out
+docker buildx build --output type=local,dest=out .
+find out -maxdepth 3 -type f -print
+```
+
+Tag không thay output. Với custom driver, nếu không chỉ định output, build result có thể chỉ được giữ trong cache.
+
+## 8. Registry push/pull fail
+
+```bash
+docker login registry.example.com
+docker buildx imagetools inspect registry.example.com/team/app:existing
+```
+
+Kiểm tra:
+
+- repository path và permission push/pull;
+- token expiry/scope;
+- registry certificate và mirror config trên worker;
+- quota/retention;
+- OCI index/attestation/cache media type compatibility;
+- proxy/load balancer giới hạn upload;
+- tag immutable policy.
+
+Multi-platform push gồm nhiều manifest/blob; một platform fail có thể làm index chưa hoàn chỉnh. Chỉ deploy sau khi `imagetools inspect` xác minh đủ platform và digest.
+
+## 9. Disk/OOM/resource
+
+```bash
+docker system df
+docker buildx du --builder <name>
+df -h
+df -i
+```
+
+OOM có thể xuất hiện là process bị `Killed` hoặc exit code 137. Kiểm tra host/container/Kubernetes events và cgroup limit. Giải pháp:
+
+- giảm compiler parallelism;
+- tăng memory/shm/resource limit có kiểm soát;
+- tách stage nặng;
+- giới hạn BuildKit max parallelism;
+- cấu hình cache GC;
+- giảm context/output và dependency thừa.
+
+Chỉ prune sau inventory:
+
+```bash
+docker buildx prune --builder <name> --filter 'until=168h' --verbose
+```
+
+Không chạy `docker system prune -af --volumes` trên shared/production host nếu chưa biết dữ liệu nào sẽ mất.
+
+## 10. Tạo minimal reproduction
+
+Khi lỗi phức tạp:
+
+1. giữ nguyên builder/driver/platform gây lỗi;
+2. pin base image digest và frontend;
+3. thu nhỏ context/Dockerfile tới step đầu tiên fail;
+4. thay secret thật bằng fixture/canary;
+5. ghi command, version, expected và actual output;
+6. test builder sạch như control, không thay production state trước;
+7. không publish repository/log nếu chứa source hoặc metadata nhạy cảm.
+
+Minimal reproduction phải giữ boundary gây lỗi. Chuyển remote builder sang local có thể làm lỗi biến mất vì network/CA/storage khác.
+
+## Runbook theo thứ tự
+
+- [ ] Xác nhận context, builder, driver, node và platform.
+- [ ] Ghi rõ output mong muốn và option `--load`/`--push`/`--output`.
+- [ ] Chạy `--progress=plain`, lấy step đầu tiên lỗi/miss.
+- [ ] Chạy `--check` và kiểm tra context/`.dockerignore`.
+- [ ] Phân biệt client network với worker network.
+- [ ] Kiểm tra secret/SSH ID mà không in giá trị.
+- [ ] Cô lập từng platform.
+- [ ] Kiểm tra registry manifest/digest sau push.
+- [ ] Xem disk, inode, memory và cache trước prune.
+- [ ] Tạo minimal reproduction và lưu evidence đã redact.
+
+## Nguồn chính thức
+
+- [`docker buildx build`](https://docs.docker.com/reference/cli/docker/buildx/build/)
+- [Build checks](https://docs.docker.com/build/checks/)
+- [Build cache invalidation](https://docs.docker.com/build/cache/invalidation/)
+- [BuildKit configuration](https://docs.docker.com/build/buildkit/configure/)
+- [`docker buildx debug` — experimental](https://docs.docker.com/reference/cli/docker/buildx/debug/)

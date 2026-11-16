@@ -1,0 +1,233 @@
+---
+title: "Exec và attach"
+description: "Phân biệt docker exec với attach, sử dụng interactive/TTY và detach keys đúng cách, tránh gửi signal nhầm tới PID 1 và debug container với quyền tối thiểu."
+---
+
+`docker container exec` và `attach` đều đưa terminal tới một container đang chạy, nhưng chúng nối vào hai đối tượng khác nhau:
+
+- `exec` tạo **process mới** trong namespaces của container;
+- `attach` nối local `STDIN`, `STDOUT`, `STDERR` vào **process chính đã có**.
+
+Chọn sai command có thể biến một thao tác xem output thành signal làm dừng application.
+
+## So sánh behavior
+
+| Khía cạnh | `docker exec` | `docker attach` |
+|---|---|---|
+| Process | Tạo process phụ | Không tạo process |
+| Target | Command do người dùng chỉ định | `ENTRYPOINT`/`CMD` đang là PID 1 |
+| Điều kiện | PID 1 phải đang chạy và container không paused | Container phải đang chạy |
+| Environment | Env lúc create, có thể override cho exec process | Environment của process chính giữ nguyên |
+| User/workdir | Có thể chọn bằng `--user`, `--workdir` | Không đổi process chính |
+| Rủi ro Ctrl+C | Thường dừng exec process | Có thể forward `SIGINT` tới PID 1 |
+| Mục tiêu | Debug, kiểm tra, tác vụ phụ có giới hạn | Xem/điều khiển stdio của application chính |
+
+## `docker exec`: chạy một executable mới
+
+Cú pháp:
+
+```text
+docker container exec [OPTIONS] CONTAINER COMMAND [ARG...]
+```
+
+Ví dụ không cần TTY:
+
+```bash
+docker container exec api id
+docker container exec api cat /etc/os-release
+```
+
+Interactive shell:
+
+```bash
+docker container exec --interactive --tty api sh
+```
+
+Shell phải tồn tại trong image. Minimal/distroless image có thể không có `sh`, `bash`, `ps`, `curl` hoặc package manager; đó không phải lỗi của `docker exec`.
+
+### Command phải là executable
+
+Docker không tự parse operator của shell:
+
+```bash
+# Sai: toàn bộ chuỗi bị coi như tên executable
+docker container exec api 'echo one && echo two'
+
+# Đúng khi image có sh
+docker container exec api sh -c 'echo one && echo two'
+```
+
+Chỉ dùng `sh -c` khi cần pipe, redirect, expansion hoặc nhiều command. Không nối input không tin cậy vào shell string vì có nguy cơ command injection.
+
+### Environment, user và working directory chỉ áp dụng cho process mới
+
+```bash
+docker container exec \
+  --env DEBUG_REQUEST=1 \
+  --user 1000:1000 \
+  --workdir /tmp \
+  api env
+```
+
+`DEBUG_REQUEST=1` không cập nhật environment của PID 1 hay các lần exec sau. User name và path phải tồn tại/hợp lệ trong container; dùng numeric UID/GID khi image không có account database phù hợp.
+
+<Callout type="warn" title="Quyền exec là quyền điều khiển workload">
+  Ai có quyền gọi Docker API thường có thể exec, đọc environment/file, chạy dưới user khác hoặc thay đổi writable state. Bảo vệ Docker socket/context như một administrative interface; ghi nhận break-glass access và tránh `--privileged` nếu chưa có lý do cụ thể.
+</Callout>
+
+## `docker attach`: nối vào stdio của PID 1
+
+Cú pháp:
+
+```text
+docker container attach [OPTIONS] CONTAINER
+```
+
+`attach` hiển thị output của process chính. Nếu process không ghi gì, terminal trông như bị treo dù container vẫn chạy.
+
+Để chỉ quan sát output và không nối input:
+
+```bash
+docker container attach --no-stdin api
+```
+
+Tuy nhiên `docker logs --follow` thường an toàn và phù hợp hơn cho việc đọc logs. Official reference cảnh báo attach qua client chậm có thể ảnh hưởng application tạo output lớn vì attach path dùng buffer hữu hạn.
+
+### Ctrl+C và detach sequence
+
+Với `--sig-proxy=true` mặc định, signal từ client được proxy tới process chính. Nhấn `Ctrl+C` thường gửi `SIGINT`; nếu application thoát, container cũng dừng.
+
+Container được tạo với interactive TTY thường cho phép rời attach mà vẫn giữ process chạy bằng sequence mặc định:
+
+```text
+Ctrl+P, Ctrl+Q
+```
+
+Nhấn hai chord theo thứ tự, không phải cùng lúc. Có thể đổi bằng `--detach-keys` hoặc cấu hình Docker CLI. Hãy thực hành trên container lab trước khi attach production.
+
+TTY-enabled và non-TTY container xử lý detach/input khác nhau; đừng giả định sequence luôn cứu được một phiên attach không tương tác.
+
+## `-i` và `-t` không đồng nghĩa
+
+- `-i` giữ input stream mở.
+- `-t` cấp pseudo-terminal.
+
+Cho người dùng thao tác shell, thường dùng cả hai:
+
+```bash
+docker container exec -it api sh
+```
+
+Cho pipeline, chỉ dùng `-i` khi cần truyền stdin:
+
+```bash
+printf '%s\n' 'payload' |
+  docker container exec -i api sh -c 'cat > /tmp/payload'
+```
+
+Không cấp TTY khi cần phân biệt stdout/stderr hoặc xử lý byte stream chính xác; pseudo-TTY có thể merge stream và thay đổi newline/buffering.
+
+## Lab: so sánh hai đường kết nối
+
+Tạo container có PID 1 chạy lâu và xử lý `SIGINT`/`SIGTERM`:
+
+```bash
+docker container run --detach \
+  --interactive \
+  --tty \
+  --name lifecycle-io-demo \
+  --label com.example.lab=exec-attach \
+  --env APP_MODE=main \
+  alpine:3.22 \
+  sh -c 'trap "echo signal-received; exit 0" INT TERM; echo main-ready; while :; do sleep 1; done'
+```
+
+### Exec một process độc lập
+
+```bash
+docker container exec lifecycle-io-demo \
+  sh -c 'echo "exec-pid=$$ app-mode=$APP_MODE"'
+
+docker container exec --env APP_MODE=debug lifecycle-io-demo \
+  sh -c 'echo "override=$APP_MODE"'
+```
+
+Process exec có PID riêng. Lần override thứ hai không đổi `APP_MODE=main` của PID 1.
+
+Kiểm tra process tree:
+
+```bash
+docker container top lifecycle-io-demo -eo pid,ppid,user,stat,args
+```
+
+### Attach vào process chính
+
+Mở một terminal khác và chạy:
+
+```bash
+docker container attach lifecycle-io-demo
+```
+
+Bạn sẽ thấy output `main-ready` nếu attach/replay path còn output phù hợp, rồi terminal chờ output mới. Dùng `Ctrl+P`, `Ctrl+Q` để detach mà không dừng container. Xác minh từ terminal đầu:
+
+```bash
+docker container inspect lifecycle-io-demo \
+  --format 'status={{.State.Status}} running={{.State.Running}}'
+```
+
+Nếu dùng `Ctrl+C`, handler có thể làm PID 1 exit và container chuyển sang `exited`. Đây là lý do `logs --follow` phù hợp hơn khi chỉ cần quan sát.
+
+Cleanup bất kể state hiện tại:
+
+```bash
+docker container rm --force lifecycle-io-demo
+```
+
+## Debug mà không làm drift container
+
+`exec` rất tiện nhưng mọi file/package được sửa trong writable layer không nằm trong Dockerfile hay deployment declaration. Cách làm an toàn hơn:
+
+1. Dùng command read-only trước: `id`, `env` đã redact, `cat` config không chứa secret, kiểm tra socket/process.
+2. Capture command, operator, timestamp và container ID trong incident record.
+3. Không cài package hoặc sửa config trực tiếp nếu có thể dùng debug container/toolbox riêng.
+4. Nếu buộc phải thay đổi để mitigation, coi đó là break-glass và recreate từ image đã sửa ngay sau incident.
+5. Dùng `docker container diff` để phát hiện thay đổi writable layer còn sót.
+
+Không dùng `docker commit` để biến một phiên debug thủ công thành release. Pipeline build phải tạo image có source, dependency và provenance có thể review.
+
+## Troubleshooting
+
+### `exec` báo container không running hoặc đang paused
+
+```bash
+docker container inspect CONTAINER \
+  --format 'status={{.State.Status}} paused={{.State.Paused}} error={{json .State.Error}}'
+```
+
+Nếu PID 1 đã exit, không thể exec vào object đó. Thu inspect/logs rồi debug image bằng container mới hoặc công cụ chuyên dụng. Nếu paused, xác nhận ownership trước khi unpause.
+
+### `exec: "sh": executable file not found`
+
+Image không chứa shell hoặc `PATH` không tìm thấy executable. Inspect image config và dùng executable thực sự có trong image; đừng cài shell vào production image chỉ để debug nếu toolbox riêng đáp ứng được.
+
+### Attach xong container dừng
+
+Kiểm tra signal và exit code:
+
+```bash
+docker container inspect CONTAINER --format '{{json .State}}'
+docker events --since '5m' --until '0s' --filter 'container=CONTAINER'
+```
+
+Khả năng phổ biến là `Ctrl+C` được proxy tới PID 1 hoặc input gửi lệnh exit cho application. Lần sau dùng `docker logs --follow`, `attach --no-stdin` hoặc detach sequence đã kiểm thử.
+
+### Output exec không xuất hiện trong `docker logs`
+
+Không giả định stdout/stderr của exec process đi qua logging path của PID 1. Capture output ngay tại client hoặc chuyển diagnostic vào hệ thống observability chủ đích; `docker logs` tập trung vào stdout/stderr của container process theo logging driver.
+
+## Nguồn chính thức
+
+- [docker container exec](https://docs.docker.com/reference/cli/docker/container/exec/)
+- [docker container attach](https://docs.docker.com/reference/cli/docker/container/attach/)
+- [Docker CLI detach keys](https://docs.docker.com/reference/cli/docker/)
+- [docker container diff](https://docs.docker.com/reference/cli/docker/container/diff/)

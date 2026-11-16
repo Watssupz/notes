@@ -1,0 +1,166 @@
+---
+title: "Quản lý Linux capabilities"
+description: "Tách quyền root thành các Linux capability nhỏ, drop toàn bộ rồi chỉ thêm quyền workload thực sự cần thay vì dùng --privileged."
+---
+
+Linux capabilities chia quyền superuser thành các đơn vị như bind port thấp, thay đổi network hay trace process. Docker cấp một tập capability mặc định tương đối hạn chế, nhưng nhiều application không cần toàn bộ tập đó.
+
+```text
+root truyền thống
+  ├── CAP_CHOWN
+  ├── CAP_NET_BIND_SERVICE
+  ├── CAP_NET_RAW
+  ├── CAP_SETUID / CAP_SETGID
+  └── ... nhiều quyền kernel khác
+```
+
+Capability là thuộc tính của thread/process và gồm nhiều set như permitted, effective, inheritable, bounding, ambient. Với vận hành Docker, mục tiêu thực tế là thu hẹp bounding/effective set bằng `--cap-drop` và `--cap-add`.
+
+## Capability không đồng nghĩa user
+
+| Cấu hình | Ý nghĩa |
+|---|---|
+| `--user 10001` | Process chạy non-root trong container |
+| `--cap-drop ALL` | Bỏ mọi capability khỏi bounding set do runtime cấp |
+| `--cap-add NET_BIND_SERVICE` | Thêm đúng quyền bind port thấp |
+| `no-new-privileges` | Chặn process nhận privilege mới qua `execve`, setuid/file capability |
+| `--privileged` | Mở rộng capability, device và security configuration; không phải một capability đơn |
+
+Chạy non-root và drop capability là hai control khác nhau. Một process non-root có thể được cấp file/ambient capability; process UID `0` đã drop capability vẫn có thể đọc file cho phép root trong namespace.
+
+## Xem effective capabilities
+
+Từ host:
+
+```bash
+docker run --rm alpine:3.23 sh -c \
+  'grep -E "^(Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs):" /proc/1/status'
+```
+
+Các giá trị là bitmask. Để đọc tên dễ hơn, dùng image/tool có `capsh`:
+
+```bash
+docker run --rm debian:13-slim sh -c \
+  'apt-get update >/dev/null && apt-get install -y --no-install-recommends libcap2-bin >/dev/null && capsh --print'
+```
+
+Command tải package trong container lab và cần network. Không cài tool trực tiếp vào container production chỉ để debug; dùng image toolbox đã quản lý.
+
+Xem config Docker đã lưu:
+
+```bash
+docker inspect CONTAINER --format 'add={{json .HostConfig.CapAdd}} drop={{json .HostConfig.CapDrop}} privileged={{.HostConfig.Privileged}}'
+```
+
+## Chiến lược drop-all rồi add-back
+
+Lab không cần capability:
+
+```bash
+docker run --rm \
+  --user 10001:10001 \
+  --cap-drop ALL \
+  --security-opt no-new-privileges=true \
+  alpine:3.23 sh -c 'id; grep -E "CapEff|NoNewPrivs" /proc/1/status'
+```
+
+Web server bind port `80` trên kernel/config yêu cầu capability có thể dùng:
+
+```bash
+docker run --rm \
+  --user 101:101 \
+  --cap-drop ALL \
+  --cap-add NET_BIND_SERVICE \
+  --security-opt no-new-privileges=true \
+  nginx:1.28-alpine
+```
+
+Tuy nhiên image có thể cần ghi config/cache hoặc có entrypoint đổi ownership. Thực tế thường đơn giản hơn nếu application listen port `8080` bằng non-root rồi reverse proxy/NAT publish ra port `80`, không cần add capability.
+
+<Callout type="info" title="Ưu tiên sửa thiết kế">
+  Trước khi add capability, hỏi liệu có thể đổi port, pre-create ownership trong image, mount đúng path hoặc chuyển thao tác đặc quyền ra init/provisioning hay không.
+</Callout>
+
+## Capability nhạy cảm
+
+| Capability | Rủi ro chính | Cách thay thế thường gặp |
+|---|---|---|
+| `SYS_ADMIN` | Tập quyền rất rộng; liên quan mount/namespace và nhiều kernel API | Tách thao tác ra host helper có API hẹp |
+| `SYS_PTRACE` | Đọc/sửa process khác trong boundary cho phép | Debug container riêng, time-boxed |
+| `NET_ADMIN` | Thay route/interface/firewall trong network namespace | Cấu hình network từ platform |
+| `SYS_MODULE` | Load/unload kernel module | Provision module trên host |
+| `SYS_RAWIO` | Raw I/O và device access | Device-specific service, policy hẹp |
+| `DAC_READ_SEARCH` | Bypass kiểm tra đọc/search file | Cấp ACL/ownership đúng path |
+| `NET_RAW` | Raw/packet socket, spoofing và network discovery | Drop nếu app không ping/raw socket |
+
+`SYS_ADMIN` thường được gọi là “new root” vì phạm vi quá rộng. Nếu vendor yêu cầu, cần threat model, dedicated node/VM và test capability cụ thể; không add mù quáng.
+
+## `no-new-privileges`
+
+Flag ngăn process và child nhận privilege mới qua setuid/setgid bit hoặc file capability:
+
+```bash
+docker run --rm \
+  --security-opt no-new-privileges=true \
+  alpine:3.23 grep NoNewPrivs /proc/1/status
+```
+
+Expected:
+
+```text
+NoNewPrivs:	1
+```
+
+Flag không drop capability process đang có. Kết hợp với non-root và `--cap-drop ALL`.
+
+## Compose baseline
+
+```yaml
+services:
+  api:
+    image: registry.example.com/team/api@sha256:REPLACE_WITH_DIGEST
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+```
+
+Nếu cần capability:
+
+```yaml
+    cap_add:
+      - NET_BIND_SERVICE
+```
+
+Sau `docker compose up`, xác minh effective config bằng `docker compose ps -q api | xargs docker inspect`; không chỉ tin file source vì override có thể thay đổi model.
+
+## Debug lỗi permission đúng cách
+
+Khi app lỗi `Operation not permitted`:
+
+1. Ghi syscall/path/operation cụ thể bằng log, `strace` trong môi trường test hoặc audit LSM.
+2. Kiểm tra UID/GID, file permission, mount mode và user namespace.
+3. Kiểm tra seccomp/AppArmor/SELinux trước khi kết luận thiếu capability.
+4. Thử add **một** capability trong lab.
+5. Viết regression test và loại bỏ capability thừa.
+
+Không chuyển thẳng sang `--privileged`. Flag đó có thể làm lỗi biến mất nhưng xóa bằng chứng về control thực sự cần.
+
+## Kiểm thử capability tối thiểu
+
+- Khởi động, healthcheck và shutdown bình thường.
+- Thực hiện mọi feature hiếm: rotate log/certificate, reload config, backup, diagnostics.
+- Xác minh `CapEff`, `CapBnd`, `NoNewPrivs` trong process PID 1.
+- Test exploit path dự kiến bị deny, không chỉ happy path.
+- Re-test khi đổi base image, runtime hoặc kernel.
+
+## Nguồn chính thức
+
+- [Runtime privilege and Linux capabilities](https://docs.docker.com/engine/containers/run/#runtime-privilege-and-linux-capabilities)
+- [Docker Engine security: Linux capabilities](https://docs.docker.com/engine/security/#linux-kernel-capabilities)
+- [Linux capabilities manual](https://man7.org/linux/man-pages/man7/capabilities.7.html)
+- [Seccomp profiles](/docs/security/seccomp-profiles/)

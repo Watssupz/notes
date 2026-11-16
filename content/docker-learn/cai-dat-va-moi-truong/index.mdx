@@ -1,0 +1,156 @@
+---
+title: "Tổng quan cài đặt Docker"
+description: "Chọn Docker Engine hoặc Docker Desktop theo platform, hiểu boundary client-daemon và lập kế hoạch cài đặt, bảo mật, xác minh trước khi bắt đầu."
+---
+
+Cài Docker không chỉ là làm cho command `docker` xuất hiện trong terminal. Một môi trường dùng được phải có **Docker CLI**, một **daemon** mà CLI có quyền truy cập, runtime phù hợp với platform, network tới registry và storage đủ an toàn cho image, container, volume.
+
+Sau phần này, bạn phải chọn được mô hình cài đặt phù hợp, xác định command đang điều khiển daemon nào, cấu hình quyền truy cập có chủ đích và chứng minh environment hoạt động qua một smoke test end-to-end.
+
+## Mental model: CLI có thể không nằm cùng daemon
+
+Luồng điều khiển cơ bản là:
+
+```text
+Terminal
+  │
+  │ docker CLI + Docker context
+  ▼
+Docker API endpoint
+  ├── Unix socket trên Linux Engine
+  ├── endpoint do Docker Desktop cung cấp
+  └── SSH/TLS tới remote daemon
+        │
+        ▼
+Docker daemon
+  ├── image/content store
+  ├── container runtime
+  ├── network và published ports
+  └── volumes/data root
+```
+
+CLI chỉ gửi API request. Image được pull, container được tạo và port được publish trên **host chạy daemon**, không nhất thiết trên host chạy terminal. Vì vậy, `docker context show` là bước an toàn bắt buộc trước lab, cleanup hoặc thay đổi production.
+
+```bash
+docker context show
+docker context ls
+docker version
+```
+
+`docker version` phải có cả phần Client và Server. Nếu chỉ có Client, bạn đã cài CLI nhưng chưa kết nối được daemon.
+
+<Callout type="error" title="Kiểm tra target trước khi thao tác">
+  Nếu context trỏ tới remote, shared, staging hoặc production host, không chạy command cài thử, cleanup hay `docker run` từ tutorial. Chuyển về local context hoặc dùng một máy lab riêng.
+</Callout>
+
+## Chọn mô hình cài đặt
+
+| Môi trường | Lựa chọn thường phù hợp | Đặc điểm cần hiểu |
+|---|---|---|
+| Linux server hoặc VM | Docker Engine native | `dockerd` chạy như system service; admin quản lý package, socket, firewall và data root |
+| Windows development | Docker Desktop với WSL 2 cho Linux containers | Engine chạy trong môi trường Linux do Desktop quản lý; WSL distro tích hợp chủ yếu là workspace và CLI |
+| macOS development | Docker Desktop | Linux containers chạy trong VM vì macOS không cung cấp Linux kernel primitives |
+| Linux desktop cá nhân | Docker Engine native hoặc Docker Desktop for Linux | Engine native nhẹ hơn; Desktop cung cấp UI và tính năng tích hợp nhưng có lifecycle/data store riêng |
+| Host nhiều người dùng, giảm quyền daemon | Docker Engine rootless | Daemon và container chạy trong user namespace; có giới hạn network/cgroup cần đánh giá |
+| CI runner tạm thời | Package/repository hoặc image runner do platform quản lý | Cần pin version, cache có kiểm soát và không dùng convenience script thiếu review |
+| Remote build/runtime host | Local CLI + Docker context qua SSH/TLS | Không cần daemon local, nhưng endpoint remote là quyền điều khiển mạnh |
+
+Docker Desktop và Docker Engine native không nên được coi là hai tên cho cùng một cách vận hành. Desktop quản lý VM, update, network và settings qua application; nhiều hướng dẫn sửa `/etc/docker/daemon.json` trên host không áp dụng trực tiếp cho Desktop.
+
+### Rootful, nhóm `docker` hay rootless?
+
+Ba mô hình quyền phổ biến trên Linux có boundary khác nhau:
+
+| Mô hình | Daemon | Người gọi CLI | Ý nghĩa bảo mật |
+|---|---|---|---|
+| Dùng `sudo docker ...` | Chạy bằng root | Chỉ user có quyền `sudo` phù hợp | Mỗi lần gọi có elevation rõ ràng, nhưng policy phụ thuộc sudoers |
+| User thuộc nhóm `docker` | Chạy bằng root | Truy cập socket không cần `sudo` | Thành viên nhóm gần như có quyền root trên host qua Docker API |
+| Rootless mode | Chạy bằng user thường | Truy cập user socket | Giảm impact của daemon/runtime compromise, đổi lại có compatibility và resource-control trade-off |
+
+Không sửa `/var/run/docker.sock` thành mode world-writable để “hết permission denied”. Chọn một trong các mô hình trên và ghi nhận ai có quyền điều khiển daemon.
+
+## Chuẩn bị trước khi cài
+
+Trước khi chạy package manager hoặc installer, thu thập:
+
+1. **Platform và architecture:** OS release, CPU architecture, Linux kernel/WSL version.
+2. **Nguồn package:** Docker official repository, distribution repository hay enterprise mirror. Không trộn package `docker.io`, `containerd`, `runc` của distribution với bundle `docker-ce`/`containerd.io` nếu hướng dẫn platform yêu cầu gỡ conflict.
+3. **Network path:** DNS, HTTPS egress, corporate proxy, TLS-inspecting CA và registry mirror.
+4. **Storage:** filesystem, free space, inode và vị trí dữ liệu bền vững. Gỡ package không đồng nghĩa xóa image/volume.
+5. **Firewall:** port publishing có thể tạo rule ngoài cách bạn quen quản lý bằng `ufw`/`firewalld`; production host cần review packet-filtering policy.
+6. **Access model:** ai được dùng daemon, có cần rootless hay remote access không.
+7. **Upgrade policy:** stable channel, version pin, maintenance window và rollback bằng backup/snapshot đã test.
+
+Trên Linux, các command sau tạo inventory ban đầu mà không thay đổi hệ thống:
+
+```bash
+uname -a
+cat /etc/os-release
+uname -m
+df -h
+df -i
+systemctl status docker --no-pager 2>/dev/null || true
+command -v docker || true
+docker context ls 2>/dev/null || true
+```
+
+Output có thể chứa hostname và endpoint nội bộ; redaction trước khi gửi ra ngoài tổ chức.
+
+## Luồng cài đặt an toàn
+
+Một quy trình có thể lặp lại nên đi theo thứ tự:
+
+```text
+Inventory host và installation hiện có
+        ↓
+Chọn product + source package + access model
+        ↓
+Backup state/config nếu đây là upgrade hoặc reinstall
+        ↓
+Cài package/application từ nguồn tin cậy
+        ↓
+Khởi động daemon và kiểm tra Client/Server
+        ↓
+Cấu hình quyền, logging, proxy/mirror khi cần
+        ↓
+Smoke test pull → create → network/mount → cleanup
+        ↓
+Ghi lại version, context, config và rollback plan
+```
+
+Đừng cấu hình proxy, mirror, data root và nhiều security option cùng lúc trước lần start đầu tiên. Tạo baseline chạy được, sau đó áp từng thay đổi, validate và xác minh. Cách này giữ failure domain nhỏ và giúp biết setting nào gây daemon start failure.
+
+## Bản đồ nội dung trong phần này
+
+1. [Cài Docker Engine trên Linux](/docs/cai-dat-va-moi-truong/docker-engine-linux/) trình bày installation bằng official APT/DNF repository và cách xác minh service.
+2. [Thiết lập Linux sau cài đặt](/docs/cai-dat-va-moi-truong/linux-post-install/) chọn quyền socket, startup, logging và baseline vận hành.
+3. [Rootless mode](/docs/cai-dat-va-moi-truong/rootless-mode/) cài daemon trong user namespace và đánh giá giới hạn.
+4. [Cấu hình Docker daemon](/docs/cai-dat-va-moi-truong/daemon-configuration/) cung cấp workflow sửa `daemon.json`, validate, rollout và rollback.
+5. [Proxy và registry mirror](/docs/cai-dat-va-moi-truong/proxy-and-mirror/) tách network của daemon, build và container, đồng thời cấu hình pull-through cache.
+6. [Nâng cấp và gỡ cài đặt](/docs/cai-dat-va-moi-truong/upgrade-uninstall/) giữ dữ liệu, kiểm soát downtime và phân biệt remove package với purge state.
+7. [Xác minh môi trường](/docs/cai-dat-va-moi-truong/verify-environment/) chạy checklist end-to-end và chẩn đoán theo layer.
+
+Nếu quản trị Linux server, nên đọc theo thứ tự từ Engine Linux đến verification. Với laptop Windows hoặc macOS, đối chiếu thêm tài liệu Docker Desktop chính thức trước khi áp dụng các bước Linux trực tiếp.
+
+## Tiêu chí hoàn thành
+
+Environment chỉ được coi là sẵn sàng khi bạn chứng minh được:
+
+- context trỏ đúng daemon;
+- Client và Server giao tiếp được;
+- daemon tự khởi động theo policy đã chọn;
+- user chỉ có mức quyền đã chủ đích cấp;
+- pull image qua DNS/proxy/TLS/registry path thành công;
+- container chạy, ghi volume/bind mount và published port theo đúng boundary;
+- Buildx và Compose plugin có mặt nếu curriculum tiếp theo cần;
+- logs không tăng không giới hạn;
+- package version, config, data location và cách rollback đã được ghi lại.
+
+`docker run hello-world` chỉ chứng minh một phần của chuỗi này. Trang verification cuối phần sẽ kiểm tra từng layer và giúp phân biệt lỗi client, daemon, registry, runtime, network hay storage.
+
+## Nguồn chính thức để đối chiếu
+
+- [Install Docker Engine](https://docs.docker.com/engine/install/)
+- [Docker daemon configuration overview](https://docs.docker.com/engine/daemon/)
+- [Docker Desktop](https://docs.docker.com/desktop/)
+- [Protect the Docker daemon socket](https://docs.docker.com/engine/security/protect-access/)

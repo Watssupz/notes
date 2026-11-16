@@ -1,0 +1,256 @@
+---
+title: "COPY và ADD"
+description: "Copy file an toàn từ build context, stage hoặc image; hiểu path, ownership, wildcard, cache và chỉ dùng ADD khi cần tar, URL hoặc Git source."
+---
+
+`COPY` và `ADD` đưa filesystem content vào build stage. `COPY` là lựa chọn mặc định vì contract hẹp và dễ review. `ADD` bổ sung behavior như tải remote URL/Git source và tự giải nén local tar archive; chỉ dùng khi behavior đó là mục tiêu có chủ đích.
+
+```dockerfile
+COPY [OPTIONS] <src> ... <dest>
+ADD  [OPTIONS] <src> ... <dest>
+```
+
+Dạng JSON cần thiết khi path chứa whitespace hoặc khi muốn argument boundary rõ:
+
+```dockerfile
+COPY ["file with spaces.txt", "/app/file.txt"]
+```
+
+## Source phải đến từ nguồn builder cho phép
+
+`COPY` thông thường đọc source từ build context. Source path được resolve tương đối từ root của context, không từ vị trí Dockerfile và không từ `WORKDIR` trên máy client.
+
+```text
+project/
+├── docker/Dockerfile
+├── src/app.js
+└── package.json
+```
+
+Build:
+
+```bash
+docker build --file docker/Dockerfile --tag app:test .
+```
+
+Trong Dockerfile:
+
+```dockerfile
+COPY src/ /app/src/
+```
+
+Context là `.` (`project/`). `COPY ../secret /app/` không thể thoát khỏi context. Nếu build bằng `docker build -f docker/Dockerfile docker/`, `src/` lại không nằm trong context và copy sẽ fail.
+
+## Source và destination path
+
+```dockerfile
+WORKDIR /app
+COPY package.json .
+COPY src/ ./src/
+```
+
+Destination tương đối được resolve từ `WORKDIR`; absolute destination từ root filesystem stage.
+
+Trailing slash của source directory không tạo thêm cấp directory như một số người kỳ vọng: content của directory được copy vào destination. Với nhiều source, destination phải là directory và nên kết thúc bằng `/` để intent rõ:
+
+```dockerfile
+COPY package.json package-lock.json /app/
+```
+
+Destination trailing slash có thể đổi semantics:
+
+```dockerfile
+COPY test.txt /abs       # tạo file /abs nếu chưa là directory
+COPY test.txt /abs/      # tạo /abs/test.txt
+```
+
+Dùng path explicit, không dựa vào directory tồn tại tình cờ từ base image.
+
+## Wildcard và `.dockerignore`
+
+Source có thể dùng wildcard theo pattern matching của builder:
+
+```dockerfile
+COPY package*.json /app/
+```
+
+Escape ký tự pattern nếu tên file chứa chúng. Pattern được áp dụng sau khi context đã bị `.dockerignore` lọc; exception sai thứ tự có thể làm source biến mất.
+
+Khi gặp `not found` hoặc `failed to calculate checksum`:
+
+1. xác nhận context cuối command build;
+2. kiểm tra spelling/case trên filesystem Linux;
+3. kiểm tra `.dockerignore` và Dockerfile-specific ignore file;
+4. xác nhận source không được sinh ở host sau khi build context đã snapshot;
+5. nếu source đến stage khác, kiểm tra stage/path output.
+
+## Ownership và permission
+
+Mặc định, file copy từ build context vào Linux image có ownership UID/GID `0:0`, trừ khi option hoặc source metadata đặc thù thay đổi behavior. Đặt ownership ngay khi copy:
+
+```dockerfile
+COPY --chown=10001:10001 --chmod=755 app /usr/local/bin/app
+```
+
+Dùng numeric UID/GID tăng tính độc lập với `/etc/passwd` ở stage đích. Nếu dùng tên:
+
+```dockerfile
+COPY --chown=app:app . /app
+```
+
+Builder phải resolve user/group trong root filesystem stage; thiếu database entry sẽ fail. `--chown`/`--chmod` là feature cho Linux container build; Windows có permission model khác.
+
+`--chmod` hỗ trợ octal permission với Dockerfile syntax tương thích. Không đặt `777` để chữa permission mơ hồ; xác định process cần read/write/execute ở path nào.
+
+## Tối ưu cache bằng nhiều `COPY`
+
+Anti-pattern:
+
+```dockerfile
+COPY . .
+RUN npm ci
+```
+
+Tách dependency manifest:
+
+```dockerfile
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+```
+
+Source code đổi không làm dependency step miss cache nếu manifest giữ nguyên. `.dockerignore` tiếp tục loại `node_modules`, `.git`, log, test artifact và secret khỏi context.
+
+Không tách thành hàng chục `COPY` chỉ để tăng cache; mỗi boundary phải phản ánh nhóm input và lifecycle thực.
+
+## Copy từ stage, image hoặc named context
+
+Multi-stage:
+
+```dockerfile
+FROM golang:1.25 AS build
+WORKDIR /src
+COPY . .
+RUN go build -o /out/server ./cmd/server
+
+FROM alpine:3.23
+COPY --from=build /out/server /usr/local/bin/server
+```
+
+Source của `COPY --from` được resolve từ root filesystem của stage, không từ `WORKDIR` hiện tại. Đặt tên stage để reorder không làm hỏng `--from=0`.
+
+Có thể copy từ external image:
+
+```dockerfile
+COPY --from=busybox:1.37.0-uclibc /bin/busybox /bin/busybox
+```
+
+Reference external image là supply-chain dependency; pin trusted tag/digest và kiểm tra license/compatibility.
+
+Named context:
+
+```bash
+docker build --build-context docs=./docs .
+```
+
+```dockerfile
+COPY --from=docs . /usr/share/app/docs/
+```
+
+Named context giữ input tách biệt thay vì mở rộng default context quá mức.
+
+## Khi nào dùng `ADD`
+
+### Local tar tự giải nén
+
+```dockerfile
+ADD rootfs.tar.gz /
+```
+
+Khi source là recognized local tar archive, `ADD` giải nén vào destination. Behavior dựa trên nội dung archive, không chỉ extension. Review archive path traversal, ownership và content; `COPY` giữ nguyên archive nếu bạn chỉ muốn lưu file `.tar.gz`.
+
+### Remote URL có checksum
+
+```dockerfile
+# syntax=docker/dockerfile:1
+ADD --checksum=sha256:<EXPECTED_SHA256> \
+    https://downloads.example.com/tool.tar.gz \
+    /tmp/tool.tar.gz
+```
+
+Thay checksum bằng giá trị lấy từ trusted release channel. Remote URL download không tự giải nén như local tar source. `--checksum` hỗ trợ HTTP(S) source theo syntax version tương ứng và giúp build fail khi bytes không khớp.
+
+Không truyền credential trong URL. URL có token có thể lộ qua source, log, provenance hoặc history. Dùng secret mount với downloader trong `RUN` khi nguồn private, và không log secret.
+
+### Git source
+
+Frontend hiện đại cho phép `ADD` Git repository với option như giữ `.git` hoặc chọn checksum/ref theo feature được hỗ trợ. Đây là dependency remote: pin commit/checksum và cân nhắc named Git context để source/credential rõ ở build invocation.
+
+## Vì sao không luôn dùng `ADD`
+
+`ADD . /app` trông ngắn nhưng người review phải kiểm tra context có tar nào bị auto-extract, remote behavior có được dùng hay không và input quá rộng không. `COPY` biểu đạt đúng ý “đưa file này vào image” với ít behavior ngầm hơn.
+
+Decision rule:
+
+| Nhu cầu | Chọn |
+|---|---|
+| File/directory từ context | `COPY` |
+| Artifact từ stage/image/named context | `COPY --from` |
+| Local tar cần auto-extract | `ADD` |
+| Public remote artifact cần checksum/cache semantics | `ADD --checksum` |
+| Private remote artifact | `RUN --mount=type=secret` + downloader |
+| Input chỉ cần trong một build step | `RUN --mount=type=bind` |
+
+## Secret đã copy rồi xóa vẫn có thể tồn tại
+
+Không làm:
+
+```dockerfile
+COPY .npmrc /root/.npmrc
+RUN npm ci && rm /root/.npmrc
+```
+
+`.npmrc` đã nằm trong layer của `COPY`; xóa ở layer sau chỉ che file trong final unified view. Dùng:
+
+```dockerfile
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc,required=true \
+    npm ci
+```
+
+Và loại file khỏi context:
+
+```text
+.npmrc
+.env
+*.pem
+```
+
+`.dockerignore` giảm nguy cơ nhưng không thay secret scanning và repository hygiene.
+
+## Xác minh copy result
+
+Thêm test trong build stage khi artifact có invariant:
+
+```dockerfile
+COPY --chmod=755 app /usr/local/bin/app
+RUN test -x /usr/local/bin/app
+```
+
+Sau build:
+
+```bash
+docker run --rm --entrypoint sh app:test -c '
+  set -eu
+  ls -l /usr/local/bin/app
+  test -x /usr/local/bin/app
+'
+```
+
+Với final image không có shell, dùng test stage trước final export hoặc `docker create` + `docker cp` cho kiểm tra file cụ thể. `docker image history --no-trunc app:test` giúp tìm instruction copy lớn bất thường nhưng không thay inventory/SBOM.
+
+## Nguồn chính thức
+
+- [`COPY` reference](https://docs.docker.com/reference/dockerfile/#copy)
+- [`ADD` reference](https://docs.docker.com/reference/dockerfile/#add)
+- [Build context](https://docs.docker.com/build/concepts/context/)
+- [Dockerfile best practices: ADD or COPY](https://docs.docker.com/build/building/best-practices/#add-or-copy)

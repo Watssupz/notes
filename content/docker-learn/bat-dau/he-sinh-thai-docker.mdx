@@ -1,0 +1,275 @@
+---
+title: "Hệ sinh thái Docker"
+description: "Bản đồ Docker Engine, CLI, Desktop, BuildKit, Buildx, Compose, Hub, registry và các chuẩn OCI trong workflow phát triển và vận hành container."
+---
+
+“Docker” có thể chỉ một command, một daemon, một desktop application hoặc cả platform. Nếu không tách các thành phần này, bạn dễ cài sai product, đọc nhầm manual hoặc quy lỗi cho CLI trong khi daemon mới là nơi thực hiện thao tác.
+
+Trang này dùng một workflow làm trục: **viết cấu hình → build image → lưu trong registry → chạy container → quản lý application**. Mỗi công cụ Docker đảm nhiệm một phần của workflow đó.
+
+## Bản đồ tổng thể
+
+```text
+┌───────────────────────────────────────────────┐
+│ Developer / CI                                │
+│ Docker CLI · Compose CLI · Buildx             │
+└──────────────────────┬────────────────────────┘
+                       │ Docker API
+                       ▼
+┌───────────────────────────────────────────────┐
+│ Docker Engine                                 │
+├───────────────────────────────────────────────┤
+│ dockerd              Quản lý Docker objects   │
+│ BuildKit             Thực thi build           │
+│ containerd / runtime Chạy container           │
+└──────────────────────┬────────────────────────┘
+                       │ push / pull image
+                       ▼
+┌───────────────────────────────────────────────┐
+│ Registry · Docker Hub hoặc private registry   │
+└───────────────────────────────────────────────┘
+
+Docker Desktop đóng gói và tích hợp các thành phần trên
+cho môi trường developer trên macOS, Windows và Linux.
+```
+
+Sơ đồ được đơn giản hóa để xây mental model. Implementation bên dưới Engine còn có containerd, shim và OCI runtime; các phần đó được phân tích sau trong [Docker internals](/docs/docker-internals/).
+
+## Docker Engine: lớp thực thi cốt lõi
+
+Docker Engine là containerization technology theo kiến trúc client-server. Ba phần giao tiếp chính là:
+
+- **`dockerd`:** daemon chạy lâu dài, nhận API request và quản lý image, container, network, volume cùng các object khác.
+- **Docker API:** interface để CLI, SDK và tool khác điều khiển daemon.
+- **`docker` CLI:** client chuyển command của người dùng thành API request.
+
+Ví dụ:
+
+```bash
+docker container ls
+```
+
+Command này không tự quét process trên máy. CLI hỏi daemon trong Docker context hiện tại và hiển thị container daemon đó quản lý.
+
+Dùng hai command sau để phân biệt việc “CLI đã cài” với “Engine có thể truy cập”:
+
+```bash
+docker --version
+docker version
+```
+
+Command đầu chỉ cần binary client. Command sau cố lấy cả thông tin Client và Server. Nếu chỉ thấy Client hoặc lỗi kết nối daemon, bạn chưa có một environment sẵn sàng chạy container.
+
+### Docker objects Engine quản lý
+
+| Object | Vai trò |
+|---|---|
+| Image | Template read-only để tạo container |
+| Container | Instance của image cùng runtime configuration |
+| Network | Kết nối và cô lập network endpoint của container |
+| Volume | Persistent data do Docker quản lý lifecycle ở mức volume |
+| Plugin | Mở rộng một số capability như network hoặc volume driver |
+
+Các object có lifecycle riêng. `docker container rm` không đồng nghĩa `docker image rm`; xóa container cũng không mặc định xóa named volume.
+
+## Docker CLI: giao diện điều khiển
+
+Docker CLI có command group theo object:
+
+```bash
+docker container ls
+docker image ls
+docker network ls
+docker volume ls
+```
+
+Nhiều command có alias ngắn, ví dụ `docker ps` tương đương cách liệt kê container phổ biến. Trong tài liệu, object-oriented form thường làm rõ resource đang bị tác động; alias hữu ích khi thao tác hằng ngày.
+
+CLI có thể điều khiển daemon local hoặc remote. Docker context lưu endpoint và metadata của target:
+
+```bash
+docker context show
+docker context ls
+```
+
+<Callout type="error" title="Thận trọng">
+  Luôn kiểm tra context trước `docker system prune`, xóa volume, deploy hoặc thao tác production. Terminal local không đảm bảo daemon đích cũng là local.
+</Callout>
+
+CLI còn chứa plugin/subcommand như `docker compose` và `docker buildx`. Vì plugin có version riêng, khi troubleshooting cần lấy đúng version:
+
+```bash
+docker version
+docker compose version
+docker buildx version
+```
+
+## Docker Desktop: environment tích hợp cho developer
+
+Docker Desktop là application cài đặt cho macOS, Windows và Linux, tích hợp Docker Engine, CLI, Compose cùng các tiện ích quản lý. Trên platform không có Linux kernel native phù hợp cho Linux container, Desktop quản lý backend Linux/virtualization cần thiết.
+
+Docker Desktop giải quyết các việc khác với Engine package cài trực tiếp:
+
+- cung cấp UI quản lý container, image, volume và settings;
+- tích hợp file sharing, networking và resource controls với desktop OS;
+- phân phối CLI plugin và update theo product lifecycle;
+- tùy cấu hình, cung cấp các tính năng bổ sung của Docker Desktop.
+
+Không dùng “Docker Desktop” và “Docker Engine” như từ đồng nghĩa. Một Linux server thường cài Docker Engine mà không cần desktop GUI. Một laptop macOS chạy Linux container qua environment do Desktop quản lý.
+
+<Callout type="warn" title="Quan trọng">
+  Docker Desktop và Docker Engine có license/terms khác nhau. Chính sách có thể thay đổi; tổ chức phải kiểm tra [Docker subscription and licensing](https://docs.docker.com/subscription/) hiện hành thay vì dựa vào một con số chép lại trong tutorial.
+</Callout>
+
+## Docker Build, BuildKit và Buildx
+
+### Docker Build: nhóm capability tạo artifact
+
+Khi chạy:
+
+```bash
+docker build -t example/app:dev .
+```
+
+bạn yêu cầu Docker đọc build definition, gửi build context và tạo image output. Dấu `.` là build context hiện tại, không phải “đường dẫn Dockerfile” theo mặc định trong mọi trường hợp.
+
+### BuildKit: build engine
+
+BuildKit giải quyết build graph, cache, parallel execution, secret/SSH mount và nhiều output type. Đây là engine đứng sau workflow Docker Build hiện đại. Nó phân biệt rõ build input, cache và output, cho phép build hiệu quả và an toàn hơn so với pattern copy secret vào image layer.
+
+### Buildx: CLI cho build nâng cao
+
+`docker buildx` là CLI plugin để làm việc với BuildKit builder, driver, multi-platform build, cache backend và Bake. Bạn không cần hiểu mọi driver khi mới học, nhưng cần nhận ra:
+
+- `docker build` là entry point quen thuộc cho build thường;
+- `docker buildx` mở các workflow và cấu hình BuildKit nâng cao;
+- builder có thể không trùng hoàn toàn với daemon local, tùy driver/context;
+- image build xong không phải lúc nào tự xuất hiện trong local image store nếu output được cấu hình sang registry hoặc loại artifact khác.
+
+Các chủ đề này được tách sâu tại [Images và Dockerfile](/docs/images-va-dockerfile/) và [BuildKit](/docs/buildkit/).
+
+## Docker Compose: mô tả application nhiều container
+
+Docker Compose dùng Compose file để mô tả service, network, volume, config và secret của một application. Thay vì duy trì nhiều lệnh `docker run`, bạn khai báo desired configuration rồi dùng CLI:
+
+```bash
+docker compose up -d
+docker compose ps
+docker compose logs
+docker compose down
+```
+
+Một **service** trong Compose là cấu hình để tạo container, không phải chính container. Compose còn nhóm resource theo project name, nhờ đó nhiều stack có thể cùng tồn tại nếu tên và port không xung đột.
+
+Compose phù hợp cho local development, test, CI và một số deployment scenario. Nó không tự trở thành một multi-node orchestrator chỉ vì file có nhiều services. Scheduling, cluster reconciliation và high availability cần capability khác.
+
+<Callout type="info" title="Lưu ý">
+  Tài liệu hiện đại dùng Compose v2 dưới dạng `docker compose`. Command `docker-compose` có dấu gạch nối thuộc thế hệ standalone cũ và có thể xuất hiện trong bài viết legacy. Khi đọc ví dụ, hãy kiểm tra version và migration guidance.
+</Callout>
+
+Xem toàn bộ object model tại [Docker Compose](/docs/docker-compose/).
+
+## Registry và Docker Hub
+
+### Registry là protocol/service phân phối image
+
+Registry lưu image content và metadata để client push/pull. Image reference cho biết registry, namespace, repository, tag hoặc digest. Tổ chức có thể dùng:
+
+- Docker Hub;
+- cloud registry;
+- private registry tự quản lý;
+- registry tích hợp trong source/CI platform.
+
+### Docker Hub là một registry service
+
+Docker Hub cung cấp public/private repositories và các workflow phân phối liên quan. Docker thường tìm image không ghi registry trên Docker Hub theo default naming rules.
+
+Ví dụ:
+
+```bash
+docker pull nginx:alpine
+```
+
+Đây là reference rút gọn. Trong pipeline cần kiểm soát supply chain, hãy xác định rõ publisher, namespace, tag/digest, authentication, retention và policy của registry.
+
+Registry không chỉ là “nơi upload file tar”. Image được lưu theo content-addressed blobs và manifest; client có thể chỉ tải content còn thiếu. Chi tiết naming, authentication, signing và distribution nằm trong [Registry và distribution](/docs/registry-va-distribution/).
+
+## Docker Scout và supply-chain workflow
+
+Docker Scout là nhóm capability của Docker để phân tích software supply chain, image content và vulnerability/policy theo product offering hiện hành. Nó không thay thế toàn bộ security program: kết quả phụ thuộc database, SBOM, image scope và policy; runtime risk còn nằm ngoài static image analysis.
+
+Trong mental model, Scout nằm sau hoặc quanh bước build/publish:
+
+```text
+┌─────────────┐   ┌────────────────┐   ┌────────────────────────┐
+│ Build image │──▶│ Tạo / đọc SBOM │──▶│ Policy + vulnerability │
+└──────┬──────┘   └────────────────┘   └───────────┬────────────┘
+       │                                           │
+       └──────────────── publish ──────────────────┘
+```
+
+Nếu sử dụng, hãy đọc manual và subscription hiện hành; không giả định mọi capability đều có cùng availability trong mọi plan hoặc environment.
+
+## Moby, containerd, runc và OCI nằm ở đâu?
+
+Người mới thường thấy các tên này trong log hoặc architecture diagram:
+
+- **Moby Project:** upstream open-source project cung cấp nhiều component nền tảng của Docker container system.
+- **containerd:** container runtime daemon quản lý image transfer/storage và lifecycle container ở layer thấp hơn trong stack.
+- **runc:** OCI runtime phổ biến thực hiện việc tạo/chạy container theo OCI runtime specification.
+- **OCI:** Open Container Initiative duy trì specifications cho image, runtime và distribution, giúp hệ sinh thái có các interface chung.
+
+Không cần gọi trực tiếp các component này để hoàn thành tutorial đầu tiên. Tuy nhiên, biết layer của chúng giúp đọc log và hiểu rằng Docker image/container ecosystem không bị giới hạn ở một CLI duy nhất.
+
+## Orchestrator: ranh giới ngoài Engine đơn lẻ
+
+Docker Engine quản lý container trên host mà daemon kiểm soát. Khi bài toán có nhiều node, reschedule sau failure, rollout service và desired-state reconciliation, bạn cần orchestrator hoặc platform cung cấp các capability đó.
+
+- **Docker Swarm mode** tích hợp orchestration trong Docker Engine.
+- **Kubernetes** là orchestration platform rộng hơn và dùng CRI-compatible runtime; Kubernetes không dùng Docker Engine làm CRI runtime theo mô hình cũ, nhưng vẫn chạy OCI-compatible images được build bằng Docker.
+
+Do đó, “Kubernetes không dùng Docker” là kết luận sai. Docker-built image vẫn có thể chạy trên Kubernetes nếu image/platform và runtime requirements tương thích; điểm khác nằm ở runtime integration và control plane.
+
+Xem [Docker Swarm](/docs/docker-swarm/) và [Kubernetes và Docker](/docs/kubernetes-va-docker/) khi đã nắm image, network, storage và lifecycle.
+
+## Một workflow end-to-end
+
+Giả sử team phát triển một web API:
+
+1. Developer viết `Dockerfile` và `.dockerignore`.
+2. Docker Build/BuildKit tạo image từ source và dependency.
+3. CI test image, tạo metadata/SBOM và áp security policy.
+4. CI gắn reference rồi push image vào registry.
+5. Môi trường đích pull đúng digest.
+6. Docker Engine hoặc orchestrator tạo container với environment, secret, network và storage bên ngoài image.
+7. Runtime signals như logs, metrics, health và events được thu thập.
+8. Release mới tạo image mới; hệ thống thay container thay vì patch thủ công container cũ.
+
+Compose có thể mô tả bước 6 cho local stack hoặc một deployment phù hợp. Registry nối build environment với runtime environment. CLI/API là control path; application request đi qua network data path chứ không đi qua CLI.
+
+## Chọn đúng tài liệu và command
+
+Khi gặp một vấn đề, xác định component trước:
+
+| Triệu chứng/câu hỏi | Bắt đầu ở đâu |
+|---|---|
+| `Cannot connect to the Docker daemon` | Engine/daemon, context, Docker Desktop/backend |
+| Dockerfile build chậm hoặc cache miss | Docker Build, BuildKit, build context |
+| `docker compose up` tạo sai cấu hình | Compose interpolation, merge và project model |
+| Pull/push bị denied | Image reference, registry authentication và authorization |
+| Container chạy nhưng service không truy cập được | Port publishing, network, process listen address |
+| Image có vulnerability | Base image, dependency, SBOM/scanner và remediation policy |
+| Container bị dừng/OOM | Process exit, memory limit, daemon/runtime events |
+
+Cách phân loại này ngăn việc thử command ngẫu nhiên ở sai layer.
+
+## Nguồn chính thức để đối chiếu
+
+- [Docker manuals](https://docs.docker.com/manuals/)
+- [Docker Engine](https://docs.docker.com/engine/)
+- [Docker Build](https://docs.docker.com/build/)
+- [Docker Compose](https://docs.docker.com/compose/)
+- [Docker Hub](https://docs.docker.com/docker-hub/)
+- [Docker reference](https://docs.docker.com/reference/)
+
+Trước khi thực hành, đọc [Thuật ngữ Docker quan trọng](/docs/bat-dau/thuat-ngu-quan-trong/) để thống nhất cách gọi object và lifecycle trong toàn bộ tài liệu.

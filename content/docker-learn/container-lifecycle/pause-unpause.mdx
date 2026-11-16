@@ -1,0 +1,178 @@
+---
+title: "Pause và unpause"
+description: "Hiểu cách Docker suspend toàn bộ process bằng cgroup freezer, tác động tới traffic và resource, trường hợp nên dùng pause/unpause và cách khôi phục an toàn."
+---
+
+`docker container pause` tạm suspend **tất cả process** trong một hoặc nhiều container; `unpause` cho chúng tiếp tục chạy. Container object, PID, memory, file descriptor và connection không bị tạo lại.
+
+Trên Linux, Docker dùng freezer cgroup thay vì gửi `SIGSTOP` lần lượt cho từng process. Process không có cơ hội chạy signal handler để “chuẩn bị pause”. Trên Windows, official CLI reference chỉ hỗ trợ pause cho Hyper-V container.
+
+```bash
+docker container pause api
+docker container unpause api
+```
+
+## Pause khác stop như thế nào?
+
+| Khía cạnh | `pause` | `stop` |
+|---|---|---|
+| Process | Vẫn tồn tại nhưng bị suspend | Được yêu cầu thoát, sau đó không còn |
+| PID/memory state | Giữ nguyên | Mất khi process dừng |
+| Signal graceful shutdown | Không | Có stop signal và grace period |
+| Connection/file descriptor | Vẫn được giữ ở OS/runtime | Application có cơ hội đóng |
+| Resume | `unpause`, tiếp tục process cũ | `start`, tạo process instance mới |
+| Mục tiêu | Đóng băng tạm thời | Kết thúc một lần chạy |
+
+Pause không phải “sleep nhẹ”. Trong lúc process không được schedule, nó không đọc request, trả heartbeat, renew lease, ghi log hoặc xử lý timeout ở application level. Client và dependency bên ngoài vẫn tiếp tục chạy theo clock của chúng nên có thể timeout, retry hoặc đánh dấu instance lỗi.
+
+## Điều gì vẫn tiêu thụ resource?
+
+Container paused gần như không dùng CPU cho application process, nhưng vẫn giữ:
+
+- memory pages và cgroup memory charge;
+- open file descriptor, socket và file lock;
+- writable layer và mount;
+- network namespace và connection state;
+- PID cùng kernel object liên quan.
+
+Vì vậy, pause không phải giải pháp giải phóng memory, disk hay connection. Muốn giới hạn resource, dùng cgroup/resource options; muốn scale down, dừng và thay container theo deployment model.
+
+## Khi nào pause hữu ích?
+
+Pause phù hợp cho một cửa sổ ngắn, có người kiểm soát và đã hiểu tác động, ví dụ:
+
+- đóng băng workload trong lúc thu thập một snapshot/debug signal cụ thể;
+- tái hiện behavior khi application không được CPU;
+- tạm dừng job local để ưu tiên workload khác mà vẫn giữ process state;
+- kiểm tra timeout/retry của client trong chaos test có giới hạn.
+
+Pause thường **không phù hợp** để:
+
+- bảo trì service đang nhận traffic;
+- tạo backup application-consistent;
+- thay thế graceful shutdown;
+- “khắc phục” process ngốn CPU lâu dài;
+- chờ vô thời hạn mà không có auto-unpause/runbook.
+
+<Callout type="warn" title="Pause không tạo consistency boundary">
+  Freezer chỉ ngăn process tiếp tục chạy. Nó không flush application buffer, không quiesce database theo protocol và không xác nhận dữ liệu đã bền vững. Dùng cơ chế backup/snapshot chính thức của application và storage.
+</Callout>
+
+## Lab: quan sát process bị đóng băng
+
+Tạo container ghi một dòng mỗi giây:
+
+```bash
+docker container run --detach \
+  --name lifecycle-pause-demo \
+  --label com.example.lab=pause-unpause \
+  alpine:3.22 \
+  sh -c 'while :; do date -u +%Y-%m-%dT%H:%M:%SZ; sleep 1; done'
+```
+
+Xác minh ban đầu:
+
+```bash
+docker container logs --tail 3 lifecycle-pause-demo
+docker container inspect lifecycle-pause-demo \
+  --format 'status={{.State.Status}} paused={{.State.Paused}} pid={{.State.Pid}}'
+```
+
+### Pause
+
+```bash
+docker container pause lifecycle-pause-demo
+docker container inspect lifecycle-pause-demo \
+  --format 'status={{.State.Status}} paused={{.State.Paused}} pid={{.State.Pid}}'
+```
+
+Expected: state `paused`, `.State.Paused=true`, PID vẫn giữ nguyên. Đợi vài giây rồi xem logs; không có timestamp mới do shell và `sleep` đều bị suspend.
+
+Thử exec trong khi paused:
+
+```bash
+docker container exec lifecycle-pause-demo echo test
+```
+
+Docker từ chối exec và yêu cầu unpause trước. Điều này ngăn một process mới chạy trong cùng container trong khi nhóm process hiện tại bị đóng băng.
+
+### Unpause
+
+```bash
+docker container unpause lifecycle-pause-demo
+docker container logs --tail 5 lifecycle-pause-demo
+docker container inspect lifecycle-pause-demo \
+  --format 'status={{.State.Status}} paused={{.State.Paused}} pid={{.State.Pid}}'
+```
+
+Expected: state trở lại `running`, PID chính không đổi và log tiếp tục xuất hiện. Khoảng trống timestamp cho biết thời gian container bị pause.
+
+Cleanup:
+
+```bash
+docker container rm --force lifecycle-pause-demo
+```
+
+## Tác động tới service đang nhận traffic
+
+Giả sử web container bị pause:
+
+1. process không `accept` hoặc đọc request mới;
+2. connection đang mở có thể vẫn tồn tại ở kernel nhưng application không xử lý;
+3. client timeout và có thể retry sang instance khác;
+4. load balancer/healthcheck có thể đánh dấu instance lỗi;
+5. khi unpause, work cũ và work mới có thể dồn lại cùng lúc.
+
+Hệ quả là latency spike, retry storm hoặc request trùng có thể xảy ra dù container chưa từng chuyển sang `exited`. Trước chaos test, đặt timeout, retry budget và idempotency phù hợp; loại instance khỏi traffic nếu mục tiêu không phải kiểm thử trực tiếp đường phục vụ.
+
+## Quy trình vận hành an toàn
+
+Trước khi pause workload không phải lab:
+
+1. Xác minh Docker context, container ID và ownership label.
+2. Xác định client/dependency nào sẽ timeout hoặc failover.
+3. Đặt thời điểm auto-unpause hoặc người chịu trách nhiệm rõ ràng.
+4. Capture state ban đầu và mở monitoring.
+5. Pause một instance/canary trước, không đóng băng cả failure domain.
+6. Unpause, rồi xác minh traffic, queue depth, health và error rate đã hồi phục.
+
+Ví dụ capture state:
+
+```bash
+docker context show
+docker container inspect api --format 'id={{.Id}} status={{.State.Status}} paused={{.State.Paused}}'
+docker container stats --no-stream api
+```
+
+## Troubleshooting
+
+### Quên container nào đang paused
+
+```bash
+docker container ls \
+  --filter 'status=paused' \
+  --format '{{.ID}}\t{{.Names}}\t{{.Status}}'
+```
+
+Review từng ID trước khi unpause hàng loạt. Trong shared daemon, không tác động container không thuộc scope của bạn.
+
+### `exec` hoặc application request bị treo/thất bại
+
+Kiểm tra state trước:
+
+```bash
+docker container inspect CONTAINER \
+  --format 'status={{.State.Status}} paused={{.State.Paused}}'
+```
+
+Nếu paused là ngoài ý muốn, unpause rồi xác minh application health. Không restart ngay vì restart làm mất process state có thể cần cho điều tra.
+
+### Unpause xong latency tăng mạnh
+
+Kiểm tra retry, backlog, connection pool và resource saturation. Unpause chỉ cho process chạy tiếp; nó không rate-limit lượng work tích tụ. Có thể cần drain traffic hoặc giảm concurrency ở lớp application/gateway.
+
+## Nguồn chính thức
+
+- [docker container pause](https://docs.docker.com/reference/cli/docker/container/pause/)
+- [docker container unpause](https://docs.docker.com/reference/cli/docker/container/unpause/)
+- [docker container exec và behavior khi paused](https://docs.docker.com/reference/cli/docker/container/exec/)

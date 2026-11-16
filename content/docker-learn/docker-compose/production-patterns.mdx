@@ -1,0 +1,287 @@
+---
+title: "Compose cho production"
+description: "Vận hành Compose an toàn trên một Docker host với immutable images, production overrides, secrets, health, backup, rollout và rollback có kiểm soát."
+---
+
+Compose có thể triển khai application lên một Docker host, nhưng production readiness không đến từ `docker compose up -d`. Bạn vẫn phải thiết kế host provisioning, image supply chain, secret, backup, observability, upgrade, rollback và recovery.
+
+<Callout type="warn" title="Boundary của Compose">
+  Compose trên standalone Engine không cung cấp scheduler đa node, rolling update controller, quorum hay rescheduling sang host khác. Nếu host hỏng, workload không tự chuyển sang máy khác nếu bạn chưa xây automation bên ngoài.
+</Callout>
+
+## Base model và production delta
+
+Giữ base file portable, không chứa development bind mounts:
+
+```yaml
+# compose.yaml
+services:
+  api:
+    image: "registry.example.com/shop/api:${IMAGE_TAG:?required}"
+    init: true
+    restart: unless-stopped
+    environment:
+      DB_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    networks: [frontend, backend]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:18.3-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: shop
+      POSTGRES_USER: shop
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    networks: [backend]
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+networks:
+  frontend: {}
+  backend:
+    internal: true
+
+volumes:
+  db-data: {}
+
+secrets:
+  db_password:
+    file: "${DB_PASSWORD_FILE:?Set DB_PASSWORD_FILE to a protected host path}"
+```
+
+Production override chỉ chứa delta:
+
+```yaml
+# compose.production.yaml
+services:
+  api:
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+```
+
+Resolve đúng file set:
+
+```bash
+export IMAGE_TAG=1.8.3
+export DB_PASSWORD_FILE=/run/credentials/shop-db-password
+
+docker compose \
+  -p shop-prod \
+  -f compose.yaml \
+  -f compose.production.yaml \
+  config --quiet
+```
+
+Không auto-load development `compose.override.yaml` trong production invocation.
+
+## Immutable image và promotion
+
+Production host nên pull image đã build/test từ registry, không build tùy ý từ working tree:
+
+```bash
+IMAGE_TAG=1.8.3 docker compose \
+  -f compose.yaml -f compose.production.yaml \
+  pull
+```
+
+Tag version tốt hơn `latest`; digest mạnh hơn khi cần pin exact bytes:
+
+```yaml
+image: registry.example.com/shop/api@sha256:...
+```
+
+Pipeline nên verify signature/policy, vulnerability posture và provenance theo yêu cầu tổ chức. Digest pin không tự chứng minh publisher đáng tin.
+
+## Secret và configuration
+
+- Không commit production `.env` chứa credential.
+- Không đặt password trong `environment` nếu application đọc secret file được.
+- Provision source secret bằng permission chặt hoặc secret manager workflow.
+- Recreate service có kiểm soát khi rotate.
+- Bảo vệ resolved config, inspect output và CI logs.
+
+```yaml
+services:
+  api:
+    secrets:
+      - db_password
+
+secrets:
+  db_password:
+    external: true
+    name: shop-db-password-v4
+```
+
+Khả năng `external` secret phụ thuộc platform. Với standalone Compose, xác minh implementation thực tế và threat model; đừng suy ra guarantees của Swarm secrets.
+
+## Exposure và reverse proxy
+
+Chỉ publish service phải đi qua host boundary. Database/cache giữ internal network và không publish. Nếu reverse proxy chạy trên cùng host:
+
+```yaml
+ports:
+  - "127.0.0.1:8080:8080"
+```
+
+Proxy host gọi loopback. Nếu proxy là container, nối shared frontend network và gọi service name/container port; không cần publish backend.
+
+TLS termination, authentication, rate limit và firewall phải được thiết kế rõ. `internal: true` không thay host/cloud firewall.
+
+## Resource và security baseline
+
+Tùy workload/platform, review:
+
+```yaml
+services:
+  api:
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+```
+
+Limit sai có thể tạo outage; load test và theo dõi throttling/OOM. Một số field `deploy` có support khác giữa local Compose và orchestrator, nên validate effective Engine config bằng `docker inspect`.
+
+## Deploy có kiểm soát
+
+Một flow single-host tối thiểu:
+
+```bash
+export IMAGE_TAG=1.8.3
+export DB_PASSWORD_FILE=/run/credentials/shop-db-password
+
+compose_prod() {
+  docker compose -p shop-prod \
+    -f compose.yaml \
+    -f compose.production.yaml \
+    "$@"
+}
+
+compose_prod config --quiet
+compose_prod pull
+compose_prod up --detach --wait --wait-timeout 120 --remove-orphans
+compose_prod ps
+curl --fail http://127.0.0.1:8080/healthz
+```
+
+Trước deploy:
+
+- backup và test restore dữ liệu;
+- kiểm tra disk/memory và image availability;
+- review migration compatibility;
+- lưu image digest/config version trước đó;
+- xác định rollback trigger và operator.
+
+`up` có thể recreate container, đóng connection và tạo downtime. Compose không tự rolling update nhiều replica an toàn khi fixed host port/load balancer không được thiết kế.
+
+## Update một service
+
+Docker docs minh họa:
+
+```bash
+docker compose build web
+docker compose up --no-deps --detach web
+```
+
+Trong production dùng prebuilt image, thường là:
+
+```bash
+compose_prod pull api
+compose_prod up --no-deps --detach --wait api
+```
+
+`--no-deps` tránh recreate dependency, nhưng không đảm bảo schema/protocol compatibility. Chỉ dùng khi release contract cho phép.
+
+## Migration và rollback
+
+Rollback image không luôn rollback database. Dùng expand/contract migration:
+
+1. thêm schema backward-compatible;
+2. deploy code đọc/ghi tương thích;
+3. migrate/backfill;
+4. quan sát;
+5. chỉ xóa schema cũ ở release sau.
+
+Nếu smoke test fail và schema vẫn compatible:
+
+```bash
+export IMAGE_TAG=1.8.2
+compose_prod pull api
+compose_prod up --no-deps --detach --wait api
+```
+
+Nếu migration phá compatibility, rollback cần runbook riêng; không chạy reverse migration mù quáng.
+
+## Backup và host recovery
+
+Named volume nằm trên host/driver. Restart policy không giúp khi disk/host mất. Cần:
+
+- database-native backup hoặc snapshot consistent;
+- copy off-host;
+- retention/encryption/access control;
+- restore drill định kỳ;
+- inventory external networks/volumes/secrets;
+- host bootstrap code và pinned Engine/Compose versions.
+
+Đọc [Backup và restore](/docs/storage/backup-and-restore/).
+
+## Observability và log lifecycle
+
+Compose `logs` hữu ích để incident response, nhưng không phải long-term log platform. Cấu hình log driver/rotation để tránh đầy disk:
+
+```yaml
+logging:
+  driver: local
+  options:
+    max-size: "10m"
+    max-file: "5"
+```
+
+Option phụ thuộc logging driver. Thu metrics, health, host disk/inode, OOM events và daemon logs ra hệ thống bền vững.
+
+## Production checklist
+
+- [ ] Project name cố định và file set rõ ràng.
+- [ ] Image immutable/pinned, pull trước deploy.
+- [ ] Không còn bind source/debug port/dev profile.
+- [ ] Secret/config có source và rotation runbook.
+- [ ] Chỉ publish port cần thiết, bind đúng interface.
+- [ ] Healthcheck và application retry được kiểm chứng.
+- [ ] Resource/security options có test effective.
+- [ ] Backup off-host và restore drill thành công.
+- [ ] Deploy/smoke/rollback command được tự động hóa.
+- [ ] Host failure và Docker daemon upgrade có runbook.
+
+## Nguồn chính thức
+
+- [Use Compose in production](https://docs.docker.com/compose/how-tos/production/)
+- [Merge Compose files](https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/)
+- [Compose production best practices](https://docs.docker.com/compose/production/)
+- [Docker Engine security](https://docs.docker.com/engine/security/)

@@ -1,0 +1,257 @@
+---
+title: "CMD và ENTRYPOINT"
+description: "Thiết kế process mặc định, hiểu quy tắc override giữa Dockerfile và docker run, xử lý PID 1, signal và entrypoint script an toàn."
+---
+
+`ENTRYPOINT` xác định executable chính của image; `CMD` cung cấp command mặc định hoặc default arguments cho entrypoint. Cả hai chỉ ghi image configuration lúc build, không chạy command trong build stage.
+
+Pattern dễ vận hành cho service/CLI image:
+
+```dockerfile
+ENTRYPOINT ["/usr/local/bin/myapp"]
+CMD ["--config", "/etc/myapp/config.yaml"]
+```
+
+Khi chạy `docker run image`, process nhận cả entrypoint và CMD. Argument sau image name thay thế `CMD` nhưng giữ `ENTRYPOINT`.
+
+## Exec form là lựa chọn mặc định cho service
+
+```dockerfile
+ENTRYPOINT ["/usr/local/bin/myapp"]
+CMD ["--listen=:8080"]
+```
+
+Exec form là JSON array. Runtime gọi executable trực tiếp với argument boundaries rõ, không tự dùng shell, không glob và không expand `$VAR`.
+
+Shell form:
+
+```dockerfile
+CMD myapp --listen="$LISTEN_ADDR"
+```
+
+Trên Linux, shell form thường trở thành `/bin/sh -c ...`. Shell có thể expand variable nhưng cũng trở thành process trung gian và thay đổi signal/argument behavior. Dùng shell form chỉ khi shell semantics là yêu cầu thật; nếu cần expansion, cân nhắc entrypoint script có `exec`.
+
+## Quy tắc kết hợp và override
+
+Giả sử image có:
+
+```dockerfile
+ENTRYPOINT ["top", "-b"]
+CMD ["-c"]
+```
+
+| Command | Executable/arguments hiệu lực |
+|---|---|
+| `docker run IMAGE` | `top -b -c` |
+| `docker run IMAGE -H` | `top -b -H` |
+| `docker run --entrypoint ps IMAGE aux` | `ps aux` |
+
+`docker run IMAGE ...` thay `CMD`. `--entrypoint` thay entrypoint của image; giá trị mới là executable, không phải shell command string tự parse. Argument sau image vẫn được dùng như command/args cho entrypoint mới.
+
+Với image chỉ có exec-form `CMD`:
+
+```dockerfile
+CMD ["sleep", "30"]
+```
+
+```bash
+docker run IMAGE             # sleep 30
+docker run IMAGE echo hello  # echo hello
+```
+
+Với image chỉ có exec-form `ENTRYPOINT`, arguments sau image được append.
+
+## Chỉ instruction cuối cùng có hiệu lực
+
+Một stage chỉ có một effective `CMD` và một effective `ENTRYPOINT`. Nếu khai báo nhiều lần, giá trị cuối ghi đè giá trị trước:
+
+```dockerfile
+CMD ["echo", "first"]
+CMD ["echo", "second"]
+```
+
+Container chạy `echo second`. Base image có `CMD`/`ENTRYPOINT` cũng có thể bị instruction ở image con override. Inspect final config thay vì suy luận từ một đoạn Dockerfile.
+
+```bash
+docker image inspect app:test \
+  --format 'entrypoint={{json .Config.Entrypoint}} cmd={{json .Config.Cmd}}'
+```
+
+## `RUN` khác `CMD`
+
+```dockerfile
+RUN npm run build
+CMD ["node", "dist/server.js"]
+```
+
+- `RUN` compile source khi build; nếu fail, image không được tạo.
+- `CMD` không kiểm tra `node dist/server.js` lúc build; lỗi executable/path chỉ xuất hiện khi container start trừ khi có test stage.
+
+Thêm smoke test trong build/CI:
+
+```dockerfile
+RUN test -f dist/server.js
+```
+
+và chạy container thật sau build.
+
+## PID 1 và signal
+
+Process chính trong container thường là PID 1 trong PID namespace. Khi `docker stop` gửi stop signal, process cần nhận và xử lý để shutdown trong grace period. Nếu command là shell form:
+
+```dockerfile
+ENTRYPOINT myapp --listen=:8080
+```
+
+shell có thể là PID 1 và process ứng dụng là child; signal/reaping phụ thuộc shell/script behavior. Exec form tránh lớp không cần thiết:
+
+```dockerfile
+ENTRYPOINT ["myapp", "--listen=:8080"]
+```
+
+Ứng dụng vẫn phải tự xử lý signal. Exec form không tự thêm init/reaper. Nếu workload tạo orphan/zombie hoặc cần init behavior, cân nhắc `docker run --init`/orchestrator equivalent và test lifecycle.
+
+Kiểm tra process:
+
+```bash
+docker run --name signal-lab --detach app:test
+docker container top signal-lab
+docker stop --time 10 signal-lab
+docker inspect signal-lab --format '{{json .State}}'
+docker rm signal-lab
+```
+
+Review log để xác nhận graceful shutdown, không chỉ thấy container đã dừng sau timeout.
+
+## Entrypoint script đúng contract
+
+Script hữu ích khi cần render config, kiểm tra permission hoặc drop privilege trước khi chạy app:
+
+```sh
+#!/bin/sh
+set -eu
+
+if [ "${1#-}" != "$1" ]; then
+  set -- /usr/local/bin/myapp "$@"
+fi
+
+# Validate required runtime input without printing secret.
+: "${APP_CONFIG:?APP_CONFIG is required}"
+
+exec "$@"
+```
+
+Dockerfile:
+
+```dockerfile
+COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["/usr/local/bin/myapp", "--config", "/run/config/app.yaml"]
+```
+
+Các invariant:
+
+- `set -e` dừng khi setup command fail; `-u` bắt biến chưa set nhưng cần xử lý default bằng `${VAR:-}` khi optional;
+- quote `"$@"` để giữ đúng argument boundaries;
+- dòng cuối dùng `exec` để app thay shell làm PID 1;
+- không log toàn bộ environment hoặc command nếu có secret;
+- setup phải idempotent nếu container restart trên cùng volume;
+- không thay đổi ownership đệ quy volume lớn ở mọi startup nếu có cách provision trước.
+
+Nếu script khởi chạy nhiều process, cần supervisor/init và shutdown policy rõ; `cmd1 & cmd2` không phải process management đáng tin cậy.
+
+## Variable expansion trong exec form
+
+Dòng này không expand `$PORT`:
+
+```dockerfile
+CMD ["myapp", "--port", "$PORT"]
+```
+
+Runtime truyền literal `$PORT`. Các lựa chọn:
+
+1. Ứng dụng tự đọc environment variable — thường sạch nhất.
+2. Dùng entrypoint script rồi `exec myapp --port "$PORT"`.
+3. Dùng shell rõ ràng:
+
+```dockerfile
+CMD ["sh", "-c", "exec myapp --port \"$PORT\""]
+```
+
+Với `sh -c`, arguments bổ sung có semantics positional đặc biệt; đừng append user arguments nếu chưa thiết kế `$0`, `"$@"` đúng.
+
+## Image service và image CLI
+
+Service image thường có executable cố định:
+
+```dockerfile
+ENTRYPOINT ["/usr/local/bin/api"]
+CMD ["serve", "--listen=:8080"]
+```
+
+CLI image có thể làm image name giống command:
+
+```dockerfile
+ENTRYPOINT ["/usr/local/bin/migrate"]
+CMD ["--help"]
+```
+
+```bash
+docker run --rm migrate-image
+docker run --rm migrate-image up --database-url '<REDACTED>'
+```
+
+Image general-purpose/dev có thể chỉ dùng `CMD`, cho phép thay toàn bộ command dễ hơn. Không có một công thức phù hợp mọi image; contract override phải được document.
+
+## Runtime trong Compose và Kubernetes
+
+Compose `entrypoint` override image `ENTRYPOINT`; `command` override command/default args theo Compose semantics. Kubernetes thường ánh xạ:
+
+- Pod `command` → image `ENTRYPOINT`;
+- Pod `args` → image `CMD`.
+
+Tên field dễ gây nhầm; luôn inspect effective Pod/container spec. Shell syntax như `$(VAR)` chỉ hoạt động nếu bạn gọi shell rõ ràng.
+
+## Thực hành kiểm chứng ma trận
+
+Dockerfile:
+
+```dockerfile
+FROM alpine:3.23
+ENTRYPOINT ["printf", "entry=%s\\n"]
+CMD ["default"]
+```
+
+```bash
+docker build --tag entry-lab:test .
+docker run --rm entry-lab:test
+docker run --rm entry-lab:test override
+docker run --rm --entrypoint printf entry-lab:test 'new=%s\n' value
+```
+
+Expected output lần lượt minh họa `default`, `override` và entrypoint mới. Dùng `docker image inspect` để đối chiếu source với image config.
+
+## Lỗi thường gặp
+
+### Container thoát ngay với code 0
+
+Main process đã hoàn thành; container không phải VM cần giữ chạy. Chạy service foreground thay vì daemonize hoặc dùng `tail -f /dev/null` để che thiết kế sai.
+
+### `executable file not found`
+
+Kiểm tra path, `PATH`, executable bit, architecture, dynamic linker và stage copy. Exec form không dùng shell để tìm alias/function.
+
+### Stop chậm rồi bị kill
+
+Kiểm tra shell form, script thiếu `exec`, app không handle signal, stop signal/grace period và child process. Thu log/process tree trước khi tăng timeout.
+
+### Arguments runtime bị bỏ qua
+
+Shell-form `ENTRYPOINT` không kết hợp runtime arguments như exec-form mental model. Chuyển sang exec form hoặc script `exec "$@"` có contract rõ.
+
+## Nguồn chính thức
+
+- [`CMD` reference](https://docs.docker.com/reference/dockerfile/#cmd)
+- [`ENTRYPOINT` reference](https://docs.docker.com/reference/dockerfile/#entrypoint)
+- [Dockerfile best practices: ENTRYPOINT](https://docs.docker.com/build/building/best-practices/#entrypoint)
+- [`docker container run`](https://docs.docker.com/reference/cli/docker/container/run/)

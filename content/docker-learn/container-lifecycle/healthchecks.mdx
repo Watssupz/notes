@@ -1,0 +1,222 @@
+---
+title: "Container health checks"
+description: "Thiết kế Docker HEALTHCHECK, hiểu trạng thái starting/healthy/unhealthy, cấu hình interval/timeout/retries/start-period, đọc output probe và tránh nhầm health với restart policy."
+---
+
+Lifecycle state trả lời “process chính còn chạy không”. Healthcheck trả lời một câu khác: “workload bên trong container có còn phục vụ được không?”. Một web server có thể vẫn `running` nhưng kẹt event loop, không trả request mới hoặc mất kết nối database; healthcheck giúp Docker ghi nhận tình trạng này bằng health status riêng.
+
+Khi container có healthcheck, Docker theo dõi chuỗi trạng thái:
+
+```text
+starting → healthy ↔ unhealthy
+```
+
+Health status không thay thế `running/exited`. Docker Engine độc lập không tự restart container chỉ vì healthcheck chuyển `unhealthy`; restart policy phản ứng với process exit. Vì vậy, healthcheck là tín hiệu quan sát và điều phối cho lớp khác, không phải cơ chế tự chữa hoàn chỉnh.
+
+## Khai báo healthcheck ở đâu?
+
+Có hai cách phổ biến:
+
+1. Trong image bằng Dockerfile `HEALTHCHECK`.
+2. Lúc `docker run`/`docker create` bằng các option `--health-*`.
+
+Dockerfile example:
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
+  CMD wget -q -O- http://127.0.0.1:8080/ >/dev/null || exit 1
+```
+
+Container-level override:
+
+```bash
+docker container run --detach \
+  --name api \
+  --health-cmd='wget -q -O- http://127.0.0.1:8080/ >/dev/null || exit 1' \
+  --health-interval=30s \
+  --health-timeout=3s \
+  --health-retries=3 \
+  app:1.0
+```
+
+Tắt healthcheck kế thừa từ base image hoặc image upstream:
+
+```bash
+docker container run --no-healthcheck app:1.0
+```
+
+Chỉ có một healthcheck effective cho container. Nếu Dockerfile có nhiều `HEALTHCHECK`, instruction cuối cùng có hiệu lực; option lúc create/run có thể override cấu hình từ image.
+
+## Exit code của probe
+
+Command healthcheck chạy bên trong container. Exit code của command quyết định kết quả probe:
+
+| Exit code | Ý nghĩa |
+|---:|---|
+| `0` | Thành công, container được xem là healthy |
+| `1` | Thất bại, container không hoạt động đúng |
+| `2` | Reserved theo Dockerfile reference; không dùng |
+
+Output ngắn trên stdout/stderr của probe được lưu trong health log và đọc được bằng `docker inspect`. Tài liệu Docker hiện ghi chỉ 4096 byte đầu được lưu, nên probe không nên in stack trace dài hoặc dữ liệu nhạy cảm.
+
+## Các tham số thời gian
+
+| Tham số | Vai trò | Default trong Dockerfile reference |
+|---|---|---:|
+| `--interval` | Khoảng cách giữa các lần probe sau khi container đã qua giai đoạn start | `30s` |
+| `--timeout` | Thời gian tối đa cho một lần probe | `30s` |
+| `--retries` | Số lần thất bại liên tiếp trước khi chuyển `unhealthy` | `3` |
+| `--start-period` | Khoảng thời gian khởi động mà failure chưa bị tính vào retries | `0s` |
+| `--start-interval` | Khoảng cách probe trong start period; yêu cầu Docker Engine 25.0+ theo Dockerfile reference | `5s` |
+
+Probe đầu tiên chạy sau `interval` kể từ khi container start; các probe sau chạy `interval` sau lần probe trước hoàn tất. Trong `start-period`, Docker có thể chạy theo `start-interval`. Nếu một probe chạy lâu hơn `timeout`, Docker xem probe đó failed và dừng process probe.
+
+`start-period` không phải “bỏ qua mọi health signal”. Nếu probe thành công trong start period, container được xem là đã started; các failure liên tiếp sau đó bắt đầu được tính.
+
+## Thiết kế probe tốt
+
+Probe nên kiểm tra đúng điểm đại diện cho khả năng phục vụ, nhưng không biến thành một request production nặng:
+
+- web API: endpoint nhẹ như `/healthz` hoặc `/readyz`, trả nhanh, không yêu cầu auth phức tạp nếu chỉ gọi localhost trong container;
+- worker: kiểm tra process có đọc được config, kết nối queue tối thiểu hoặc heartbeat nội bộ;
+- database/cache dependency: chỉ kiểm tra khi dependency đó thật sự là điều kiện phục vụ; tránh làm dependency outage kéo mọi instance vào `unhealthy` nếu service có degradation mode;
+- batch job ngắn hạn: thường không cần healthcheck, vì exit code của job đã là signal chính.
+
+Một healthcheck xấu có thể gây nhiễu vận hành: gọi endpoint chậm, tạo bản ghi trong database, phụ thuộc DNS bên ngoài không cần thiết, hoặc in secret trong output.
+
+<Callout type="warn" title="Healthcheck không phải readiness gate đầy đủ">
+  Docker Engine ghi nhận `healthy/unhealthy`, nhưng không tự rút container khỏi traffic trên bridge network độc lập. Load balancer, reverse proxy hoặc orchestrator phải đọc tín hiệu này và có hành động phù hợp nếu bạn muốn health ảnh hưởng routing.
+</Callout>
+
+## Lab: tạo container có healthcheck
+
+Lab này dùng BusyBox `nc` trong Alpine để trả một HTTP response tối thiểu. Healthcheck gọi chính endpoint bên trong container.
+
+```bash
+docker container run --detach \
+  --name lifecycle-health-demo \
+  --label com.example.lab=healthchecks \
+  --health-cmd='wget -q -O- http://127.0.0.1:8080/ >/dev/null || exit 1' \
+  --health-interval=5s \
+  --health-timeout=2s \
+  --health-retries=2 \
+  --health-start-period=3s \
+  alpine:3.22 \
+  sh -c 'while :; do printf "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nok\n" | nc -l -p 8080; done'
+```
+
+Xem lifecycle state và health status:
+
+```bash
+docker container inspect lifecycle-health-demo \
+  --format 'state={{.State.Status}} health={{with .State.Health}}{{.Status}}{{else}}none{{end}}'
+```
+
+Trong vài giây đầu, health có thể là `starting`. Sau một lần probe thành công, expected status là `healthy`.
+
+Đọc health log gần nhất:
+
+```bash
+docker container inspect lifecycle-health-demo \
+  --format '{{range .State.Health.Log}}{{println .Start .ExitCode .Output}}{{end}}'
+```
+
+Output có thể trống nếu probe thành công và không in gì. `ExitCode=0` là tín hiệu quan trọng.
+
+## Gây failure có kiểm soát
+
+Làm endpoint biến mất bằng cách dừng server chính không thuận tiện vì PID 1 dừng sẽ làm container `exited`. Thay vào đó, sửa nội dung probe để phụ thuộc một file rồi xóa file đó trong lab mới:
+
+```bash
+docker container rm --force lifecycle-health-demo
+
+docker container run --detach \
+  --name lifecycle-health-demo \
+  --label com.example.lab=healthchecks \
+  --health-cmd='test -f /tmp/healthy' \
+  --health-interval=3s \
+  --health-timeout=1s \
+  --health-retries=2 \
+  alpine:3.22 \
+  sh -c 'touch /tmp/healthy; exec sleep 300'
+```
+
+Chờ status `healthy`, rồi xóa file:
+
+```bash
+docker container exec lifecycle-health-demo rm /tmp/healthy
+sleep 8
+docker container inspect lifecycle-health-demo \
+  --format 'state={{.State.Status}} health={{.State.Health.Status}} exit={{.State.ExitCode}}'
+```
+
+Expected: lifecycle state vẫn `running`, health chuyển `unhealthy`, exit code của PID 1 vẫn chưa đổi vì `sleep` còn chạy. Đây là khác biệt cốt lõi giữa health failure và process failure.
+
+Cleanup:
+
+```bash
+docker container rm --force lifecycle-health-demo
+```
+
+## Quan sát event health
+
+Khi health status đổi, Docker phát event `health_status`:
+
+```bash
+docker events \
+  --since '10m' \
+  --until '0s' \
+  --filter 'container=lifecycle-health-demo' \
+  --filter 'event=health_status'
+```
+
+Event hữu ích để dựng timeline incident, nhưng không thay thế monitoring bền vững. Event stream không phải audit log lâu dài nếu bạn không thu thập nó vào hệ thống riêng.
+
+## Healthcheck và restart policy
+
+Một hiểu lầm phổ biến là `--restart=always` sẽ restart container khi healthcheck thất bại. Trên standalone Docker Engine, điều đó không xảy ra. Restart policy xử lý process exit; healthcheck chỉ cập nhật health status.
+
+Nếu bạn muốn container tự exit khi một điều kiện nghiêm trọng kéo dài, application hoặc watchdog bên trong phải quyết định exit rõ ràng. Cách này cần thận trọng vì nó biến health failure thành restart loop và có thể che mất evidence nếu logs/metrics không được thu thập.
+
+## Troubleshooting
+
+### Health luôn `starting`
+
+Kiểm tra probe có từng chạy chưa và interval/start-period có quá dài không:
+
+```bash
+docker container inspect CONTAINER \
+  --format 'health={{json .State.Health}}'
+```
+
+Nếu không có `.State.Health`, container không có healthcheck effective hoặc bị `--no-healthcheck`.
+
+### Health `unhealthy` nhưng service vẫn có vẻ chạy
+
+Đọc output probe, command và network path của probe:
+
+```bash
+docker container inspect CONTAINER \
+  --format 'health={{json .State.Health}} cmd={{json .Config.Healthcheck.Test}}'
+```
+
+Probe có thể gọi sai port, dùng tool không tồn tại, timeout quá ngắn, phụ thuộc DNS/proxy không có trong container hoặc endpoint yêu cầu auth.
+
+### Probe làm container nặng lên
+
+Đo CPU/log/dependency request quanh thời điểm probe. Healthcheck chạy định kỳ và có thể tạo tải đáng kể nếu interval ngắn hoặc command khởi động runtime nặng. Giữ probe nhanh, ít allocation và có timeout rõ.
+
+### Không thấy container restart dù unhealthy
+
+Đây là behavior đúng của Docker Engine độc lập. Kiểm tra `.RestartCount` để xác nhận restart policy có thực sự kích hoạt vì process exit hay không:
+
+```bash
+docker container inspect CONTAINER \
+  --format 'health={{with .State.Health}}{{.Status}}{{else}}none{{end}} restarts={{.RestartCount}} exit={{.State.ExitCode}}'
+```
+
+## Nguồn chính thức
+
+- [Dockerfile `HEALTHCHECK`](https://docs.docker.com/reference/dockerfile/#healthcheck)
+- [docker container run health options](https://docs.docker.com/reference/cli/docker/container/run/)
+- [docker events](https://docs.docker.com/reference/cli/docker/system/events/)

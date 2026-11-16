@@ -1,0 +1,15 @@
+{
+  "title": "Tài nguyên và hiệu năng",
+  "pages": [
+    "index",
+    "cpu-limits",
+    "memory-limits",
+    "block-io",
+    "pids-limit",
+    "ulimits",
+    "gpu",
+    "resource-monitoring",
+    "performance-profiling",
+    "performance-tuning"
+  ]
+}

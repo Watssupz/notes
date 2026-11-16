@@ -1,0 +1,249 @@
+---
+title: "EXPOSE, VOLUME và HEALTHCHECK"
+description: "Thiết kế metadata về port, mount point và health probe; hiểu những gì Dockerfile khai báo và những gì vẫn phải cấu hình ở runtime."
+---
+
+`EXPOSE`, `VOLUME` và `HEALTHCHECK` mô tả ba phần của runtime contract: process nghe ở đâu, dữ liệu mutable đặt ở đâu và xác định container còn phục vụ được hay không. Chúng không thay thế cấu hình deployment:
+
+- `EXPOSE` không publish port ra host;
+- `VOLUME` không chọn host path/backup policy;
+- `HEALTHCHECK` không tự restart container và không biết dependency end-to-end có khỏe hay không.
+
+## `EXPOSE`: metadata về container port
+
+```dockerfile
+EXPOSE <port>[/<protocol>] ...
+```
+
+Ví dụ service nghe HTTP TCP 8080 và metrics TCP 9090:
+
+```dockerfile
+EXPOSE 8080/tcp 9090/tcp
+```
+
+TCP là default nếu bỏ protocol. Cùng số port cho TCP và UDP phải khai báo cả hai:
+
+```dockerfile
+EXPOSE 8125/tcp
+EXPOSE 8125/udp
+```
+
+### `EXPOSE` không mở firewall hay publish port
+
+Container vẫn cần runtime mapping để host bên ngoài truy cập:
+
+```bash
+docker run --rm --publish 127.0.0.1:8080:8080 app:test
+```
+
+Mapping nghĩa là host `127.0.0.1:8080` chuyển tới container port `8080`. Bind `0.0.0.0` có thể làm service reachable trên mọi host interface tùy firewall/routing; chỉ publish scope cần thiết.
+
+`-P`/`--publish-all` publish các exposed ports tới host ports tự chọn:
+
+```bash
+docker run --detach --publish-all --name app app:test
+docker port app
+```
+
+Dùng explicit mapping trong production để policy và monitoring ổn định. Container cùng user-defined network có thể giao tiếp trực tiếp qua container port mà không cần `EXPOSE` hay publish; `EXPOSE` vẫn hữu ích làm documentation/tooling metadata.
+
+Inspect:
+
+```bash
+docker image inspect app:test --format '{{json .Config.ExposedPorts}}'
+docker inspect app --format '{{json .NetworkSettings.Ports}}'
+```
+
+Field image cho biết hint; field container/network cho biết runtime mapping.
+
+## Application phải listen đúng interface
+
+`EXPOSE 8080` không sửa application. Nếu app chỉ bind `127.0.0.1:8080` bên trong container, traffic tới container IP có thể không vào được. Service thường cần listen `0.0.0.0` hoặc interface thích hợp trong container, còn host exposure được giới hạn bằng publish/firewall.
+
+Xác minh từ host:
+
+```bash
+curl --fail --show-error http://127.0.0.1:8080/health
+```
+
+Nếu fail, kiểm tra application log, listen socket trong network namespace, container mapping và host firewall; không thêm `EXPOSE` lần nữa như một fix.
+
+## `VOLUME`: khai báo mount point
+
+```dockerfile
+VOLUME ["/var/lib/app"]
+```
+
+JSON form tránh ambiguity. `VOLUME` đánh dấu path dự kiến chứa mutable data và khiến Docker runtime tạo/mount volume khi người chạy không cung cấp mount khác. Với `docker run`, đây thường là anonymous volume.
+
+`VOLUME` không thể chỉ định host directory:
+
+```dockerfile
+# Không hợp lệ như một host mapping contract
+VOLUME ["/host/path:/container/path"]
+```
+
+Host path, named volume, driver, backup và lifecycle thuộc runtime:
+
+```bash
+# Named volume
+docker volume create app-data
+docker run --rm \
+  --mount type=volume,src=app-data,dst=/var/lib/app \
+  app:test
+
+# Bind mount
+docker run --rm \
+  --mount type=bind,src="$PWD/data",dst=/var/lib/app \
+  app:test
+```
+
+### Khi không nên thêm `VOLUME`
+
+`VOLUME` trong application image có thể tạo anonymous volume ngoài ý muốn khi operator quên mount, làm cleanup/backup khó và làm path behavior khi build/runtime khó hiểu. Với image nội bộ được deploy hoàn toàn bằng Compose/Kubernetes, có thể document mount contract và khai báo ở deployment layer thay vì bake `VOLUME`.
+
+Dùng `VOLUME` khi image có contract phổ quát, rõ ràng rằng path là persistent/mutable mount point. Không đánh dấu `/app` hoặc toàn bộ home chỉ vì process ghi một file tạm; chuyển temp/cache sang `/tmp` hoặc tmpfs nếu không cần bền vững.
+
+### Dữ liệu ban đầu và mount che filesystem
+
+Mount tại `/var/lib/app` che content cùng path trong image khi container chạy. Với named/anonymous volume mới, Docker Engine có behavior copy content có sẵn vào empty volume theo mount semantics; volume đã có dữ liệu không tự đồng bộ khi image update. Có thể dùng `volume-nocopy` ở runtime khi muốn ngăn copy cho named volume.
+
+Không dựa vào implicit copy để chạy database migration. Thiết kế schema/version migration riêng, backup trước và test rollback.
+
+### Build sau `VOLUME`
+
+Behavior thay đổi filesystem dưới path đã khai báo sau `VOLUME` từng khác giữa legacy builder và BuildKit. Đặt seed file và permission **trước** `VOLUME`, dùng BuildKit hiện hành, rồi test final image/volume behavior; không dựa vào side effect builder cũ.
+
+## `HEALTHCHECK`: kiểm tra từ bên trong container
+
+Dạng exec:
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD ["/usr/local/bin/healthcheck"]
+```
+
+Dạng shell:
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
+  CMD wget --quiet --tries=1 --spider http://127.0.0.1:8080/health || exit 1
+```
+
+Exec form không tự dùng shell. Shell form dùng default shell của image và hỗ trợ `||`, expansion. Tool probe phải tồn tại trong final image; đừng cài full `curl` chỉ cho healthcheck nếu application có thể cung cấp binary/subcommand nhỏ.
+
+Một Dockerfile stage chỉ có effective `HEALTHCHECK` cuối cùng. Tắt healthcheck thừa kế:
+
+```dockerfile
+HEALTHCHECK NONE
+```
+
+### Trạng thái và exit code
+
+Container bắt đầu với health status `starting`. Sau probe:
+
+- exit `0`: healthy;
+- exit `1`: unhealthy cho lần probe;
+- exit `2`: reserved, không dùng như custom third state.
+
+Sau số failure liên tiếp theo `--retries` ngoài startup grace, status chuyển `unhealthy`. Success sau đó có thể đưa về `healthy`.
+
+Các option chính:
+
+| Option | Ý nghĩa thiết kế |
+|---|---|
+| `--interval` | Khoảng giữa các lần probe sau khi lần trước hoàn tất theo runtime semantics |
+| `--timeout` | Giới hạn một probe |
+| `--start-period` | Grace period cho startup; failure trong giai đoạn này được xử lý theo healthcheck rules |
+| `--retries` | Số failure liên tiếp để đánh dấu unhealthy |
+| `--start-interval` | Nhịp probe riêng trong startup khi Dockerfile/runtime version hỗ trợ |
+
+Default và support có thể đổi theo Engine/Dockerfile version; đặt explicit value theo startup/SLO của ứng dụng thay vì copy mặc định.
+
+### Probe đúng thứ cần biết
+
+Probe tốt cần:
+
+- nhanh hơn timeout với margin;
+- không mutate business data;
+- không phụ thuộc internet bên ngoài;
+- kiểm tra process thực sự có thể phục vụ, không chỉ PID tồn tại;
+- không quá sâu tới mức một dependency phụ làm mọi replica bị loại;
+- trả output ngắn, không chứa secret.
+
+Ví dụ binary tự kiểm tra loopback:
+
+```dockerfile
+HEALTHCHECK --interval=15s --timeout=2s --start-period=20s --retries=3 \
+  CMD ["/app/server", "healthcheck", "--address=127.0.0.1:8080"]
+```
+
+Healthcheck từ trong container không chứng minh host port, load balancer, DNS bên ngoài hoặc client path hoạt động. Kết hợp synthetic check từ ngoài cho end-to-end availability.
+
+## Health status không phải restart policy
+
+Docker Engine ghi health status và phát health events, nhưng standalone container không tự restart chỉ vì `unhealthy`. Restart policy chủ yếu phản ứng process exit. Compose dependency/orchestrator có thể dùng health theo semantics riêng, nhưng không giả định chúng giống nhau.
+
+Nếu app không phục hồi được, cân nhắc để main process exit có kiểm soát sau khi thu evidence, hoặc để orchestrator liveness mechanism xử lý. Tránh healthcheck gây restart loop che root cause.
+
+## Quan sát health
+
+```bash
+docker run --detach --name app app:test
+
+docker inspect app \
+  --format 'status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}not-configured{{end}}'
+
+docker inspect app --format '{{json .State.Health.Log}}'
+docker events --filter container=app --filter event=health_status
+```
+
+Health log chứa output probe giới hạn theo Engine behavior; không dùng nó làm log store. Application log và metric vẫn cần riêng.
+
+## Ví dụ runtime contract hoàn chỉnh
+
+```dockerfile
+FROM alpine:3.23
+
+RUN addgroup -S -g 10001 app \
+    && adduser -S -D -H -u 10001 -G app app \
+    && install -d -o app -g app /var/lib/app
+
+COPY --chown=10001:10001 --chmod=755 server /usr/local/bin/server
+
+USER 10001:10001
+EXPOSE 8080/tcp
+VOLUME ["/var/lib/app"]
+HEALTHCHECK --interval=15s --timeout=2s --start-period=20s --retries=3 \
+  CMD ["/usr/local/bin/server", "healthcheck", "--address=127.0.0.1:8080"]
+ENTRYPOINT ["/usr/local/bin/server"]
+CMD ["serve", "--listen=0.0.0.0:8080", "--data=/var/lib/app"]
+```
+
+Build không chứng minh binary hỗ trợ các subcommand/flags; CI phải chạy container, chờ healthy, gửi request qua published port, ghi/đọc dữ liệu trên volume rồi recreate để xác minh persistence.
+
+## Troubleshooting nhanh
+
+### Port publish đúng nhưng connection refused
+
+Kiểm tra container còn chạy, app listen `0.0.0.0:<container-port>`, mapping host→container, protocol TCP/UDP và log startup.
+
+### Anonymous volume tăng dần
+
+Tìm mount/name/labels bằng `docker volume ls` và inspect container đã tạo. Xóa volume chỉ sau khi xác định owner và backup. Cân nhắc bỏ `VOLUME` khỏi image nội bộ hoặc luôn mount named volume explicit.
+
+### Healthcheck báo `command not found`
+
+Probe tool không có ở final stage, `PATH` sai hoặc exec-form path không absolute. Chạy probe thủ công bằng `docker exec` với cùng user/env.
+
+### Container healthy nhưng user vẫn lỗi
+
+Internal probe quá nông hoặc external path lỗi. Kiểm tra published port, reverse proxy/load balancer, DNS/TLS và dependency theo request path.
+
+## Nguồn chính thức
+
+- [`EXPOSE` reference](https://docs.docker.com/reference/dockerfile/#expose)
+- [`VOLUME` reference](https://docs.docker.com/reference/dockerfile/#volume)
+- [`HEALTHCHECK` reference](https://docs.docker.com/reference/dockerfile/#healthcheck)
+- [Publishing and exposing ports](https://docs.docker.com/get-started/docker-concepts/running-containers/publishing-ports/)
+- [Volumes](https://docs.docker.com/engine/storage/volumes/)
