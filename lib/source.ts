@@ -71,47 +71,34 @@ const dockerLearn = defineDocs({
   meta: { schema: metaSchema },
 });
 
+// Shared loader configuration
+function createSource(
+  source: ReturnType<typeof docs.toFumadocsSource>,
+  baseUrl: string,
+) {
+  return loader({
+    baseUrl,
+    source,
+    plugins: [lucideIconsPlugin()],
+  });
+}
+
+// Export sources
 export const sources = {
-  docs: loader({
-    baseUrl: "/docs",
-    source: docs.toFumadocsSource(),
-    plugins: [lucideIconsPlugin()],
-  }),
-  "java-learn": loader({
-    baseUrl: "/java-learn",
-    source: javaLearn.toFumadocsSource(),
-    plugins: [lucideIconsPlugin()],
-  }),
-  "jwt-learn": loader({
-    baseUrl: "/jwt-learn",
-    source: jwtLearn.toFumadocsSource(),
-    plugins: [lucideIconsPlugin()],
-  }),
-  "90daysofdevops": loader({
-    baseUrl: "/90daysofdevops",
-    source: _90daysofdevops.toFumadocsSource(),
-    plugins: [lucideIconsPlugin()],
-  }),
-  "sql-learn": loader({
-    baseUrl: "/sql-learn",
-    source: sqlLearn.toFumadocsSource(),
-    plugins: [lucideIconsPlugin()],
-  }),
-  "redis-learn": loader({
-    baseUrl: "/redis-learn",
-    source: redisLearn.toFumadocsSource(),
-    plugins: [lucideIconsPlugin()],
-  }),
-  "interview-question": loader({
-    baseUrl: "/interview-question",
-    source: interviewQues.toFumadocsSource(),
-    plugins: [lucideIconsPlugin()],
-  }),
-  "docker-learn": loader({
-    baseUrl: "/docker-learn",
-    source: dockerLearn.toFumadocsSource(),
-    plugins: [lucideIconsPlugin()],
-  }),
+  docs: createSource(docs.toFumadocsSource(), "/docs"),
+  "java-learn": createSource(javaLearn.toFumadocsSource(), "/java-learn"),
+  "jwt-learn": createSource(jwtLearn.toFumadocsSource(), "/jwt-learn"),
+  "90daysofdevops": createSource(
+    _90daysofdevops.toFumadocsSource(),
+    "/90daysofdevops",
+  ),
+  "sql-learn": createSource(sqlLearn.toFumadocsSource(), "/sql-learn"),
+  "redis-learn": createSource(redisLearn.toFumadocsSource(), "/redis-learn"),
+  "interview-question": createSource(
+    interviewQues.toFumadocsSource(),
+    "/interview-question",
+  ),
+  "docker-learn": createSource(dockerLearn.toFumadocsSource(), "/docker-learn"),
 };
 
 export function getSource(id: string) {
