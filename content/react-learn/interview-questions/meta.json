@@ -1,0 +1,9 @@
+{
+  "title": "Câu hỏi phỏng vấn",
+  "pages": [
+    "khi-nao-react-quyet-dinh-rerender",
+    "usecallback-nhieu-setstate-rerender",
+    "controlled-va-uncontrolled-components",
+    "dependency-array-cua-cac-hooks"
+  ]
+}

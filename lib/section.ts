@@ -1,4 +1,5 @@
 import {
+  Atom,
   BookOpen,
   Coffee,
   Container,
@@ -70,6 +71,13 @@ export const sections: Section[] = [
     meta: "Live • Cache",
     group: "backend",
     icon: Cpu,
+  },
+  {
+    id: "react-learn",
+    title: "React",
+    meta: "Internals • Re-render • Patterns",
+    group: "web",
+    icon: Atom,
   },
   {
     id: "interview-question",

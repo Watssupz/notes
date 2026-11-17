@@ -1,0 +1,14 @@
+{
+  "title": "Tối ưu Re-render",
+  "pages": [
+    "tong-quan-toi-uu",
+    "react-memo",
+    "usememo-usecallback",
+    "referential-equality",
+    "context-optimization",
+    "code-splitting",
+    "virtualization",
+    "throttling-debouncing",
+    "react-compiler"
+  ]
+}

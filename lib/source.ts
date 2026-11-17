@@ -70,6 +70,14 @@ const dockerLearn = defineDocs({
   },
   meta: { schema: metaSchema },
 });
+const reactLearn = defineDocs({
+  dir: "content/react-learn",
+  docs: {
+    schema: pageSchema,
+    postprocess: { includeProcessedMarkdown: true },
+  },
+  meta: { schema: metaSchema },
+});
 
 // Shared loader configuration
 function createSource(
@@ -99,6 +107,7 @@ export const sources = {
     "/interview-question",
   ),
   "docker-learn": createSource(dockerLearn.toFumadocsSource(), "/docker-learn"),
+  "react-learn": createSource(reactLearn.toFumadocsSource(), "/react-learn"),
 };
 
 export function getSource(id: string) {

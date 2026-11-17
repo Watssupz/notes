@@ -1,0 +1,395 @@
+---
+title: "Strict Mode"
+description: "Công cụ dev-only của React: double-invoke render & effects để lộ side-effect ẩn — cơ chế, vì sao mount→unmount→mount, các kiểm tra kèm theo, cách viết code idempotent và những hiểu lầm thường gặp"
+---
+
+<span id="strict-mode" />
+
+**Strict Mode**
+
+## Mục lục
+
+- [Tổng quan](#tổng-quan)
+- [1. StrictMode là gì và bật thế nào](#1-strictmode-là-gì-và-bật-thế-nào)
+- [2. Double-invoke render: vì sao chạy 2 lần](#2-double-invoke-render-vì-sao-chạy-2-lần)
+  - [2.1 Component phải "thuần"](#21-component-phải-thuần)
+  - [2.2 Vì sao console.log bị làm mờ](#22-vì-sao-consolelog-bị-làm-mờ)
+- [3. Double-invoke effect: mount → unmount → mount](#3-double-invoke-effect-mount--unmount--mount)
+  - [3.1 Bẫy kinh điển: API gọi 2 lần](#31-bẫy-kinh-điển-api-gọi-2-lần)
+- [4. Vì sao React làm vậy](#4-vì-sao-react-làm-vậy)
+- [5. Các kiểm tra khác mà StrictMode bật](#5-các-kiểm-tra-khác-mà-strictmode-bật)
+- [6. Cái gì bị gọi 2 lần, cái gì không](#6-cái-gì-bị-gọi-2-lần-cái-gì-không)
+- [7. Viết code "qua" được StrictMode](#7-viết-code-qua-được-strictmode)
+- [8. StrictMode trong production](#8-strictmode-trong-production)
+- [9. Những hiểu lầm thường gặp](#9-những-hiểu-lầm-thường-gặp)
+- [10. Câu hỏi tự kiểm tra](#10-câu-hỏi-tự-kiểm-tra)
+- [Tài liệu tham khảo](#tài-liệu-tham-khảo)
+
+---
+
+## Tổng quan
+
+**Strict Mode** (`<StrictMode>`) là một công cụ **chỉ chạy ở môi trường development** giúp phát hiện sớm các lỗi tiềm ẩn trong component: side-effect đặt sai chỗ, effect thiếu cleanup, dùng API đã lỗi thời. Nó **không render ra UI nào** và **không ảnh hưởng tới production build**.
+
+<Callout type="info" title="Important">
+
+Cách hoạt động chính của StrictMode là **cố tình gọi lặp lại** một số hàm (render, initializer, effect) trong dev để "ép lộ" những đoạn code không **idempotent** (chạy lại cho kết quả khác). Nếu code của bạn đúng theo mô hình `UI = f(state)` thuần khiết, double-invoke **không** làm gì hại; nếu nó làm vỡ thứ gì, đó chính là bug StrictMode muốn bạn thấy.
+
+**Nói ngắn gọn: StrictMode là bài kiểm tra độ bền, không phải cơ chế chạy app thật.** React muốn bắt sớm hai lỗi vốn rất khó thấy:
+
+1. **Render không thuần**: render một lần đã làm thay đổi thứ gì đó bên ngoài (ví dụ gọi API, tăng biến toàn cục). Gọi lại là lộ lỗi ngay.
+2. **Effect không dọn dẹp**: mở kết nối/listener/request nhưng component biến mất thì không cleanup. React thử `setup → cleanup → setup` để kiểm tra.
+
+Do đó, request xuất hiện 2 lần trong Network tab không có nghĩa React tự dưng cần dữ liệu 2 lần ở production. Đó là **hai lần chạy `useEffect` có chủ đích, chỉ trong development + StrictMode**.
+
+</Callout>
+
+---
+
+## 1. StrictMode là gì và bật thế nào
+
+StrictMode là một component bọc quanh một phần (hoặc toàn bộ) cây. Mọi component **bên trong** nó được áp các kiểm tra dev.
+
+```tsx
+import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>
+);
+```
+
+Có thể bọc cục bộ chỉ một nhánh:
+
+```tsx
+function App() {
+  return (
+    <>
+      <Header />               {/* không bị StrictMode */}
+      <StrictMode>
+        <Experimental />       {/* chỉ nhánh này bị kiểm tra */}
+      </StrictMode>
+    </>
+  );
+}
+```
+
+<Callout type="info" title="Note">
+
+Trong **Next.js**, không bọc `<StrictMode>` thủ công — bật bằng cờ `reactStrictMode: true` trong `next.config.js` (mặc định đã bật ở nhiều phiên bản). Create React App / Vite template cũng bọc sẵn `<StrictMode>` trong file entry.
+
+</Callout>
+
+---
+
+## 2. Double-invoke render: vì sao chạy 2 lần
+
+Trong dev + StrictMode, React **gọi thân component hai lần** mỗi lần render (lần thứ hai bị "bỏ" kết quả). Điều này áp cho:
+
+- Thân function component.
+- Hàm khởi tạo `useState(() => ...)`, `useReducer` initializer.
+- Hàm updater truyền vào `setState(prev => ...)`.
+- `useMemo` / `useCallback` callback.
+
+```d2 title="2. Double-invoke render: vì sao chạy 2 lần — sơ đồ 1"
+direction: right
+R: "Một lần render trong dev"
+A: "Gọi component lần 1"
+B: "Gọi component lần 2 (kết quả không được commit)"
+C: "Render phải không gây thay đổi bên ngoài"
+D: "Bug lộ ra (log đôi, state nhảy...)"
+E: "An toàn, không ảnh hưởng"
+R -> A
+R -> B
+A -> C
+B -> C
+C -> D: "có side-effect"
+C -> E: "thuần"
+```
+
+### 2.1 Component phải "thuần"
+
+Render phải là hàm **thuần**: cùng input → cùng output, **không** side-effect. Đoạn dưới sai vì mutate biến ngoài **trong lúc render**:
+
+```tsx
+let id = 0;
+
+// ❌ Side-effect trong render: double-invoke làm id nhảy 2 bước
+function BadList({ items }: { items: string[] }) {
+  return items.map((x) => <li key={id++}>{x}</li>); // id++ khi render!
+}
+
+// ✅ Không side-effect khi render
+function GoodList({ items }: { items: { id: string; text: string }[] }) {
+  return items.map((x) => <li key={x.id}>{x.text}</li>);
+}
+```
+
+<Callout type="warn" title="Warning">
+
+Mutate biến module, đẩy vào mảng ngoài, ghi vào `ref.current`, hay gọi API **ngay trong thân render** đều là side-effect. Double-invoke của StrictMode sẽ làm chúng chạy 2 lần → kết quả lệch. Side-effect phải nằm trong event handler hoặc `useEffect`, không phải trong render.
+
+</Callout>
+
+### 2.2 Vì sao console.log bị làm mờ
+
+Vì component chạy 2 lần, `console.log` trong render cũng in **2 lần**. Để đỡ rối, React **làm mờ (greyed out)** nhóm log lần thứ hai trong DevTools console thay vì in trùng rõ ràng.
+
+<Callout type="info" title="Tip">
+
+Nếu thấy log của mình in đôi (một dòng mờ) trong dev — đó là StrictMode, **không** phải bug. Ở production chỉ chạy một lần. Có thể tắt tính năng làm mờ này trong cài đặt console của React DevTools nếu muốn thấy đủ.
+
+</Callout>
+
+---
+
+## 3. Double-invoke effect: mount → unmount → mount
+
+Từ React 18, StrictMode còn **chạy lại effect** ngay sau khi mount: React **mount → chạy effect → chạy cleanup → chạy effect lại**. Mục đích: kiểm tra effect của bạn có **cleanup đúng** và **chịu được việc bị chạy nhiều lần** không.
+
+```d2 title="3. Double-invoke effect: mount → unmount → mount — sơ đồ 2"
+shape: sequence_diagram
+R: "React (dev + Strict)"
+C: "Component"
+R -> C: "Mount"
+R -> C: "chạy effect (setup) — lần 1"
+R -> C: "chạy cleanup — lần 1"
+R -> C: "chạy effect (setup) — lần 2"
+R."Ghi chú (R,C): Production chỉ có: Mount → effect (1 lần)"
+```
+
+```tsx
+useEffect(() => {
+  const conn = createConnection(roomId);
+  conn.connect();
+  return () => conn.disconnect(); // BẮT BUỘC: cleanup để chịu được double-invoke
+}, [roomId]);
+```
+
+<Callout type="info" title="Important">
+
+Nếu effect **thiếu cleanup**, double-invoke sẽ để lại "rác": 2 kết nối WebSocket, 2 listener, 2 interval... StrictMode phơi bày điều này ngay trong dev thay vì để bạn phát hiện qua memory leak ở production.
+
+</Callout>
+
+### 3.1 Bẫy kinh điển: API gọi 2 lần
+
+Ví dụ code sau đặt `fetch` trong effect:
+
+```tsx
+useEffect(() => {
+  fetch(`/api/users/${id}`).then(/* ... */);
+}, [id]);
+```
+
+Khi **lần đầu mount** ở dev + StrictMode, React cố ý chạy đúng chuỗi này:
+
+```d2 title="StrictMode dev: thử lại effect và gửi request"
+direction: down
+setup1: "setup lần 1"
+fetch1: "fetch #1 được gửi"
+cleanup: "cleanup — component giả lập bị gỡ"
+setup2: "setup lần 2"
+fetch2: "fetch #2 được gửi"
+setup1 -> fetch1 -> cleanup -> setup2 -> fetch2
+```
+
+Vì `fetch()` là lệnh gửi request thật, cả hai request có thể tới server. Cleanup **không thể rút lại** request đã tới server; nó chỉ hủy request còn đang chờ và, quan trọng hơn, ngăn response cũ cập nhật state. Đây **không** phải bug của StrictMode: nó buộc effect phải xử lý hủy/đua (race), giống lúc `id` đổi nhanh hoặc người dùng rời màn hình.
+
+```tsx
+// ✅ Hủy request cũ; chỉ response của effect còn hiệu lực mới được dùng.
+useEffect(() => {
+  const controller = new AbortController();
+
+  fetch(`/api/users/${id}`, { signal: controller.signal })
+    .then((r) => r.json())
+    .then((data) => setUser(data))
+    .catch((error) => {
+      if (error.name !== 'AbortError') throw error;
+    });
+
+  return () => controller.abort();
+}, [id]);
+```
+
+Nếu endpoint có side-effect (ví dụ `POST /orders`, gửi email, analytics), **đừng gọi nó trong effect để “chạy một lần”**. Hãy gọi trong event handler (`onSubmit`, `onClick`) hoặc dùng idempotency key ở server. Với data fetching thật, thư viện cache sẽ dedupe request phù hợp.
+
+<Callout type="info" title="Note">
+
+Với data fetching thật, dùng **TanStack Query** / **SWR** — chúng tự dedupe nên request đôi trong dev cũng được gộp. Xem [Code-splitting](/toi-uu-rerender/code-splitting/).
+
+</Callout>
+
+---
+
+## 4. Vì sao React làm vậy
+
+Double-invoke effect mô phỏng tình huống component **bị mount lại** mà không mất state — một kịch bản React muốn hỗ trợ tốt trong tương lai:
+
+<Steps>
+  <Step>
+    ### Fast Refresh khi dev
+    Sửa code → component re-mount liên tục. Effect không cleanup đúng sẽ rò rỉ ngay khi bạn code.
+  </Step>
+  <Step>
+    ### Tính năng giữ & khôi phục state
+    React hướng tới việc "ẩn" rồi "hiện lại" một phần UI (kiểu Activity/Offscreen) mà vẫn giữ state — tức effect bị tắt/bật lại. Code chịu được double-invoke sẽ sẵn sàng cho điều này.
+  </Step>
+  <Step>
+    ### Buộc tư duy "effect = đồng bộ, không phải lifecycle"
+    Effect nên mô tả "đồng bộ hệ thống ngoài với state hiện tại" và luôn dọn dẹp được — không phải "làm một việc một lần khi mount".
+  </Step>
+</Steps>
+
+---
+
+## 5. Các kiểm tra khác mà StrictMode bật
+
+Ngoài double-invoke, StrictMode còn cảnh báo các mẫu lỗi thời / nguy hiểm:
+
+| Kiểm tra | Ý nghĩa |
+|----------|---------|
+| API deprecated | Cảnh báo dùng `findDOMNode`, string ref (`ref="x"`), legacy context API |
+| Effect không cleanup | Phơi bày qua double-invoke effect (mục 3) |
+| Render không thuần | Phơi bày qua double-invoke render (mục 2) |
+| `UNSAFE_` lifecycle | Cảnh báo các method class lỗi thời (`UNSAFE_componentWillMount`...) |
+
+<Callout type="info" title="Note">
+
+Các cảnh báo deprecated chủ yếu liên quan code cũ (class component, React đời trước). Code function + hooks hiện đại hầu như chỉ gặp hai loại double-invoke ở trên.
+
+</Callout>
+
+---
+
+## 6. Cái gì bị gọi 2 lần, cái gì không
+
+| Bị double-invoke (dev + Strict) | KHÔNG double-invoke |
+|--------------------------------|---------------------|
+| Thân function component | Event handler (onClick, onChange...) |
+| `useState`/`useReducer` initializer | Code trong `setTimeout`/`Promise` callback |
+| Updater `setState(prev => ...)` | Lệnh chạy ngoài render & ngoài effect |
+| `useMemo` / `useCallback` callback | — |
+| Effect setup + cleanup (mount lần đầu) | — |
+
+<Callout type="warn" title="Warning">
+
+Vì **initializer** và **updater** bị gọi 2 lần, tuyệt đối **không** đặt side-effect trong chúng:
+```tsx
+// ❌ side-effect trong updater → chạy 2 lần
+setCount((c) => { logToServer(c); return c + 1; });
+// ✅ updater thuần; side-effect tách ra event handler
+setCount((c) => c + 1);
+```
+
+</Callout>
+
+---
+
+## 7. Viết code "qua" được StrictMode
+
+<Steps>
+  <Step>
+    ### Render thuần
+    Không mutate biến ngoài, không gọi API, không ghi ref trong thân component. Chỉ tính toán từ props/state và trả JSX.
+  </Step>
+  <Step>
+    ### Mọi effect có cleanup
+    Subscribe → unsubscribe, connect → disconnect, setInterval → clearInterval, addEventListener → removeEventListener.
+  </Step>
+  <Step>
+    ### Effect idempotent / chịu race
+    Dùng cờ `ignore`/`AbortController` cho fetch; thiết kế để chạy lại không gây hậu quả kép.
+  </Step>
+  <Step>
+    ### Initializer & updater thuần
+    Không log, không gọi API, không random/Date.now() có hệ quả bên ngoài trong các hàm này.
+  </Step>
+</Steps>
+
+<Callout type="info" title="Tip">
+
+Nguyên tắc vàng: nếu việc gì **chỉ được xảy ra một lần khi người dùng làm gì đó** (gửi form, mua hàng) → đặt trong **event handler**, không phải effect. Effect là để **đồng bộ**, mà đồng bộ thì lặp lại được.
+
+</Callout>
+
+---
+
+## 8. StrictMode trong production
+
+<Callout type="info" title="Important">
+
+StrictMode **không có tác dụng gì ở production**: không double-invoke, không cảnh báo, không chi phí. Toàn bộ kiểm tra chỉ chạy ở development. Vì vậy **luôn để StrictMode bật** — bạn được lợi khi dev mà không trả giá khi chạy thật.
+
+</Callout>
+
+```d2 title="8. StrictMode trong production — sơ đồ 3"
+direction: right
+D: "Development + StrictMode"
+D1: "double-invoke render"
+D2: "double-invoke effect"
+D3: "cảnh báo deprecated"
+P: "Production"
+P1: "chạy 1 lần, không cảnh báo, không overhead"
+D -> D1
+D -> D2
+D -> D3
+P -> P1
+```
+
+---
+
+## 9. Những hiểu lầm thường gặp
+
+<Accordions type="single">
+  <Accordion title="'StrictMode làm app tôi chậm gấp đôi'">
+    Sai. Double-invoke CHỈ xảy ra ở dev. Production không hề bị. Và ngay cả ở dev, mục tiêu là phơi bày bug, không phải đo hiệu năng.
+  </Accordion>
+  <Accordion title="'API bị gọi 2 lần là bug của React'">
+    Không. Đó là StrictMode chạy effect 2 lần ở dev để lộ việc effect thiếu xử lý hủy/race. Sửa bằng cờ ignore/AbortController, hoặc dùng thư viện data fetching tự dedupe.
+  </Accordion>
+  <Accordion title="'Nên tắt StrictMode cho đỡ phiền'">
+    Không nên. Việc 'phiền' chính là bug được phơi bày sớm. Tắt đi chỉ giấu bug tới production.
+  </Accordion>
+  <Accordion title="'Double-invoke nghĩa là code tôi sai'">
+    Không nhất thiết. Double-invoke luôn xảy ra; nó chỉ GÂY HẠI khi render/effect của bạn không thuần. Code thuần thì double-invoke vô hại.
+  </Accordion>
+</Accordions>
+
+---
+
+## 10. Câu hỏi tự kiểm tra
+
+<Accordions type="single">
+  <Accordion title="1. StrictMode chạy ở môi trường nào?">
+    Chỉ development. Production hoàn toàn không bị double-invoke, không cảnh báo, không overhead.
+  </Accordion>
+  <Accordion title="2. StrictMode double-invoke những gì khi render?">
+    Thân component, initializer của useState/useReducer, updater setState(prev => ...), và callback của useMemo/useCallback.
+  </Accordion>
+  <Accordion title="3. Thứ tự double-invoke effect khi mount là gì?">
+    setup → cleanup → setup (mount → chạy effect → cleanup → chạy effect lại). Mục đích: kiểm tra effect có cleanup đúng và chịu được mount lại.
+  </Accordion>
+  <Accordion title="4. Vì sao API bị gọi 2 lần trong dev và sửa thế nào?">
+    Vì effect chạy 2 lần. Sửa bằng cờ ignore hoặc AbortController trong cleanup để bỏ qua response cũ, hoặc dùng TanStack Query/SWR (tự dedupe).
+  </Accordion>
+  <Accordion title="5. Vì sao không được đặt side-effect trong updater setState(prev => ...)?">
+    Vì updater bị gọi 2 lần trong dev + Strict → side-effect chạy đôi. Updater phải thuần; side-effect đặt ở event handler.
+  </Accordion>
+  <Accordion title="6. Có nên tắt StrictMode không?">
+    Không. Nó không tốn gì ở production và phơi bày bug sớm ở dev. Luôn để bật.
+  </Accordion>
+</Accordions>
+
+---
+
+## Tài liệu tham khảo
+
+- [React Docs — `<StrictMode>`](https://react.dev/reference/react/StrictMode)
+- [React Docs — Keeping Components Pure](https://react.dev/learn/keeping-components-pure)
+- [React Docs — Synchronizing with Effects](https://react.dev/learn/synchronizing-with-effects)
+- [Render Pipeline](/react-internals/render-pipeline/)
+- [Fiber & Reconciliation](/react-internals/fiber-reconciliation/)
+- [Custom Hooks](/patterns/custom-hooks/)

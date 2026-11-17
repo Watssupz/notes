@@ -1,0 +1,13 @@
+{
+  "title": "React Internals",
+  "pages": [
+    "render-pipeline",
+    "virtual-dom-hoat-dong-nhu-the-nao",
+    "fiber-reconciliation",
+    "vi-sao-component-rerender",
+    "key-trong-list",
+    "strict-mode",
+    "error-boundaries",
+    "portals"
+  ]
+}

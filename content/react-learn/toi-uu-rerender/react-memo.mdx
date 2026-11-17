@@ -1,0 +1,285 @@
+---
+title: "React.memo"
+description: "memo bỏ qua re-render khi props không đổi — cơ chế bailout, so sánh nông, cạm bẫy props tham chiếu, comparator tùy biến, memo không chặn state/context, và giải pháp children"
+---
+
+<span id="reactmemo" />
+
+**React.memo**
+
+## Mục lục
+
+- [Tổng quan](#tổng-quan)
+- [1. memo làm gì](#1-memo-làm-gì)
+  - [1.1 Liên hệ với bailout của Fiber](#11-liên-hệ-với-bailout-của-fiber)
+- [2. Ví dụ: trước và sau memo](#2-ví-dụ-trước-và-sau-memo)
+- [3. Cạm bẫy: props là object/hàm inline](#3-cạm-bẫy-props-là-objecthàm-inline)
+- [4. memo KHÔNG chặn re-render do state/context](#4-memo-không-chặn-re-render-do-statecontext)
+- [5. So sánh tùy biến với hàm thứ hai](#5-so-sánh-tùy-biến-với-hàm-thứ-hai)
+- [6. Khi nào KHÔNG cần memo](#6-khi-nào-không-cần-memo)
+- [7. Giải pháp thay thế thường tốt hơn: children](#7-giải-pháp-thay-thế-thường-tốt-hơn-children)
+- [8. Câu hỏi tự kiểm tra](#8-câu-hỏi-tự-kiểm-tra)
+- [Tài liệu tham khảo](#tài-liệu-tham-khảo)
+
+---
+
+## Tổng quan
+
+`React.memo` bọc một component để React **bỏ qua re-render** nếu props của nó **không thay đổi** (so sánh nông). Nó cắt đứt chuỗi "cha render → con render" với điều kiện props giữ nguyên tham chiếu.
+
+<Callout type="info" title="Important">
+
+`memo` chỉ chặn re-render đến từ **cha**. Nó **không** chặn re-render do **state nội bộ** hay **context** của chính component đổi. Và nó chỉ hữu ích khi bạn **thật sự giữ được props ổn định** — điều mà object/hàm inline phá vỡ ngay (mục 3).
+
+</Callout>
+
+---
+
+## 1. memo làm gì
+
+Mặc định: cha render → mọi con render (xem [Vì sao re-render](/react-internals/vi-sao-component-rerender/)). `memo` thêm một bước kiểm tra:
+
+```d2 title="1. memo làm gì — sơ đồ 1"
+direction: down
+P: "Cha render"
+Q: "Con bọc memo?\nSo sánh props cũ vs mới\n(Object.is từng prop)" {shape: diamond}
+S: "BỎ QUA render con ✅"
+R: "Render con như thường"
+P -> Q
+Q -> S: "Mọi prop bằng nhau"
+Q -> R: "Có prop khác"
+```
+
+So sánh mặc định là **nông (shallow)**: với mỗi prop, React dùng `Object.is(propCũ, propMới)`. "Nông" nghĩa là chỉ so sánh **một tầng** — giá trị/ tham chiếu trực tiếp của từng prop, **không** đi sâu vào bên trong object.
+
+```tsx
+// Shallow compare 2 object props:
+shallowEqual({ a: 1, list: arr }, { a: 1, list: arr }); // true nếu arr CÙNG tham chiếu
+shallowEqual({ a: 1, list: [1] }, { a: 1, list: [1] }); // false — 2 mảng khác tham chiếu
+```
+
+### 1.1 Liên hệ với bailout của Fiber
+
+`memo` không phải phép màu riêng — nó tận dụng cơ chế **bailout** sẵn có trong `beginWork` (xem [Fiber](/react-internals/fiber-reconciliation/#43-bailout--khi-react-bỏ-qua-cả-subtree)). Bình thường React vẫn bailout khi một component không có update riêng **và** cha truyền **cùng element**. Nhưng khi cha re-render, element con là **mới** mỗi lần, nên bailout mặc định không kích hoạt. `memo` chèn bước so sánh props để **chủ động** kích hoạt bailout dù element là mới.
+
+<Callout type="info" title="Note">
+
+Hiểu điều này giải thích vì sao `memo` "thua" khi props đổi tham chiếu: bước so sánh props ra "khác" → không bailout → render như thường.
+
+</Callout>
+
+---
+
+## 2. Ví dụ: trước và sau memo
+
+```tsx
+import { memo, useState } from 'react';
+
+// Con "nặng" giả lập: in log để thấy nó render
+const HeavyList = memo(function HeavyList({ title }: { title: string }) {
+  console.log('HeavyList render');
+  // tưởng tượng đây là 1000 dòng cần render
+  return <div>{title}</div>;
+});
+
+export default function App() {
+  const [count, setCount] = useState(0);
+  return (
+    <div>
+      <button onClick={() => setCount((c) => c + 1)}>Count: {count}</button>
+      {/* title là string cố định → memo so sánh thấy không đổi → KHÔNG render lại */}
+      <HeavyList title="Danh sách sản phẩm" />
+    </div>
+  );
+}
+```
+
+**Kết quả:** "HeavyList render" chỉ in **1 lần** lúc mount. Bấm nút tăng `count` bao nhiêu lần cũng không in thêm — vì prop `title` không đổi. Bỏ `memo` đi: log in lại mỗi lần bấm.
+
+---
+
+## 3. Cạm bẫy: props là object/hàm inline
+
+Đây là lý do `memo` "không hoạt động" trong 90% trường hợp người mới dùng:
+
+```tsx
+const Child = memo(function Child({ config, onClick }: any) {
+  console.log('Child render');
+  return <button onClick={onClick}>{config.label}</button>;
+});
+
+export default function App() {
+  const [count, setCount] = useState(0);
+  return (
+    <div>
+      <button onClick={() => setCount((c) => c + 1)}>Count: {count}</button>
+      {/* ❌ Mỗi render App tạo object & hàm MỚI → tham chiếu khác → memo vô dụng */}
+      <Child config={{ label: 'Bấm tôi' }} onClick={() => console.log('click')} />
+    </div>
+  );
+}
+```
+
+`{ label: 'Bấm tôi' }` và `() => ...` là **giá trị mới** ở **mỗi** lần render App. `Object.is(objCũ, objMới)` → `false` → memo nghĩ props đổi → vẫn render. "Child render" vẫn in mỗi lần bấm.
+
+**Sửa:** ổn định tham chiếu bằng `useMemo`/`useCallback`:
+
+```tsx
+import { memo, useState, useMemo, useCallback } from 'react';
+
+export default function App() {
+  const [count, setCount] = useState(0);
+
+  const config = useMemo(() => ({ label: 'Bấm tôi' }), []); // 1 object, giữ nguyên
+  const onClick = useCallback(() => console.log('click'), []); // 1 hàm, giữ nguyên
+
+  return (
+    <div>
+      <button onClick={() => setCount((c) => c + 1)}>Count: {count}</button>
+      <Child config={config} onClick={onClick} /> {/* memo giờ mới có tác dụng */}
+    </div>
+  );
+}
+```
+
+<Callout type="warn" title="Warning">
+
+`memo` và `useMemo`/`useCallback` thường phải đi **thành bộ ba**. Bọc `memo` mà quên ổn định props object/hàm = tốn chi phí so sánh mà chẳng chặn được gì. Đọc kỹ [Referential Equality](/toi-uu-rerender/referential-equality/).
+
+</Callout>
+
+---
+
+## 4. memo KHÔNG chặn re-render do state/context
+
+`memo` chỉ chặn re-render đến từ cha. Nếu chính component có `useState`/`useReducer` đổi, hoặc đọc một context vừa đổi value, nó **vẫn re-render** bất kể memo:
+
+```tsx
+const Panel = memo(function Panel() {
+  const [open, setOpen] = useState(false);
+  const theme = useContext(ThemeCtx);
+  // memo KHÔNG ngăn được 2 nguồn này:
+  // - setOpen(...) → state đổi → re-render
+  // - ThemeCtx.value đổi → re-render
+  return <div className={theme}>{open ? 'Mở' : 'Đóng'}</div>;
+});
+```
+
+<Callout type="info" title="Important">
+
+Nhớ ba nguyên nhân re-render: state / cha / context. `memo` chỉ xử lý nhánh **cha**. Đừng kỳ vọng `memo` "đóng băng" một component đang có state riêng hoặc đang nghe context.
+
+</Callout>
+
+---
+
+## 5. So sánh tùy biến với hàm thứ hai
+
+`memo` nhận tham số thứ hai: hàm `(prevProps, nextProps) => boolean`. Trả `true` nghĩa là "coi như bằng nhau, **đừng** render".
+
+```tsx
+const Row = memo(
+  function Row({ user }: { user: { id: number; name: string } }) {
+    return <li>{user.name}</li>;
+  },
+  // chỉ render lại khi id hoặc name đổi, bỏ qua các field khác của user
+  (prev, next) => prev.user.id === next.user.id && prev.user.name === next.user.name
+);
+```
+
+<Callout type="error" title="Caution">
+
+Cẩn thận: hàm so sánh sai (vd quên một field) gây bug "UI không cập nhật". Và so sánh sâu thủ công có thể đắt hơn chính việc render. Chỉ dùng khi đo thấy đáng. Đa số trường hợp nên ổn định props thay vì viết comparator.
+
+</Callout>
+
+<Callout type="info" title="Note">
+
+Quy ước trả về **ngược** với `shouldComponentUpdate` của class: comparator của `memo` trả `true` = "bằng nhau, bỏ render"; còn `shouldComponentUpdate` trả `true` = "render". Dễ nhầm.
+
+</Callout>
+
+---
+
+## 6. Khi nào KHÔNG cần memo
+
+<Accordions type="single">
+  <Accordion title="Component vốn đã rẻ">
+    Render dưới 1ms thì memo chỉ thêm chi phí so sánh. Bỏ qua.
+  </Accordion>
+  <Accordion title="Props gần như luôn đổi">
+    Nếu component nhận props đổi mỗi render (vd giá trị đang animate), memo luôn 'miss' → vô ích.
+  </Accordion>
+  <Accordion title="Dự án đã bật React Compiler">
+    Compiler tự memo hóa. memo thủ công thường thừa. Xem Tổng quan tối ưu.
+  </Accordion>
+  <Accordion title="Có thể lift thành children (xem mục 7)">
+    Thường gọn và hiệu quả hơn memo mà không cần ổn định props.
+  </Accordion>
+</Accordions>
+
+---
+
+## 7. Giải pháp thay thế thường tốt hơn: children
+
+Một component nhận qua `children` **không** render lại khi cha đổi state, vì element `children` được tạo ở cấp cha-của-cha và truyền xuống — không bị tạo lại khi component ở giữa render.
+
+```tsx
+import { useState } from 'react';
+
+function Wrapper({ children }: { children: React.ReactNode }) {
+  const [count, setCount] = useState(0);
+  return (
+    <div>
+      <button onClick={() => setCount((c) => c + 1)}>Count: {count}</button>
+      {children} {/* không render lại khi count đổi — element đã được tạo ở ngoài */}
+    </div>
+  );
+}
+
+export default function App() {
+  return (
+    <Wrapper>
+      <ExpensiveTree /> {/* tạo 1 lần ở App, Wrapper chỉ "đặt" vào — không tái tạo */}
+    </Wrapper>
+  );
+}
+```
+
+<Callout type="info" title="Tip">
+
+Kỹ thuật "lift content lên, nhận qua children" giải quyết rất nhiều trường hợp mà không cần `memo` lẫn ổn định props. Đây là một dạng **composition** — xem bài [Composition](/patterns/composition/).
+
+</Callout>
+
+---
+
+## 8. Câu hỏi tự kiểm tra
+
+<Accordions type="single">
+  <Accordion title="1. memo chặn re-render từ những nguồn nào?">
+    Chỉ từ cha (khi props không đổi theo so sánh nông). Không chặn re-render do state nội bộ hay context của chính component.
+  </Accordion>
+  <Accordion title="2. Vì sao truyền config={{...}} inline làm memo vô dụng?">
+    Object literal tạo tham chiếu mới mỗi render → Object.is ra false → memo thấy props 'khác' → render như thường. Cần useMemo để ổn định.
+  </Accordion>
+  <Accordion title="3. 'So sánh nông' nghĩa là gì?">
+    So sánh từng prop một tầng bằng Object.is, không đi sâu vào bên trong object/array. Hai object cùng nội dung nhưng khác tham chiếu vẫn coi là khác.
+  </Accordion>
+  <Accordion title="4. Comparator thứ hai của memo trả true nghĩa là gì?">
+    'Coi như bằng nhau, bỏ qua render'. Ngược với shouldComponentUpdate (true = render).
+  </Accordion>
+  <Accordion title="5. Giải pháp nào thường tốt hơn memo và vì sao?">
+    Lift content thành children: element được tạo ở cấp cao hơn nên không tái tạo khi component giữa đổi state — không cần ổn định props.
+  </Accordion>
+</Accordions>
+
+---
+
+## Tài liệu tham khảo
+
+- [React Docs — memo](https://react.dev/reference/react/memo)
+- [Fiber & Reconciliation](/react-internals/fiber-reconciliation/)
+- [useMemo & useCallback](/toi-uu-rerender/usememo-usecallback/)
+- [Referential Equality](/toi-uu-rerender/referential-equality/)
+- [Composition](/patterns/composition/)

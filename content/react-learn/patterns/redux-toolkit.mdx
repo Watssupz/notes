@@ -1,0 +1,526 @@
+---
+title: "Redux Toolkit"
+description: "Quản lý client state dùng Redux Toolkit và React-Redux: store, slice, selector, async thunk, tối ưu re-render và ranh giới với server state."
+---
+
+<Callout type="info" title="Phạm vi bài viết">
+  Bài này dùng **Redux Toolkit (RTK)** — cách viết Redux được Redux khuyến nghị hiện nay — cùng `react-redux`. Redux cổ điển với `createStore`, action type string rời rạc và switch reducer dài chỉ nên đọc để hiểu code cũ.
+</Callout>
+
+## Mục lục
+
+- [Tổng quan](#tổng-quan)
+- [1. Redux giải quyết vấn đề gì?](#1-redux-giải-quyết-vấn-đề-gì)
+  - [Khi nào Redux phù hợp](#khi-nào-redux-phù-hợp)
+  - [Khi nào không nên dùng Redux](#khi-nào-không-nên-dùng-redux)
+- [2. Mental model: dữ liệu đi một chiều](#2-mental-model-dữ-liệu-đi-một-chiều)
+- [3. Cài đặt và tạo store](#3-cài-đặt-và-tạo-store)
+- [4. Tạo slice đầu tiên](#4-tạo-slice-đầu-tiên)
+  - [Vì sao có thể "mutate" state?](#vì-sao-có-thể-mutate-state)
+- [5. Kết nối store với React](#5-kết-nối-store-với-react)
+- [6. Selector và hiệu năng re-render](#6-selector-và-hiệu-năng-re-render)
+- [7. Xử lý bất đồng bộ với createAsyncThunk](#7-xử-lý-bất-đồng-bộ-với-createasyncthunk)
+- [8. Tổ chức code theo feature](#8-tổ-chức-code-theo-feature)
+- [9. Redux Toolkit so với Context và useReducer](#9-redux-toolkit-so-với-context-và-usereducer)
+- [10. Checklist và lỗi thường gặp](#10-checklist-và-lỗi-thường-gặp)
+- [11. Câu hỏi tự kiểm tra](#11-câu-hỏi-tự-kiểm-tra)
+- [Tài liệu tham khảo](#tài-liệu-tham-khảo)
+
+---
+
+## Tổng quan
+
+**Redux** là một thư viện quản lý state phía client theo mô hình store tập trung. Thay vì component tự sửa state ở nhiều nơi, UI gửi một **action** mô tả việc vừa xảy ra. Reducer — hàm quyết định state mới — xử lý action đó. Store giữ state cuối cùng và báo cho đúng component đang theo dõi phần state đã đổi.
+
+**Redux Toolkit (RTK)** là bộ công cụ chính thức để viết Redux ít mã lặp hơn. Nó cung cấp `configureStore`, `createSlice`, Immer để cập nhật immutable thuận tiện, middleware mặc định và tích hợp Redux DevTools.
+
+<Callout type="idea" title="Ý chính">
+  Redux không làm state tự nhiên "toàn cục" trở nên tốt hơn. Nó tạo một **quy trình cập nhật có thể dự đoán, quan sát và kiểm tra** khi nhiều khu vực của ứng dụng cùng đọc hoặc thay đổi client state.
+</Callout>
+
+---
+
+## 1. Redux giải quyết vấn đề gì?
+
+Ở app nhỏ, `useState`, `useReducer` và Context thường đủ. Vấn đề xuất hiện khi cùng một state được đọc và ghi từ nhiều màn hình độc lập. Ví dụ: giỏ hàng hiện ở header, trang sản phẩm, trang checkout và popup; một thao tác thêm hàng phải cập nhật tất cả nơi này theo cùng một quy tắc.
+
+Nếu mỗi nơi tự giữ bản sao của `cart`, dữ liệu dễ lệch. Nếu đưa tất cả vào một Context lớn, mỗi lần bất kỳ trường nào thay đổi có thể làm mọi consumer của Context render lại. Redux gom **nguồn dữ liệu** và **quy tắc cập nhật** vào một nơi, đồng thời cho component đăng ký đúng mẩu dữ liệu cần dùng bằng selector.
+
+### Khi nào Redux phù hợp
+
+Dùng Redux Toolkit khi phần lớn các dấu hiệu sau đúng:
+
+- Client state được nhiều khu vực xa nhau cùng đọc hoặc cùng thay đổi: giỏ hàng, bộ lọc toàn ứng dụng, phiên làm việc, notification UI, wizard nhiều bước.
+- Bạn cần lần theo được action nào đã đổi state. Redux DevTools cho phép xem action, state trước/sau và phát lại luồng.
+- Logic transition có nhiều quy tắc nghiệp vụ và cần test tách khỏi UI.
+- State thay đổi thường xuyên nhưng mỗi component chỉ nên render khi phần nó quan tâm đổi.
+
+### Khi nào không nên dùng Redux
+
+Redux không phải mặc định cho mọi state:
+
+| Loại state | Lựa chọn nên ưu tiên | Lý do |
+|---|---|---|
+| Mở/đóng một modal, giá trị một input | `useState` cục bộ | State chỉ phục vụ một vùng UI. |
+| Logic phức tạp trong một feature | `useReducer` | Reducer gần nơi dùng, không cần store toàn cục. |
+| Theme, locale, user ít thay đổi | Context + Provider | Truyền giá trị xuống sâu đơn giản. |
+| Dữ liệu lấy từ API: cache, loading, refetch | TanStack Query / SWR / RTK Query | Đây là **server state**, có vòng đời cache riêng. |
+
+<Callout type="warn" title="Đừng biến Redux thành database client">
+  Không sao chép mọi response API vào Redux chỉ vì nó "toàn cục". Dữ liệu từ server cần cache, invalidation và refetch; một thư viện server state xử lý những việc đó tốt hơn. Redux thường phù hợp nhất với **client state**: state do giao diện và hành vi người dùng sở hữu.
+</Callout>
+
+---
+
+## 2. Mental model: dữ liệu đi một chiều
+
+Luồng Redux chỉ đi theo một hướng. Component không gán trực tiếp `state.cart.items`; nó dispatch một action như `cart/addItem`. Reducer nhận state hiện tại cùng action và tạo state kế tiếp. Sau đó React-Redux chạy selector của các component đã subscribe; component chỉ re-render nếu giá trị selector trả về thay đổi.
+
+```d2 title="2. Mental model: dữ liệu đi một chiều — sơ đồ 1"
+direction: right
+UI: "UI: click Thêm giỏ hàng"
+D: "dispatch(cartActions.addItem(product))"
+M: "Middleware\n(thunk, logging, ...)"
+R: "Reducer trong slice"
+S: "Redux store\nstate mới" {shape: cylinder}
+SEL: "useSelector(selector)"
+UI2: "Chỉ component có dữ liệu đổi re-render"
+UI -> D
+D -> M
+M -> R
+R -> S
+S -> SEL
+SEL -> UI2
+```
+
+Ba khái niệm cần nhớ:
+
+| Khái niệm | Vai trò | Ví dụ |
+|---|---|---|
+| **Store** | Nơi giữ state của toàn ứng dụng Redux. | `store.getState().cart` |
+| **Action** | Object mô tả một sự kiện đã xảy ra. | `{ type: 'cart/addItem', payload: product }` |
+| **Reducer** | Hàm thuần tính state mới từ state cũ và action. | `addItem(state, action) { ... }` |
+
+Reducer phải là **hàm thuần**: cùng input luôn cho cùng output và không tạo side effect. Không gọi API, không đọc `localStorage`, không dùng `Date.now()` hay `Math.random()` trong reducer. Những việc đó đặt trong event handler, thunk hoặc middleware.
+
+---
+
+## 3. Cài đặt và tạo store
+
+Cài hai package: RTK chứa API Redux hiện đại; `react-redux` cung cấp `<Provider>`, `useSelector` và `useDispatch` cho React.
+
+Chạy trong project React muốn thêm Redux Toolkit, **không phải yêu cầu cài lại site tài liệu**. Viewer chỉ mô tả lệnh và tiêu chí kiểm tra, không tự chạy lệnh hay cung cấp output đã đo.
+
+```terminal-session
+title: Cài và kiểm tra dependency Redux Toolkit
+context:
+  kind: local
+  label: Project React của bạn
+  cwd: /path/to/your-react-app
+steps:
+  - id: install
+    command: npm install @reduxjs/toolkit react-redux
+    expected: package.json và lockfile có cả hai dependency; npm không báo lỗi cài đặt.
+  - id: verify
+    command: npm ls @reduxjs/toolkit react-redux
+    expected: Cây dependency liệt kê cả hai package, không có trạng thái missing hoặc invalid.
+```
+
+Tạo `store.ts`. `configureStore` tự gắn thunk middleware, kiểm tra serializable trong môi trường phát triển và kết nối Redux DevTools.
+
+```ts
+// src/store/store.ts
+import { configureStore } from '@reduxjs/toolkit';
+import cartReducer from '../features/cart/cartSlice';
+
+export const store = configureStore({
+  reducer: {
+    cart: cartReducer,
+  },
+});
+
+export type RootState = ReturnType<typeof store.getState>;
+export type AppDispatch = typeof store.dispatch;
+```
+
+Bọc gốc React bằng `Provider` một lần. Với Next.js App Router, file Provider dùng hooks/context của React phải là Client Component.
+
+```tsx
+// src/store/store-provider.tsx
+'use client';
+
+import { Provider } from 'react-redux';
+import { store } from './store';
+
+export function StoreProvider({ children }: { children: React.ReactNode }) {
+  return <Provider store={store}>{children}</Provider>;
+}
+```
+
+```tsx
+// src/app/layout.tsx
+import { StoreProvider } from '@/store/store-provider';
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="vi">
+      <body><StoreProvider>{children}</StoreProvider></body>
+    </html>
+  );
+}
+```
+
+<Callout type="info" title="Next.js App Router">
+  Giữ `layout.tsx` là Server Component nếu có thể. Chỉ `StoreProvider` mang `'use client'`; ranh giới client nhỏ hơn giúp Server Components vẫn render được ở các phần không cần Redux.
+</Callout>
+
+---
+
+## 4. Tạo slice đầu tiên
+
+Một **slice** gom reducer, action creator và state của một feature vào một file. Ví dụ dưới đây quản lý giỏ hàng. RTK tự tạo action creator từ tên reducer, nên không cần tự viết string `type` hay `switch`.
+
+```ts
+// src/features/cart/cartSlice.ts
+import { createSlice, type PayloadAction } from '@reduxjs/toolkit';
+
+type Product = { id: string; name: string; price: number };
+type CartItem = Product & { quantity: number };
+
+type CartState = {
+  items: CartItem[];
+};
+
+const initialState: CartState = { items: [] };
+
+const cartSlice = createSlice({
+  name: 'cart',
+  initialState,
+  reducers: {
+    addItem(state, action: PayloadAction<Product>) {
+      const existing = state.items.find((item) => item.id === action.payload.id);
+
+      if (existing) {
+        existing.quantity += 1;
+        return;
+      }
+
+      state.items.push({ ...action.payload, quantity: 1 });
+    },
+    changeQuantity(state, action: PayloadAction<{ id: string; quantity: number }>) {
+      const item = state.items.find((item) => item.id === action.payload.id);
+      if (item) item.quantity = Math.max(1, action.payload.quantity);
+    },
+    removeItem(state, action: PayloadAction<string>) {
+      state.items = state.items.filter((item) => item.id !== action.payload);
+    },
+    clearCart(state) {
+      state.items = [];
+    },
+  },
+});
+
+export const { addItem, changeQuantity, removeItem, clearCart } = cartSlice.actions;
+export default cartSlice.reducer;
+```
+
+Bốn reducer trên tạo ra bốn action type tương ứng: `cart/addItem`, `cart/changeQuantity`, `cart/removeItem`, `cart/clearCart`. Đây là lý do đặt `name: 'cart'` theo domain nghiệp vụ: DevTools sẽ đọc được luồng hành vi rõ ràng.
+
+### Vì sao có thể "mutate" state?
+
+Dòng `existing.quantity += 1` trông giống mutate state, nhưng Redux state vẫn được cập nhật immutable. RTK dùng **Immer**: reducer nhận một *draft* có thể sửa trực tiếp; Immer theo dõi thay đổi và tạo object/array mới cần thiết ở phía sau.
+
+```ts
+// Trong createSlice: hai cách này tương đương về kết quả immutable.
+state.items.push(nextItem);             // cách RTK/Immer, thường dễ đọc hơn
+// return { ...state, items: [...state.items, nextItem] }; // cách Redux thủ công
+```
+
+<Callout type="warn" title="Một reducer, một cách cập nhật">
+  Trong cùng một nhánh reducer, hãy sửa draft **hoặc** `return` state mới. Không làm cả hai: `state.items.push(item); return { ...state }` khiến Immer không biết kết quả nào cần dùng.
+</Callout>
+
+---
+
+## 5. Kết nối store với React
+
+Tạo typed hooks một lần để mọi component có `RootState` và `AppDispatch` đúng kiểu. Với React-Redux hiện đại, dùng `.withTypes()`.
+
+```ts
+// src/store/hooks.ts
+import { useDispatch, useSelector } from 'react-redux';
+import type { AppDispatch, RootState } from './store';
+
+export const useAppDispatch = useDispatch.withTypes<AppDispatch>();
+export const useAppSelector = useSelector.withTypes<RootState>();
+```
+
+Component đọc state qua selector và gửi action bằng dispatch:
+
+```tsx
+'use client';
+
+import { changeQuantity, removeItem } from './cartSlice';
+import { useAppDispatch, useAppSelector } from '@/store/hooks';
+
+export function CartSummary() {
+  const items = useAppSelector((state) => state.cart.items);
+  const dispatch = useAppDispatch();
+
+  return (
+    <ul>
+      {items.map((item) => (
+        <li key={item.id}>
+          {item.name} × {item.quantity}
+          <button onClick={() => dispatch(changeQuantity({ id: item.id, quantity: item.quantity + 1 }))}>
+            +
+          </button>
+          <button onClick={() => dispatch(removeItem(item.id))}>Xóa</button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+`useAppSelector` đăng ký component với store. Nó không yêu cầu component biết store được tạo thế nào; component chỉ biết phần state nó cần. `dispatch` có tham chiếu ổn định, nên không cần bọc `useCallback` chỉ để truyền nó vào handler.
+
+---
+
+## 6. Selector và hiệu năng re-render
+
+Selector là hàm lấy ra một phần dữ liệu từ `RootState`. React-Redux so sánh kết quả selector lần trước và lần sau bằng `===`. Nếu kết quả không đổi, component không re-render dù một slice khác vừa cập nhật.
+
+Tách selector có tên giúp tái dùng và tránh để cấu trúc nội bộ của store rải khắp component:
+
+```ts
+// src/features/cart/cartSelectors.ts
+import type { RootState } from '@/store/store';
+
+export const selectCartItems = (state: RootState) => state.cart.items;
+export const selectCartCount = (state: RootState) =>
+  state.cart.items.reduce((total, item) => total + item.quantity, 0);
+export const selectCartTotal = (state: RootState) =>
+  state.cart.items.reduce((total, item) => total + item.price * item.quantity, 0);
+```
+
+```tsx
+function CartBadge() {
+  const count = useAppSelector(selectCartCount);
+  return <span>{count}</span>;
+}
+```
+
+<Callout type="info" title="Selector phải trả về giá trị ổn định">
+  Tránh selector tạo object/array mới ở mỗi lần gọi, ví dụ `state => ({ count: state.cart.items.length })`. Dù `items` không đổi, object mới vẫn khác `===` và component sẽ re-render. Hãy chọn primitive, tham chiếu sẵn có, hoặc memoize derived data bằng `createSelector`.
+</Callout>
+
+Ví dụ derived data nặng cần memoization:
+
+```ts
+import { createSelector } from '@reduxjs/toolkit';
+
+const selectItems = (state: RootState) => state.cart.items;
+
+export const selectCartTotal = createSelector([selectItems], (items) =>
+  items.reduce((total, item) => total + item.price * item.quantity, 0),
+);
+```
+
+`createSelector` chỉ tính lại khi `selectItems` trả về tham chiếu mới. Không memoize mọi selector theo thói quen; với phép tính đơn giản trả về primitive, mã không memo thường rõ ràng hơn và đủ nhanh.
+
+---
+
+## 7. Xử lý bất đồng bộ với createAsyncThunk
+
+Reducer phải thuần, nên không `fetch` trực tiếp trong reducer. `createAsyncThunk` tạo thunk — một action creator có thể chạy async trước khi dispatch action kết quả `pending`, `fulfilled` hoặc `rejected`.
+
+```ts
+// src/features/products/productsSlice.ts
+import { createAsyncThunk, createSlice } from '@reduxjs/toolkit';
+
+type Product = { id: string; name: string };
+type ProductsState = {
+  items: Product[];
+  status: 'idle' | 'loading' | 'succeeded' | 'failed';
+  error: string | null;
+};
+
+export const fetchProducts = createAsyncThunk('products/fetchAll', async () => {
+  const response = await fetch('/api/products');
+  if (!response.ok) throw new Error('Không tải được sản phẩm');
+  return (await response.json()) as Product[];
+});
+
+const productsSlice = createSlice({
+  name: 'products',
+  initialState: { items: [], status: 'idle', error: null } as ProductsState,
+  reducers: {},
+  extraReducers: (builder) => {
+    builder
+      .addCase(fetchProducts.pending, (state) => {
+        state.status = 'loading';
+        state.error = null;
+      })
+      .addCase(fetchProducts.fulfilled, (state, action) => {
+        state.status = 'succeeded';
+        state.items = action.payload;
+      })
+      .addCase(fetchProducts.rejected, (state, action) => {
+        state.status = 'failed';
+        state.error = action.error.message ?? 'Lỗi không xác định';
+      });
+  },
+});
+
+export default productsSlice.reducer;
+```
+
+```tsx
+function Products() {
+  const dispatch = useAppDispatch();
+  const { items, status, error } = useAppSelector((state) => state.products);
+
+  useEffect(() => {
+    if (status === 'idle') dispatch(fetchProducts());
+  }, [dispatch, status]);
+
+  if (status === 'loading') return <p>Đang tải…</p>;
+  if (status === 'failed') return <p>{error}</p>;
+  return <ProductList items={items} />;
+}
+```
+
+<Callout type="idea" title="Chọn đúng công cụ cho API data">
+  `createAsyncThunk` hợp lý khi request là một phần workflow client state. Nếu app có nhiều endpoint, cache, pagination, invalidation hoặc đồng bộ dữ liệu server, hãy ưu tiên **RTK Query** (nằm trong Redux Toolkit) hoặc TanStack Query. Chúng giảm lượng code `status/error/items` lặp lại đáng kể.
+</Callout>
+
+---
+
+## 8. Tổ chức code theo feature
+
+Đừng chia thư mục chỉ theo loại kỹ thuật như `actions/`, `reducers/`, `types/`; mọi thứ của giỏ hàng bị tách xa nhau. Đặt slice, selector, component và test gần domain mà chúng phục vụ.
+
+```text
+src/
+├── store/
+│   ├── hooks.ts
+│   ├── store-provider.tsx
+│   └── store.ts
+├── features/
+│   ├── cart/
+│   │   ├── CartSummary.tsx
+│   │   ├── cartSelectors.ts
+│   │   ├── cartSlice.test.ts
+│   │   └── cartSlice.ts
+│   └── products/
+│       ├── ProductList.tsx
+│       └── productsSlice.ts
+└── app/
+    └── layout.tsx
+```
+
+Mỗi feature export công khai thứ thật sự cần: component, action để feature khác điều khiển khi cần, và selector. Không bắt component ở feature khác đọc thẳng cấu trúc state sâu bên trong slice; selector là API ổn định hơn khi bạn cần đổi cấu trúc về sau.
+
+---
+
+## 9. Redux Toolkit so với Context và useReducer
+
+| Tiêu chí | `useReducer` | Context + reducer | Redux Toolkit |
+|---|---|---|---|
+| Phạm vi mặc định | Một component/feature | Cây con của Provider | Toàn ứng dụng Redux |
+| Chia sẻ state xa nhau | Truyền props | Có, nhưng Context broadcast | Có, qua store + selector |
+| Tối ưu theo mẩu state | Tự tổ chức | Cần tách Context | `useSelector` có sẵn |
+| DevTools/middleware | Không | Không có sẵn | Có sẵn qua RTK |
+| Lượng setup | Thấp | Thấp-vừa | Vừa |
+| Phù hợp nhất | Logic cục bộ phức tạp | State ít đổi, phạm vi rõ | Client state lớn, phối hợp nhiều feature |
+
+`useReducer` và Redux dùng chung tư duy action → reducer → state mới. Khác biệt là Redux đưa reducer ra ngoài component, tạo store độc lập với React, thêm subscription theo selector, middleware và công cụ quan sát. Vì vậy không cần "nâng cấp" lên Redux chỉ vì đã dùng `useReducer`.
+
+---
+
+## 10. Checklist và lỗi thường gặp
+
+<Steps>
+  <Step>
+
+### Bắt đầu từ state cục bộ
+
+Đặt state gần nơi dùng nhất. Chỉ đưa lên Redux khi nhiều khu vực thực sự cần chia sẻ hoặc bạn cần quy trình/action log rõ ràng.
+
+  </Step>
+  <Step>
+
+### Tạo slice theo domain
+
+Dùng `cartSlice`, `authSlice`, `checkoutSlice`; không dùng một `appSlice` khổng lồ chứa mọi loại dữ liệu.
+
+  </Step>
+  <Step>
+
+### Chọn qua selector, không đọc cả store
+
+`useAppSelector(selectCartCount)` tốt hơn `useAppSelector((state) => state)`; selector nhỏ giới hạn bề mặt re-render.
+
+  </Step>
+  <Step>
+
+### Giữ state serializable
+
+Không lưu function, Promise, class instance hoặc `Date` mutable trong Redux state/action. String, number, boolean, plain object và array dễ debug, persist và phát lại hơn.
+
+  </Step>
+  <Step>
+
+### Test reducer như hàm thuần
+
+Không cần render React để test quy tắc giỏ hàng:
+
+```ts
+expect(cartReducer(undefined, addItem(product))).toEqual({
+  items: [{ ...product, quantity: 1 }],
+});
+```
+
+  </Step>
+</Steps>
+
+Các lỗi cần tránh:
+
+- Dispatch action chung chung như `setData`. Tên action nên mô tả sự kiện hoặc ý định, ví dụ `cart/addItem` hay `checkout/submitted`.
+- Nhét mọi dữ liệu API vào slice thủ công và tự quản lý cache/loading ở mọi endpoint.
+- Đặt `useSelector((state) => state)` ở component gốc. Bất kỳ update nào cũng sẽ làm nó render.
+- Cất dữ liệu chỉ dùng tạm trong một form vào Redux. State cục bộ dễ xóa khi unmount và ít coupling hơn.
+
+---
+
+## 11. Câu hỏi tự kiểm tra
+
+<Accordions type="single">
+  <Accordion title="1. Vì sao Redux action không sửa state trực tiếp?">
+    Action chỉ mô tả sự kiện. Reducer là nơi duy nhất tính state kế tiếp. Quy tắc này làm luồng cập nhật quan sát, phát lại và test được.
+  </Accordion>
+  <Accordion title="2. Vì sao reducer RTK viết được state.items.push(...)?">
+    createSlice dùng Immer. Immer cho reducer sửa một draft rồi tạo state immutable mới ở phía sau; Redux state gốc không bị mutate trực tiếp.
+  </Accordion>
+  <Accordion title="3. useSelector quyết định re-render thế nào?">
+    Sau mỗi store update, React-Redux chạy selector lại và so kết quả mới/cũ bằng ===. Kết quả giữ nguyên tham chiếu hoặc primitive không đổi thì component không re-render vì update đó.
+  </Accordion>
+  <Accordion title="4. Khi nào createAsyncThunk chưa phải lựa chọn tốt nhất?">
+    Khi ứng dụng cần cache API phức tạp, invalidation, pagination hoặc refetch. Dùng RTK Query hay TanStack Query sẽ phù hợp với server state hơn.
+  </Accordion>
+  <Accordion title="5. Redux có thay thế hoàn toàn useState không?">
+    Không. State cục bộ, ngắn hạn và chỉ phục vụ một component nên ở useState/useReducer. Redux là chi phí kiến trúc chỉ nên trả khi lợi ích chia sẻ, kiểm soát và debug lớn hơn chi phí đó.
+  </Accordion>
+</Accordions>
+
+---
+
+## Tài liệu tham khảo
+
+- [Redux Toolkit — Getting Started](https://redux-toolkit.js.org/introduction/getting-started)
+- [Redux — Style Guide](https://redux.js.org/style-guide/)
+- [React-Redux — Hooks](https://react-redux.js.org/api/hooks)
+- [React Docs — Scaling Up with Reducer and Context](https://react.dev/learn/scaling-up-with-reducer-and-context)
+- [State Reducer & useReducer](/patterns/state-reducer/)
+- [Tối ưu Context](/toi-uu-rerender/context-optimization/)
